@@ -367,16 +367,22 @@ async function solveOnce(): Promise<void> {
         }
 
         // ── Translate and push user constraints ──
-        // Outline polygons are derived + fixed; any constraint referencing
-        // them (e.g. legacy rect-wall Parallel / PerpDistance) is ignored so
-        // it cannot conflict with the fixed offset.
-        for (const c of constraints) {
-            const refsOutline = c.targets.some((t) => {
+        // Outline polygons are derived + fixed. Only the legacy rect-wall
+        // auto-added links (Parallel / PerpDistance between an outline and
+        // its own inner) are skipped — they would fight the derived offset.
+        // User-added constraints (Coincident, PointOnGrid, etc.) still
+        // apply: because outline vertices go into the solver as fixed
+        // primitives, they act as anchors that other polygons snap to.
+        const isLegacyOutlineLink = (c: Constraint): boolean => {
+            if (c.type !== "Parallel" && c.type !== "PerpDistance") return false;
+            return c.targets.some((t) => {
                 const tt = t as any;
-                if (t.kind !== "SketchEdge" && t.kind !== "SketchPoint" && t.kind !== "SketchCircle") return false;
+                if (t.kind !== "SketchEdge" && t.kind !== "SketchPoint") return false;
                 return outlinePolyIds.has(tt.polyId);
             });
-            if (refsOutline) continue;
+        };
+        for (const c of constraints) {
+            if (isLegacyOutlineLink(c)) continue;
             const gcsPrimitives = translateConstraint(c, polyIds, circleIds, wallIds, idAlloc, state.grids, state.elements as any);
             for (const p of gcsPrimitives) primitives.push(p);
         }
