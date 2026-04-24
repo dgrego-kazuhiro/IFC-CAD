@@ -1951,6 +1951,50 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const s = applyGridSnap(wp);
                 setGridSnapInfo(s.info);
                 const sp = s.p;
+                const currentPoly = room.polygons.find((p) => p.id === dragState.polyId);
+
+                // Outer-drag path: if the dragged polygon is a wall-outline,
+                // reverse-map the cursor through negative mitering to derive
+                // a new inner ring, then update the INNER polygon. The inner
+                // update flows through updatePolysAndSync which re-derives
+                // the outline, so the outer vertex lands at (≈) the cursor.
+                // Supports arbitrary polygon vertex counts.
+                const innerId = currentPoly?.wallOutlineOf;
+                const innerPoly = innerId
+                    ? room.polygons.find((p) => p.id === innerId)
+                    : undefined;
+                if (currentPoly && innerPoly && innerPoly.wallThickness != null
+                    && innerPoly.outer.length === currentPoly.outer.length
+                    && currentPoly.outer.length >= 3
+                ) {
+                    const baseOutline = currentPoly.outer;
+                    const newOutline: Vec2[] = baseOutline.map((pt, i) =>
+                        i === dragState.vertexIdx ? [sp[0], sp[1]] as Vec2 : [pt[0], pt[1]] as Vec2,
+                    );
+                    let cx = 0, cy = 0;
+                    for (const v of newOutline) { cx += v[0]; cy += v[1]; }
+                    cx /= newOutline.length; cy /= newOutline.length;
+                    const newInnerOuter = computeMiteredCorners(
+                        newOutline, [cx, cy], -innerPoly.wallThickness,
+                    );
+                    // Pin the corresponding inner vertex so the async solver
+                    // reflows the rest of the inner around it.
+                    setSolverDragHint({
+                        spaceId: activeRoomId,
+                        polyId: innerPoly.id,
+                        vertexIdx: dragState.vertexIdx,
+                        x: newInnerOuter[dragState.vertexIdx][0],
+                        y: newInnerOuter[dragState.vertexIdx][1],
+                    });
+                    const newPolys = room.polygons.map((p) => {
+                        if (p.id !== innerPoly.id) return p;
+                        return { ...p, outer: newInnerOuter };
+                    });
+                    updatePolysAndSync(newPolys);
+                    return;
+                }
+
+                // Inner-drag path.
                 // Hint the solver to pin this vertex at the cursor so other
                 // vertices reflow around it instead of stretching arbitrarily.
                 setSolverDragHint({
@@ -1960,7 +2004,6 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     x: sp[0],
                     y: sp[1],
                 });
-                const currentPoly = room.polygons.find((p) => p.id === dragState.polyId);
                 const baseOuter = currentPoly?.outer ?? dragState.origOuter;
                 const newOuter: Vec2[] = baseOuter.map((pt, i) =>
                     i === dragState.vertexIdx ? [sp[0], sp[1]] as Vec2 : [pt[0], pt[1]] as Vec2,
@@ -2160,6 +2203,35 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     d.origOuter[j][0] + d.normal[0] * perp,
                     d.origOuter[j][1] + d.normal[1] * perp,
                 ];
+                // Outer-edge drag: reverse-map through negative mitering to
+                // the inner, same pattern as the outer-vertex case.
+                const innerId = dragPoly.wallOutlineOf;
+                const innerPoly = innerId
+                    ? room.polygons.find((p) => p.id === innerId)
+                    : undefined;
+                if (innerPoly && innerPoly.wallThickness != null
+                    && innerPoly.outer.length === dragPoly.outer.length
+                    && dragPoly.outer.length >= 3
+                ) {
+                    const newOutline: Vec2[] = dragPoly.outer.map((pt, idx) => {
+                        if (idx === i) return targetI;
+                        if (idx === j) return targetJ;
+                        return [pt[0], pt[1]] as Vec2;
+                    });
+                    let cx = 0, cy = 0;
+                    for (const v of newOutline) { cx += v[0]; cy += v[1]; }
+                    cx /= newOutline.length; cy /= newOutline.length;
+                    const newInnerOuter = computeMiteredCorners(
+                        newOutline, [cx, cy], -innerPoly.wallThickness,
+                    );
+                    const newPolys = room.polygons.map(p => {
+                        if (p.id !== innerPoly.id) return p;
+                        return { ...p, outer: newInnerOuter };
+                    });
+                    updatePolysAndSync(newPolys);
+                    return;
+                }
+
                 // Use current state for the other vertices so solver adjustments
                 // from previous frames aren't overwritten (avoids shaking).
                 const currentPoly = room.polygons.find((p) => p.id === d.polyId);
