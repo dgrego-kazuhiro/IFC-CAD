@@ -1953,42 +1953,78 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const sp = s.p;
                 const currentPoly = room.polygons.find((p) => p.id === dragState.polyId);
 
-                // Outer-drag path: if the dragged polygon is a wall-outline,
-                // reverse-map the cursor through negative mitering to derive
-                // a new inner ring, then update the INNER polygon. The inner
-                // update flows through updatePolysAndSync which re-derives
-                // the outline, so the outer vertex lands at (≈) the cursor.
-                // Supports arbitrary polygon vertex counts.
-                const innerId = currentPoly?.wallOutlineOf;
-                const innerPoly = innerId
-                    ? room.polygons.find((p) => p.id === innerId)
+                // Resolve the "effective outline" being dragged:
+                //   (a) direct — dragState is on a wall-outline polygon, or
+                //   (b) indirect — the dragged vertex is Coincident with a
+                //       wall-outline vertex, so the drag is redirected to
+                //       that outline (and thus to its inner).
+                // Only single-hop Coincident links are followed.
+                let effOutline: RoomPolygon | undefined;
+                let effOutlineVertexIdx = dragState.vertexIdx;
+                if (currentPoly?.wallOutlineOf) {
+                    effOutline = currentPoly;
+                } else if (currentPoly) {
+                    for (const cid in constraints) {
+                        const cc = constraints[cid];
+                        if (cc.type !== "Coincident" || cc.targets.length < 2) continue;
+                        const t1 = cc.targets[0], t2 = cc.targets[1];
+                        if (t1.kind !== "SketchPoint" || t2.kind !== "SketchPoint") continue;
+                        const matches = (t: typeof t1) =>
+                            t.polyId === dragState.polyId && t.vertexIdx === dragState.vertexIdx;
+                        const otherT = matches(t1) ? t2 : matches(t2) ? t1 : null;
+                        if (!otherT) continue;
+                        const cand = room.polygons.find((p) => p.id === otherT.polyId);
+                        if (!cand?.wallOutlineOf) continue;
+                        effOutline = cand;
+                        effOutlineVertexIdx = otherT.vertexIdx;
+                        break;
+                    }
+                }
+                const effInnerId = effOutline?.wallOutlineOf;
+                const effInner = effInnerId
+                    ? room.polygons.find((p) => p.id === effInnerId)
                     : undefined;
-                if (currentPoly && innerPoly && innerPoly.wallThickness != null
-                    && innerPoly.outer.length === currentPoly.outer.length
-                    && currentPoly.outer.length >= 3
+
+                // Outer-drag path: reverse-map the cursor through negative
+                // mitering to derive a new inner ring, then update the INNER
+                // polygon. The inner update flows through updatePolysAndSync
+                // which re-derives the outline + walls so the outer vertex
+                // lands at (≈) the cursor. For the indirect (Coincident)
+                // case, the dragged vertex is also synced to the cursor
+                // in the same frame to avoid async-solver visual lag — the
+                // Coincident still holds (rect.v = outline.v = cursor).
+                // Works for arbitrary polygon vertex counts.
+                if (effOutline && effInner && effInner.wallThickness != null
+                    && effInner.outer.length === effOutline.outer.length
+                    && effOutline.outer.length >= 3
                 ) {
-                    const baseOutline = currentPoly.outer;
+                    const baseOutline = effOutline.outer;
                     const newOutline: Vec2[] = baseOutline.map((pt, i) =>
-                        i === dragState.vertexIdx ? [sp[0], sp[1]] as Vec2 : [pt[0], pt[1]] as Vec2,
+                        i === effOutlineVertexIdx ? [sp[0], sp[1]] as Vec2 : [pt[0], pt[1]] as Vec2,
                     );
                     let cx = 0, cy = 0;
                     for (const v of newOutline) { cx += v[0]; cy += v[1]; }
                     cx /= newOutline.length; cy /= newOutline.length;
                     const newInnerOuter = computeMiteredCorners(
-                        newOutline, [cx, cy], -innerPoly.wallThickness,
+                        newOutline, [cx, cy], -effInner.wallThickness,
                     );
-                    // Pin the corresponding inner vertex so the async solver
-                    // reflows the rest of the inner around it.
                     setSolverDragHint({
                         spaceId: activeRoomId,
-                        polyId: innerPoly.id,
-                        vertexIdx: dragState.vertexIdx,
-                        x: newInnerOuter[dragState.vertexIdx][0],
-                        y: newInnerOuter[dragState.vertexIdx][1],
+                        polyId: effInner.id,
+                        vertexIdx: effOutlineVertexIdx,
+                        x: newInnerOuter[effOutlineVertexIdx][0],
+                        y: newInnerOuter[effOutlineVertexIdx][1],
                     });
+                    const redirected = effOutline.id !== dragState.polyId;
                     const newPolys = room.polygons.map((p) => {
-                        if (p.id !== innerPoly.id) return p;
-                        return { ...p, outer: newInnerOuter };
+                        if (p.id === effInner.id) return { ...p, outer: newInnerOuter };
+                        if (redirected && p.id === dragState.polyId) {
+                            const upd = p.outer.map((pt, i) =>
+                                i === dragState.vertexIdx ? [sp[0], sp[1]] as Vec2 : [pt[0], pt[1]] as Vec2,
+                            );
+                            return { ...p, outer: upd };
+                        }
+                        return p;
                     });
                     updatePolysAndSync(newPolys);
                     return;
