@@ -17,6 +17,8 @@ import { GridLine } from "../model/grid/GridLine";
 import { ColumnElement } from "../model/elements/ColumnElement";
 import { WallElement } from "../model/elements/WallElement";
 import { Vec2 } from "../geometry/math/Vec2";
+import { Vec3 } from "../geometry/math/Vec3";
+import { computeMiteredWallAxes, syncWallsToPolygonOuter } from "../ui/room/wallSync";
 import { GcsBackend } from "./GcsBackend";
 
 type OID = number;
@@ -111,12 +113,59 @@ async function solveOnce(): Promise<void> {
     }
     if (polys.size === 0 && circles.size === 0 && walls.size === 0) return;
 
+    // Build reverse index: wall.id → owning polygon (if any).
+    // A wall is "owned" when it appears in some RoomPolygon.wallIds. For owned
+    // walls we externally re-derive the axis from the polygon's outer ring
+    // (applying dragHint) and push the endpoints as fixed primitives — the
+    // solver therefore cannot drift walls out of their thickness offset from
+    // the polygon. See Approach 2 in docs/… .
+    type WallOwner = { spaceId: string; poly: RoomPolygon; edgeIdx: number };
+    const wallOwnership = new Map<string, WallOwner>();
+    for (const el of Object.values(state.elements)) {
+        const sp = el as SpaceElement;
+        if (!sp || sp.type !== "Space" || !sp.polygons) continue;
+        for (const p of sp.polygons) {
+            if (!p.wallIds) continue;
+            for (let i = 0; i < p.wallIds.length; i++) {
+                const wid = p.wallIds[i];
+                if (wid) wallOwnership.set(wid, { spaceId: sp.id, poly: p, edgeIdx: i });
+            }
+        }
+    }
+
+    // Pre-compute mitered wall axes per polygon, applying dragHint to a single
+    // vertex if it matches. Cached by spaceId:polyId. Returns null when the
+    // polygon isn't wall-capable (no wallIds, mismatched lengths, no thickness).
+    const computedAxesByPoly = new Map<string, [Vec3, Vec3][]>();
+    const ensureAxes = (spaceId: string, poly: RoomPolygon): [Vec3, Vec3][] | null => {
+        if (!poly.wallIds || poly.wallThickness == null) return null;
+        if (poly.wallIds.length !== poly.outer.length) return null;
+        const key = `${spaceId}:${poly.id}`;
+        const cached = computedAxesByPoly.get(key);
+        if (cached) return cached;
+        const effective: Vec2[] = poly.outer.map((v, i) => {
+            if (dragHint &&
+                dragHint.spaceId === spaceId &&
+                dragHint.polyId === poly.id &&
+                dragHint.vertexIdx === i
+            ) return [dragHint.x, dragHint.y];
+            return [v[0], v[1]];
+        });
+        let cx = 0, cy = 0;
+        for (const p of effective) { cx += p[0]; cy += p[1]; }
+        cx /= effective.length; cy /= effective.length;
+        const axes = computeMiteredWallAxes(effective, [cx, cy], poly.wallThickness / 2);
+        computedAxesByPoly.set(key, axes);
+        return axes;
+    };
+
     const wrapper = await GcsBackend.makeWrapper();
     try {
         const idAlloc = new IdAllocator();
         const polyIds = new Map<string, PolyIds>();
         const circleIds = new Map<string, CircleIds>();
         const wallIds = new Map<string, WallAxisIds>();
+        const fixedWallIds = new Set<string>(); // walls pushed as fixed (owned)
         const primitives: any[] = [];
 
         // ── Push polygons as N points + N lines (no implicit constraints) ──
@@ -232,16 +281,30 @@ async function solveOnce(): Promise<void> {
             circleIds.set(key, { centerPoint: centerId, circle: circleId });
         }
 
-        // ── Push standalone wall axes as 2 points + 1 line ──
-        // The solver treats wall axes as a 2-vertex polyline with no pins.
+        // ── Push wall axes as 2 points + 1 line ──
+        // Owned walls (polygon.wallIds) use externally mitered coords with
+        // fixed:true so the solver cannot break the thickness-offset invariant
+        // against the inner polygon. Standalone walls stay unpinned.
         // Axis[0] / axis[1] go in as (x, z) since sketch is in the XZ plane.
         for (const [wid, entry] of walls) {
+            const owner = wallOwnership.get(wid);
+            let a: Vec3 = entry.wall.axis[0];
+            let b: Vec3 = entry.wall.axis[1];
+            let fixed = false;
+            if (owner) {
+                const axes = ensureAxes(owner.spaceId, owner.poly);
+                if (axes && owner.edgeIdx < axes.length) {
+                    a = axes[owner.edgeIdx][0];
+                    b = axes[owner.edgeIdx][1];
+                    fixed = true;
+                    fixedWallIds.add(wid);
+                }
+            }
             const p1 = idAlloc.next();
             const p2 = idAlloc.next();
             const line = idAlloc.next();
-            const a = entry.wall.axis[0], b = entry.wall.axis[1];
-            primitives.push({ type: "point", id: String(p1), x: a[0], y: a[2], fixed: false });
-            primitives.push({ type: "point", id: String(p2), x: b[0], y: b[2], fixed: false });
+            primitives.push({ type: "point", id: String(p1), x: a[0], y: a[2], fixed });
+            primitives.push({ type: "point", id: String(p2), x: b[0], y: b[2], fixed });
             primitives.push({ type: "line", id: String(line), p1_id: String(p1), p2_id: String(p2) });
             wallIds.set(wid, { p1, p2, line });
         }
@@ -327,7 +390,10 @@ async function solveOnce(): Promise<void> {
             }
 
             // Apply batched updates — re-read space each time so we see prior
-            // updates from this same batch.
+            // updates from this same batch. Each polygon that owns walls gets
+            // its wall axes re-synced from the post-solve outer ring, so the
+            // solver moving the inner ring (e.g. via PointOnGrid snapping)
+            // cannot strand walls at stale offsets. Works for any vertex count.
             for (const [spaceId, bucket] of perSpaceUpdates) {
                 const latest = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
                 if (!latest) continue;
@@ -339,10 +405,39 @@ async function solveOnce(): Promise<void> {
                     polygons: newPolys,
                     dirtyFlags: new Set([...latest.dirtyFlags, "Geometry", "Mesh", "Render"]),
                 } as any);
+
+                for (const polyId of bucket.keys()) {
+                    const updated = newPolys.find((p) => p.id === polyId);
+                    if (!updated || !updated.wallIds || updated.wallThickness == null) continue;
+                    syncWallsToPolygonOuter(
+                        updated.outer,
+                        updated.wallIds,
+                        updated.wallThickness,
+                        (wallId, axis) => {
+                            const w = useAppState.getState().elements[wallId] as WallElement | undefined;
+                            if (!w || w.type !== "Wall") return;
+                            // Preserve Y component from the existing axis.
+                            const next: [Vec3, Vec3] = [
+                                [axis[0][0], w.axis[0][1], axis[0][2]],
+                                [axis[1][0], w.axis[1][1], axis[1][2]],
+                            ];
+                            const drift =
+                                Math.abs(next[0][0] - w.axis[0][0]) + Math.abs(next[0][2] - w.axis[0][2]) +
+                                Math.abs(next[1][0] - w.axis[1][0]) + Math.abs(next[1][2] - w.axis[1][2]);
+                            if (drift < 1e-6) return;
+                            useAppState.getState().updateElement(wallId, {
+                                axis: next,
+                                dirtyFlags: new Set([...(w.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                            } as any);
+                        },
+                    );
+                }
             }
 
-            // Wall-axis write-back — pull solved (x, z) back into wall.axis.
+            // Wall-axis write-back — standalone walls only. Owned walls were
+            // pushed as fixed and are re-synced from their polygon above.
             for (const [wid, ids] of wallIds) {
+                if (fixedWallIds.has(wid)) continue;
                 const latest = useAppState.getState().elements[wid] as WallElement | undefined;
                 if (!latest || latest.type !== "Wall") continue;
                 const p1 = wrapper.sketch_index.get_primitive_or_fail(String(ids.p1)) as any;
