@@ -25,6 +25,7 @@ import { ColumnMeshBuilder } from "../../mesh/builders/ColumnMeshBuilder";
 import { Profile } from "../../model/profiles/Profile";
 import ConstraintPanel from "../constraint/ConstraintPanel";
 import ConstraintIconOverlay from "../constraint/ConstraintIconOverlay";
+import RoomLabelOverlay from "../room/RoomLabelOverlay";
 import { GcsBackend } from "../../constraint/GcsBackend";
 import { WallElement } from "../../model/elements/WallElement";
 import { OpeningElement } from "../../model/elements/OpeningElement";
@@ -2411,6 +2412,10 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 getCanvas={() => canvasRef.current}
             />
             <ConstraintIconOverlay
+                getCamera={() => cameraRef.current}
+                getCanvas={() => canvasRef.current}
+            />
+            <RoomLabelOverlay
                 getCamera={() => cameraRef.current}
                 getCanvas={() => canvasRef.current}
             />
