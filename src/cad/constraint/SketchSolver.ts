@@ -18,7 +18,7 @@ import { ColumnElement } from "../model/elements/ColumnElement";
 import { WallElement } from "../model/elements/WallElement";
 import { Vec2 } from "../geometry/math/Vec2";
 import { Vec3 } from "../geometry/math/Vec3";
-import { computeMiteredWallAxes, syncWallsToPolygonOuter } from "../ui/room/wallSync";
+import { computeMiteredCorners, computeMiteredWallAxes, syncWallsToPolygonOuter } from "../ui/room/wallSync";
 import { GcsBackend } from "./GcsBackend";
 
 type OID = number;
@@ -111,6 +111,25 @@ async function solveOnce(): Promise<void> {
             }
         }
     }
+    // Always include wall-outline polygons, regardless of whether any
+    // constraint references them. Outlines are derived from their inner
+    // polygon + thickness, and we use the solver pass to snap them back
+    // after the UI / drag handler has moved them. Also collect outline ids
+    // so we can skip any existing constraint referencing them (legacy rect
+    // wall data carries Parallel / PerpDistance that would conflict with
+    // the fixed-outline strategy).
+    const outlinePolyIds = new Set<string>();
+    for (const el of Object.values(state.elements)) {
+        const sp = el as SpaceElement;
+        if (!sp || sp.type !== "Space" || !sp.polygons) continue;
+        for (const p of sp.polygons) {
+            if (!p.wallOutlineOf) continue;
+            outlinePolyIds.add(p.id);
+            const key = `${sp.id}:${p.id}`;
+            if (!polys.has(key)) polys.set(key, { spaceId: sp.id, poly: p });
+        }
+    }
+
     if (polys.size === 0 && circles.size === 0 && walls.size === 0) return;
 
     // Build reverse index: wall.id → owning polygon (if any).
@@ -190,13 +209,51 @@ async function solveOnce(): Promise<void> {
             return false;
         })();
 
+        // Derive an outline polygon's outer from its inner (with any dragHint
+        // on the inner applied). Returns null when the inner is missing or
+        // not wall-capable — caller then falls back to the outline's stored
+        // outer (rare; stale data).
+        const deriveOutlineOuter = (spaceId: string, outlinePoly: RoomPolygon): Vec2[] | null => {
+            const innerId = outlinePoly.wallOutlineOf;
+            if (!innerId) return null;
+            const sp = state.elements[spaceId] as SpaceElement | undefined;
+            if (!sp || sp.type !== "Space") return null;
+            const inner = sp.polygons?.find((p) => p.id === innerId);
+            if (!inner || inner.wallThickness == null || inner.outer.length < 3) return null;
+            const innerEffective: Vec2[] = inner.outer.map((v, i) => {
+                if (dragHint &&
+                    dragHint.spaceId === spaceId &&
+                    dragHint.polyId === inner.id &&
+                    dragHint.vertexIdx === i
+                ) return [dragHint.x, dragHint.y];
+                return [v[0], v[1]];
+            });
+            let cx = 0, cy = 0;
+            for (const v of innerEffective) { cx += v[0]; cy += v[1]; }
+            cx /= innerEffective.length; cy /= innerEffective.length;
+            return computeMiteredCorners(innerEffective, [cx, cy], inner.wallThickness);
+        };
+
         for (const [key, entry] of polys) {
-            const outer = entry.poly.outer;
+            const isOutline = !!entry.poly.wallOutlineOf;
+            const outer: Vec2[] = isOutline
+                ? (deriveOutlineOuter(entry.spaceId, entry.poly) ?? entry.poly.outer)
+                : entry.poly.outer;
             const n = outer.length;
             const pIds: OID[] = [];
             for (let i = 0; i < n; i++) {
                 const pid = idAlloc.next();
                 pIds.push(pid);
+                if (isOutline) {
+                    primitives.push({
+                        type: "point",
+                        id: String(pid),
+                        x: outer[i][0],
+                        y: outer[i][1],
+                        fixed: true,
+                    });
+                    continue;
+                }
                 const isDragMatch =
                     dragHint != null &&
                     dragHint.spaceId === entry.spaceId &&
@@ -310,7 +367,16 @@ async function solveOnce(): Promise<void> {
         }
 
         // ── Translate and push user constraints ──
+        // Outline polygons are derived + fixed; any constraint referencing
+        // them (e.g. legacy rect-wall Parallel / PerpDistance) is ignored so
+        // it cannot conflict with the fixed offset.
         for (const c of constraints) {
+            const refsOutline = c.targets.some((t) => {
+                const tt = t as any;
+                if (t.kind !== "SketchEdge" && t.kind !== "SketchPoint" && t.kind !== "SketchCircle") return false;
+                return outlinePolyIds.has(tt.polyId);
+            });
+            if (refsOutline) continue;
             const gcsPrimitives = translateConstraint(c, polyIds, circleIds, wallIds, idAlloc, state.grids, state.elements as any);
             for (const p of gcsPrimitives) primitives.push(p);
         }
@@ -397,9 +463,21 @@ async function solveOnce(): Promise<void> {
             for (const [spaceId, bucket] of perSpaceUpdates) {
                 const latest = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
                 if (!latest) continue;
-                const newPolys = latest.polygons.map((p) => {
+                let newPolys = latest.polygons.map((p) => {
                     const patch = bucket.get(p.id);
                     return patch ? { ...p, ...patch } : p;
+                });
+                // Re-derive outline polygons from their (now-updated) inner
+                // so the outer outline tracks solver-driven inner motion.
+                newPolys = newPolys.map((p) => {
+                    if (!p.wallOutlineOf) return p;
+                    const inner = newPolys.find((q) => q.id === p.wallOutlineOf);
+                    if (!inner || inner.wallThickness == null || inner.outer.length < 3) return p;
+                    let cx = 0, cy = 0;
+                    for (const v of inner.outer) { cx += v[0]; cy += v[1]; }
+                    cx /= inner.outer.length; cy /= inner.outer.length;
+                    const derived = computeMiteredCorners(inner.outer, [cx, cy], inner.wallThickness);
+                    return { ...p, outer: derived };
                 });
                 useAppState.getState().updateElement(spaceId, {
                     polygons: newPolys,

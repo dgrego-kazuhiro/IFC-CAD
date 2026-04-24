@@ -879,13 +879,26 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         return best;
     };
 
-    /** Update polygons on the room AND sync linked walls. */
+    /** Update polygons on the room AND sync linked walls + wall-outline polys.
+     *  Outline polygons are always re-derived from their inner so dragging
+     *  the outer outline cannot break the thickness-offset invariant; inner
+     *  drags also propagate through this path. Works for any vertex count. */
     const updatePolysAndSync = (newPolys: RoomPolygon[]) => {
+        const synced = newPolys.map((p) => {
+            if (!p.wallOutlineOf) return p;
+            const inner = newPolys.find((q) => q.id === p.wallOutlineOf);
+            if (!inner || inner.wallThickness == null || inner.outer.length < 3) return p;
+            let cx = 0, cy = 0;
+            for (const v of inner.outer) { cx += v[0]; cy += v[1]; }
+            cx /= inner.outer.length; cy /= inner.outer.length;
+            const derived = computeMiteredCorners(inner.outer, [cx, cy], inner.wallThickness);
+            return { ...p, outer: derived };
+        });
         updateElement(activeRoomId, {
-            polygons: newPolys,
+            polygons: synced,
             dirtyFlags: new Set([...room.dirtyFlags, "Geometry", "Mesh", "Render"]),
         } as any);
-        for (const poly of newPolys) {
+        for (const poly of synced) {
             if (!poly.wallIds || !poly.wallThickness) continue;
             if (poly.wallIds.length !== poly.outer.length) continue;
             let cx = 0, cy = 0;
