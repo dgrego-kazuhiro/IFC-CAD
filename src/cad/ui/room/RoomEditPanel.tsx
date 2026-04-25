@@ -15,7 +15,7 @@ import { Constraint } from "../../model/constraint/Constraint";
 import { Vec2 } from "../../geometry/math/Vec2";
 import { Vec3 } from "../../geometry/math/Vec3";
 
-import { computeMiteredWallAxes, computeMiteredCorners, computeWalledOutlineGeometry } from "./wallSync";
+import { computeMiteredWallAxes, computeWalledOutlineGeometry } from "./wallSync";
 
 export default function RoomEditPanel() {
     const [wallThicknessMm, setWallThicknessMm] = useState("200");
@@ -296,92 +296,14 @@ export default function RoomEditPanel() {
             updatedPolys.push({ ...poly, wallIds, wallThickness });
         }
 
-        // 6) Wall outline polygons — initial position computed by mitered
-        //    offset, then locked to the inner via constraints (PerpDistance +
-        //    Parallel). After generation, outline vertices are solver-driven
-        //    like any other sketch geometry — no FIXED pin, no re-derivation.
-        const newOutlines: RoomPolygon[] = [];
-        const outlineInnerPairs: { innerId: string; outerId: string; isRect: boolean }[] = [];
-        for (const poly of updatedPolys) {
-            if (!selectedPolyIds.has(poly.id)) continue;
-            if (poly.shape?.type === "circle") continue;
-            const w = works.find((ww) => ww.poly.id === poly.id);
-            if (!w) continue;
-            const inner = w.workingOuter;
-            if (inner.length < 3) continue;
-            let cx = 0, cy = 0;
-            for (const v of inner) { cx += v[0]; cy += v[1]; }
-            cx /= inner.length; cy /= inner.length;
-            const outerRing = computeMiteredCorners(inner, [cx, cy], wallThickness);
-            const outerId = Math.random().toString(36).substring(2, 11);
-            newOutlines.push({
-                id: outerId,
-                outer: outerRing,
-                holes: [],
-                wallOutlineOf: poly.id,
-            });
-            outlineInnerPairs.push({
-                innerId: poly.id,
-                outerId,
-                isRect: inner.length === 4,
-            });
-        }
-
+        // Per the new spec ("自由ゾーニングモード"), walls track the inner
+        // polygon directly via syncWallsToPolygonOuter. No wall-outline
+        // polygon is materialized — the wall slabs are rendered procedurally
+        // from (inner outer + thickness) at render time.
         updateElement(activeRoomId, {
-            polygons: [...updatedPolys, ...newOutlines],
+            polygons: updatedPolys,
             dirtyFlags: new Set([...room.dirtyFlags, "Geometry", "Mesh", "Render"]),
         } as any);
-
-        // 7) Wire inner ↔ outer with constraints.
-        //    For rectangle inners (4-vertex BL→BR→TR→TL):
-        //      edges: 0=bottom, 1=right, 2=top, 3=left
-        //      outer verts: 0=oBL, 1=oBR, 2=oTR, 3=oTL
-        //    - Drop the inner's existing Parallel constraints
-        //    - PerpDistance(inner top,    oTL) = wallThickness
-        //    - PerpDistance(inner left,   oTL) = wallThickness
-        //    - PerpDistance(inner bottom, oBR) = wallThickness
-        //    - PerpDistance(inner right,  oBR) = wallThickness
-        //    - Parallel(inner edge i, outer edge i) for i = 0..3
-        const spaceId = activeRoomId;
-        for (const pair of outlineInnerPairs) {
-            if (!pair.isRect) continue;
-
-            for (const cid in constraints) {
-                const c = constraints[cid];
-                if (c.type !== "Parallel") continue;
-                const onInner = c.targets.every(
-                    (t) => t.kind === "SketchEdge" && t.polyId === pair.innerId,
-                );
-                if (onInner) executeCommand(new RemoveConstraintCommand(cid));
-            }
-
-            const perpDist = (innerEdgeIdx: number, outerVertexIdx: number): Constraint => ({
-                id: generateConstraintId(),
-                type: "PerpDistance",
-                targets: [
-                    { kind: "SketchEdge", spaceId, polyId: pair.innerId, edgeIdx: innerEdgeIdx },
-                    { kind: "SketchPoint", spaceId, polyId: pair.outerId, vertexIdx: outerVertexIdx },
-                ],
-                value: wallThickness,
-            });
-            const parallelEdges = (edgeIdx: number): Constraint => ({
-                id: generateConstraintId(),
-                type: "Parallel",
-                targets: [
-                    { kind: "SketchEdge", spaceId, polyId: pair.innerId, edgeIdx },
-                    { kind: "SketchEdge", spaceId, polyId: pair.outerId, edgeIdx },
-                ],
-            });
-
-            executeCommand(new AddConstraintCommand(perpDist(2, 3)));
-            executeCommand(new AddConstraintCommand(perpDist(3, 3)));
-            executeCommand(new AddConstraintCommand(perpDist(0, 1)));
-            executeCommand(new AddConstraintCommand(perpDist(1, 1)));
-            executeCommand(new AddConstraintCommand(parallelEdges(0)));
-            executeCommand(new AddConstraintCommand(parallelEdges(1)));
-            executeCommand(new AddConstraintCommand(parallelEdges(2)));
-            executeCommand(new AddConstraintCommand(parallelEdges(3)));
-        }
     };
 
     const handleDeleteWall = () => {

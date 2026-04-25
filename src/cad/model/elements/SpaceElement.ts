@@ -89,4 +89,6 @@ export interface SpaceElement extends BaseElement {
     area: number;
     height: number;
     levelId?: ElementId;
+    /** 用途タグ (e.g. 個室 / LDK / 収納 / 玄関). free-text optional. */
+    usage?: string;
 }

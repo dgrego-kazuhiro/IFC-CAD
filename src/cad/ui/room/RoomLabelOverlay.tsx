@@ -6,6 +6,7 @@ import { useAppState, AppState } from "../../application/AppState";
 import { Camera } from "../../renderer/camera/Camera";
 import { Vec3 } from "../../geometry/math/Vec3";
 import { SpaceElement, RoomPolygon } from "../../model/elements/SpaceElement";
+import { computeRoomMetrics } from "./roomMetrics";
 
 interface Props {
     getCamera: () => Camera | null;
@@ -46,6 +47,7 @@ function centroidXZ(poly: RoomPolygon): [number, number] {
 interface LabelEntry {
     id: string;
     name: string;
+    sub: string | null; // e.g. "6畳"
     world: Vec3;
 }
 
@@ -64,7 +66,10 @@ export default function RoomLabelOverlay({ getCamera, getCanvas }: Props) {
             const poly = anchorPolygon(el);
             if (!poly) continue;
             const [cx, cy] = centroidXZ(poly);
-            out.push({ id, name, world: [cx, 0, cy] });
+            const thickness = poly.wallThickness ?? 0.105;
+            const m = computeRoomMetrics(poly, thickness);
+            const sub = m.tatami > 0 ? `${m.tatami}畳` : null;
+            out.push({ id, name, sub, world: [cx, 0, cy] });
         }
         return out;
     }, [elements]);
@@ -114,8 +119,9 @@ export default function RoomLabelOverlay({ getCamera, getCanvas }: Props) {
                     <text
                         textAnchor="middle"
                         dominantBaseline="central"
-                        fontSize={13}
-                        fontWeight={600}
+                        y={l.sub ? -8 : 0}
+                        fontSize={14}
+                        fontWeight={700}
                         fill="#1f2937"
                         stroke="rgba(255,255,255,0.85)"
                         strokeWidth={3}
@@ -124,6 +130,22 @@ export default function RoomLabelOverlay({ getCamera, getCanvas }: Props) {
                     >
                         {l.name}
                     </text>
+                    {l.sub && (
+                        <text
+                            textAnchor="middle"
+                            dominantBaseline="central"
+                            y={9}
+                            fontSize={12}
+                            fontWeight={500}
+                            fill="#52525b"
+                            stroke="rgba(255,255,255,0.85)"
+                            strokeWidth={3}
+                            paintOrder="stroke"
+                            fontFamily="ui-sans-serif, system-ui, sans-serif"
+                        >
+                            {l.sub}
+                        </text>
+                    )}
                 </g>
             ))}
         </svg>
