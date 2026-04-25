@@ -210,7 +210,10 @@ export default function CadShell() {
                             ?? selection.find((id) => elements[id]?.type === "Space")
                             ?? null;
                         return targetId && elements[targetId]
-                            ? <RoomPropertyPanel activeRoomId={targetId} />
+                            // key forces a fresh component instance per room so
+                            // the draft useState reseeds from the new room and
+                            // the user never sees stale name/usage values.
+                            ? <RoomPropertyPanel key={targetId} activeRoomId={targetId} />
                             : <div className="text-sm">No selection</div>;
                     })()}
                 </div>

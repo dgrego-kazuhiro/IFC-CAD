@@ -1,16 +1,16 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { useAppState, AppState } from "../../application/AppState";
 import { ElementId } from "../../model/base/ElementId";
 import { SpaceElement, RoomPolygon } from "../../model/elements/SpaceElement";
 import { computeRoomMetrics, formatP } from "./roomMetrics";
 
 /**
- * Properties panel shown while a room is being edited. Lets the user rename
- * the room (name + 用途 stored on the SpaceElement) and inspect 芯々寸法 /
- * P数 / 畳数 / 推定内法寸法 / 推定内法面積 derived from the first non-outline
- * polygon, per the new RoomGrid spec §10.
+ * Properties panel shown for a selected / actively-edited room. The parent
+ * (CadShell) passes a fresh `key={room.id}` so this component remounts on
+ * every room switch — that means draft useState seeds straight from the new
+ * room's name / usage and we don't need a useEffect to keep them in sync.
  */
 export default function RoomPropertyPanel({ activeRoomId }: { activeRoomId: ElementId }) {
     const elements = useAppState((s: AppState) => s.elements);
@@ -23,21 +23,10 @@ export default function RoomPropertyPanel({ activeRoomId }: { activeRoomId: Elem
 
     const [nameDraft, setNameDraft] = useState(currentName);
     const [usageDraft, setUsageDraft] = useState(currentUsage);
-    // Only resync drafts when the room itself changes — otherwise an external
-    // store update (e.g. solver writeback, or the partner field committing)
-    // would overwrite whatever the user is currently typing.
-    useEffect(() => {
-        setNameDraft(currentName);
-        setUsageDraft(currentUsage);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeRoomId]);
 
     const commitName = () => {
         const next = nameDraft.trim();
         if (next === currentName) return;
-        // updateElement merges via { ...cur, ...partial }, so we have to
-        // pass the *element id* (string), not anything wrapped — this is the
-        // same call shape the rest of the codebase uses.
         updateElement(activeRoomId, { name: next });
     };
     const commitUsage = () => {
@@ -104,7 +93,7 @@ export default function RoomPropertyPanel({ activeRoomId }: { activeRoomId: Elem
                 </datalist>
             </Field>
 
-            {m && (
+            {m ? (
                 <div className="rounded border border-zinc-800 bg-zinc-950/60 p-2 space-y-1">
                     <Row k="P数" v={`${formatP(m.pCountWidth)} × ${formatP(m.pCountDepth)}`} />
                     <Row k="芯々寸法" v={`${m.centerWidthMm.toLocaleString()} × ${m.centerDepthMm.toLocaleString()} mm`} />
@@ -113,6 +102,10 @@ export default function RoomPropertyPanel({ activeRoomId }: { activeRoomId: Elem
                     <Row k="推定内法面積" v={`${m.innerAreaM2.toFixed(2)}㎡`} />
                     <Row k="芯々面積" v={`${m.centerAreaM2.toFixed(2)}㎡`} />
                     <Row k="壁タイプ" v={wallType} />
+                </div>
+            ) : (
+                <div className="rounded border border-dashed border-zinc-700 bg-zinc-950/40 p-2 text-zinc-500">
+                    部屋形状が未作成です。下の Rectangle / Polyline ツールで描画してください。
                 </div>
             )}
 

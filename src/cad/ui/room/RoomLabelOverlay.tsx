@@ -55,6 +55,11 @@ export default function RoomLabelOverlay({ getCamera, getCanvas }: Props) {
     const elements = useAppState((s: AppState) => s.elements);
     const svgRef = useRef<SVGSVGElement>(null);
     const handlesRef = useRef<Map<string, SVGGElement>>(new Map());
+    // Ref-callback cache so each label id gets the SAME function across
+    // renders. Inline-recreated callbacks would trigger a null/cleanup pass
+    // every render, briefly emptying handlesRef and causing the RAF tick
+    // to skip newly-added labels for one frame.
+    const refCallbackCacheRef = useRef<Map<string, (el: SVGGElement | null) => void>>(new Map());
 
     const labels: LabelEntry[] = React.useMemo(() => {
         const out: LabelEntry[] = [];
@@ -103,9 +108,15 @@ export default function RoomLabelOverlay({ getCamera, getCanvas }: Props) {
 
     if (labels.length === 0) return null;
 
-    const setHandle = (id: string) => (el: SVGGElement | null) => {
-        if (el) handlesRef.current.set(id, el);
-        else handlesRef.current.delete(id);
+    const setHandle = (id: string) => {
+        const cached = refCallbackCacheRef.current.get(id);
+        if (cached) return cached;
+        const cb = (el: SVGGElement | null) => {
+            if (el) handlesRef.current.set(id, el);
+            else handlesRef.current.delete(id);
+        };
+        refCallbackCacheRef.current.set(id, cb);
+        return cb;
     };
 
     return (
