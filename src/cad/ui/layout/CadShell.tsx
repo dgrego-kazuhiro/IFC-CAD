@@ -91,7 +91,10 @@ export default function CadShell() {
 
     const handleAddRoom = () => {
         if (!activeLevelId) return;
-        const cmd = new CreateSpaceCommand(pickNewRoomName(elements), 3.0, undefined, activeLevelId);
+        // Read elements from the live store so two rapid clicks don't both
+        // see the pre-add snapshot and end up generating the same name.
+        const liveElements = useAppState.getState().elements;
+        const cmd = new CreateSpaceCommand(pickNewRoomName(liveElements), 3.0, undefined, activeLevelId);
         executeCommand(cmd);
         const newRoomId = cmd.getElementId();
         setActiveRoom(newRoomId);

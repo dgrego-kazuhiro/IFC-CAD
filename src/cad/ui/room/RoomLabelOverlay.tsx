@@ -24,17 +24,19 @@ function project(world: Vec3, camera: Camera, width: number, height: number): { 
     return { x, y, visible: v[3] > 0 };
 }
 
-// Pick the polygon we anchor the room label to. Skip outline polygons (those
-// are derived geometry that sits outside the inner shape); take the first
-// non-outline closed polygon with >= 3 vertices.
-function anchorPolygon(space: SpaceElement): RoomPolygon | null {
-    if (!space.polygons) return null;
+// All non-outline closed polygons of a Space. Each gets its own label —
+// rooms with multiple drawn rectangles end up with one label per polygon
+// so the user can tell which polygon belongs to which room and see the
+// per-polygon area, instead of only the first polygon being labeled.
+function labelPolygons(space: SpaceElement): RoomPolygon[] {
+    if (!space.polygons) return [];
+    const out: RoomPolygon[] = [];
     for (const p of space.polygons) {
         if (p.wallOutlineOf) continue;
         if (!p.outer || p.outer.length < 3) continue;
-        return p;
+        out.push(p);
     }
-    return null;
+    return out;
 }
 
 function centroidXZ(poly: RoomPolygon): [number, number] {
@@ -45,7 +47,9 @@ function centroidXZ(poly: RoomPolygon): [number, number] {
 }
 
 interface LabelEntry {
-    id: string;
+    /** Unique key per (space, polygon) pair so multiple polygons in the same
+     *  space get distinct DOM nodes. */
+    key: string;
     name: string;
     sub: string | null; // e.g. "6畳"
     world: Vec3;
@@ -68,13 +72,13 @@ export default function RoomLabelOverlay({ getCamera, getCanvas }: Props) {
             if (!el || el.type !== "Space") continue;
             const name = (el.name ?? "").trim();
             if (!name) continue;
-            const poly = anchorPolygon(el);
-            if (!poly) continue;
-            const [cx, cy] = centroidXZ(poly);
-            const thickness = poly.wallThickness ?? 0.105;
-            const m = computeRoomMetrics(poly, thickness);
-            const sub = m.tatami > 0 ? `${m.tatami}畳` : null;
-            out.push({ id, name, sub, world: [cx, 0, cy] });
+            for (const poly of labelPolygons(el)) {
+                const [cx, cy] = centroidXZ(poly);
+                const thickness = poly.wallThickness ?? 0.105;
+                const m = computeRoomMetrics(poly, thickness);
+                const sub = m.tatami > 0 ? `${m.tatami}畳` : null;
+                out.push({ key: `${id}:${poly.id}`, name, sub, world: [cx, 0, cy] });
+            }
         }
         return out;
     }, [elements]);
@@ -89,7 +93,7 @@ export default function RoomLabelOverlay({ getCamera, getCanvas }: Props) {
                 const w = canvas.clientWidth;
                 const h = canvas.clientHeight;
                 for (const l of labels) {
-                    const el = handlesRef.current.get(l.id);
+                    const el = handlesRef.current.get(l.key);
                     if (!el) continue;
                     const p = project(l.world, cam, w, h);
                     if (!p.visible) {
@@ -126,7 +130,7 @@ export default function RoomLabelOverlay({ getCamera, getCanvas }: Props) {
             style={{ zIndex: 14 }}
         >
             {labels.map((l) => (
-                <g key={l.id} ref={setHandle(l.id)}>
+                <g key={l.key} ref={setHandle(l.key)}>
                     <text
                         textAnchor="middle"
                         dominantBaseline="central"

@@ -54,8 +54,9 @@ export default function TreePanel() {
     };
 
     const handleAddRoom = (levelId: string) => {
+        const liveElements = useAppState.getState().elements;
         const cmd = new CreateSpaceCommand(
-            pickNewRoomName(elements),
+            pickNewRoomName(liveElements),
             3.0,
             undefined,
             levelId,
