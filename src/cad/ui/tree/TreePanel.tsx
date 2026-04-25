@@ -6,6 +6,7 @@ import { useAppState, AppState } from "../../application/AppState";
 import { buildTree, useTreeStore } from "../../state/tree/TreeStore";
 import TreeNodeComponent from "./TreeNodeComponent";
 import { CreateSpaceCommand } from "../../commands/create/CreateSpaceCommand";
+import { pickNewRoomName } from "../room/roomNaming";
 
 export default function TreePanel() {
     const elements = useAppState((s: AppState) => s.elements);
@@ -53,11 +54,8 @@ export default function TreePanel() {
     };
 
     const handleAddRoom = (levelId: string) => {
-        const spaceCount = Object.values(elements).filter(
-            (el) => el.type === "Space"
-        ).length;
         const cmd = new CreateSpaceCommand(
-            `Room ${spaceCount + 1}`,
+            pickNewRoomName(elements),
             3.0,
             undefined,
             levelId,

@@ -23,14 +23,21 @@ export default function RoomPropertyPanel({ activeRoomId }: { activeRoomId: Elem
 
     const [nameDraft, setNameDraft] = useState(currentName);
     const [usageDraft, setUsageDraft] = useState(currentUsage);
+    // Only resync drafts when the room itself changes — otherwise an external
+    // store update (e.g. solver writeback, or the partner field committing)
+    // would overwrite whatever the user is currently typing.
     useEffect(() => {
         setNameDraft(currentName);
         setUsageDraft(currentUsage);
-    }, [activeRoomId, currentName, currentUsage]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [activeRoomId]);
 
     const commitName = () => {
         const next = nameDraft.trim();
         if (next === currentName) return;
+        // updateElement merges via { ...cur, ...partial }, so we have to
+        // pass the *element id* (string), not anything wrapped — this is the
+        // same call shape the rest of the codebase uses.
         updateElement(activeRoomId, { name: next });
     };
     const commitUsage = () => {

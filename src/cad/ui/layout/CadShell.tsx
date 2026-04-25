@@ -12,6 +12,7 @@ import { useAppState, AppState } from "../../application/AppState";
 import { SpaceElement } from "../../model/elements/SpaceElement";
 import { RemoveConstraintCommand } from "../../commands/create/AddConstraintCommand";
 import { CreateSpaceCommand } from "../../commands/create/CreateSpaceCommand";
+import { pickNewRoomName } from "../room/roomNaming";
 import { saveScene, loadScene, clearScene, hasSavedScene } from "../../application/Persistence";
 
 export default function CadShell() {
@@ -90,8 +91,7 @@ export default function CadShell() {
 
     const handleAddRoom = () => {
         if (!activeLevelId) return;
-        const spaceCount = Object.values(elements).filter((el) => el.type === "Space").length;
-        const cmd = new CreateSpaceCommand(`Room ${spaceCount + 1}`, 3.0, undefined, activeLevelId);
+        const cmd = new CreateSpaceCommand(pickNewRoomName(elements), 3.0, undefined, activeLevelId);
         executeCommand(cmd);
         const newRoomId = cmd.getElementId();
         setActiveRoom(newRoomId);
@@ -201,11 +201,18 @@ export default function CadShell() {
                     <h2 className="text-xs text-zinc-400 font-bold uppercase mb-2">Properties</h2>
                     {selectedGridIds.length > 0 ? (
                         <GridPropertyPanel />
-                    ) : activeRoomId && elements[activeRoomId] ? (
-                        <RoomPropertyPanel activeRoomId={activeRoomId} />
-                    ) : (
-                        <div className="text-sm">No selection</div>
-                    )}
+                    ) : (() => {
+                        // Show RoomPropertyPanel for either the actively-edited
+                        // room OR a singly-selected Space. This way the user
+                        // sees properties as soon as they pick a room, without
+                        // having to enter Room edit mode first.
+                        const targetId = activeRoomId
+                            ?? selection.find((id) => elements[id]?.type === "Space")
+                            ?? null;
+                        return targetId && elements[targetId]
+                            ? <RoomPropertyPanel activeRoomId={targetId} />
+                            : <div className="text-sm">No selection</div>;
+                    })()}
                 </div>
             </div>
             <div className="h-8 border-t border-zinc-800 flex items-center px-4 text-xs text-zinc-500 shrink-0">
