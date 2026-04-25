@@ -20,6 +20,9 @@ import {
     SketchMarker,
 } from "./webgpu/SketchOverlayRenderer";
 import { AddConstraintCommand, RemoveConstraintCommand, generateConstraintId } from "../../commands/create/AddConstraintCommand";
+import { CreateSpaceCommand } from "../../commands/create/CreateSpaceCommand";
+import { pickNewRoomName } from "./roomNaming";
+import { ElementId } from "../../model/base/ElementId";
 import { Constraint } from "../../model/constraint/Constraint";
 import { snapToGrids, snapAxisAlign, DEFAULT_GRID_SNAP_TOLERANCE } from "../../model/grid/GridSnap";
 import { GridLine, gridVertices } from "../../model/grid/GridLine";
@@ -348,6 +351,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const clearSketchSelection = useAppState((s: AppState) => s.clearSketchSelection);
     const setSolverDragHint = useAppState((s: AppState) => s.setSolverDragHint);
     const executeCommand = useAppState((s: AppState) => s.executeCommand);
+    const setActiveRoom = useAppState((s: AppState) => s.setActiveRoom);
 
     const [rectStart, setRectStart] = useState<[number, number] | null>(null);
     const [mouseWorld, setMouseWorld] = useState<[number, number] | null>(null);
@@ -1569,18 +1573,50 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         return { lines, quads, markers };
     }
 
+    /**
+     * Decide which room a freshly drawn shape belongs to. Per the new spec
+     * (each rectangle / polyline / circle is its own Room), if the active
+     * room already has a non-outline polygon we spawn a fresh Space with an
+     * auto-picked unique name and switch the active room to it. The first
+     * shape after entering Room mode still goes into the existing empty
+     * room so "Add Room" + "Rectangle" works unchanged.
+     */
+    const pickShapeTargetRoom = (): { roomId: ElementId; room: SpaceElement } | null => {
+        if (!activeRoomId) return null;
+        const live = useAppState.getState().elements;
+        const active = live[activeRoomId as string] as SpaceElement | undefined;
+        if (!active || active.type !== "Space") return null;
+        const hasShape = (active.polygons ?? []).some(
+            (p) => !p.wallOutlineOf && p.outer && p.outer.length >= 3,
+        );
+        if (!hasShape) return { roomId: activeRoomId, room: active };
+        const cmd = new CreateSpaceCommand(
+            pickNewRoomName(live),
+            active.height ?? 3.0,
+            undefined,
+            active.levelId,
+        );
+        executeCommand(cmd);
+        const newId = cmd.getElementId();
+        setActiveRoom(newId);
+        const fresh = useAppState.getState().elements[newId as string] as SpaceElement;
+        return { roomId: newId, room: fresh };
+    };
+
     // Finalize the polyline draft into a new RoomPolygon (no auto constraints).
     const commitPolyDraft = (points: [number, number][]) => {
         if (points.length < 3) return;
+        const target = pickShapeTargetRoom();
+        if (!target) return;
         const newId = generateId();
         const newPoly: RoomPolygon = {
             id: newId,
             outer: points.map((p) => [p[0], p[1]] as Vec2),
             holes: [],
         };
-        updateElement(activeRoomId, {
-            polygons: [...room.polygons, newPoly],
-            dirtyFlags: new Set([...room.dirtyFlags, "Geometry", "Mesh", "Render"]),
+        updateElement(target.roomId, {
+            polygons: [...(target.room.polygons ?? []), newPoly],
+            dirtyFlags: new Set([...(target.room.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
         } as any);
         setPolyDraftPoints([]);
         setMouseWorld(null);
@@ -1597,15 +1633,17 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             const a = (i / CIRCLE_DISPLAY_SEGMENTS) * Math.PI * 2;
             pts.push([center[0] + Math.cos(a) * radius, center[1] + Math.sin(a) * radius]);
         }
+        const target = pickShapeTargetRoom();
+        if (!target) return;
         const newPoly: RoomPolygon = {
             id: generateId(),
             outer: pts,
             holes: [],
             shape: { type: "circle", center: [center[0], center[1]], radius },
         };
-        updateElement(activeRoomId, {
-            polygons: [...room.polygons, newPoly],
-            dirtyFlags: new Set([...room.dirtyFlags, "Geometry", "Mesh", "Render"]),
+        updateElement(target.roomId, {
+            polygons: [...(target.room.polygons ?? []), newPoly],
+            dirtyFlags: new Set([...(target.room.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
         } as any);
         setRoomEditMode("select");
     };
@@ -1736,23 +1774,26 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const minY = Math.min(rectStart[1], snapped[1]);
                 const maxY = Math.max(rectStart[1], snapped[1]);
                 if (maxX - minX > 1e-6 && maxY - minY > 1e-6) {
-                    const newId = generateId();
-                    const newPoly: RoomPolygon = {
-                        id: newId,
-                        outer: [
-                            [minX, minY],
-                            [maxX, minY],
-                            [maxX, maxY],
-                            [minX, maxY],
-                        ],
-                        holes: [],
-                    };
-                    updateElement(activeRoomId, {
-                        polygons: [...room.polygons, newPoly],
-                        dirtyFlags: new Set([...room.dirtyFlags, "Geometry", "Mesh", "Render"]),
-                    } as any);
-                    for (const c of autoRectConstraints(activeRoomId, newId)) {
-                        executeCommand(new AddConstraintCommand(c));
+                    const target = pickShapeTargetRoom();
+                    if (target) {
+                        const newId = generateId();
+                        const newPoly: RoomPolygon = {
+                            id: newId,
+                            outer: [
+                                [minX, minY],
+                                [maxX, minY],
+                                [maxX, maxY],
+                                [minX, maxY],
+                            ],
+                            holes: [],
+                        };
+                        updateElement(target.roomId, {
+                            polygons: [...(target.room.polygons ?? []), newPoly],
+                            dirtyFlags: new Set([...(target.room.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                        } as any);
+                        for (const c of autoRectConstraints(target.roomId, newId)) {
+                            executeCommand(new AddConstraintCommand(c));
+                        }
                     }
                 }
                 setRectStart(null); setMouseWorld(null); setGridSnapInfo(null); setRoomEditMode("select");
