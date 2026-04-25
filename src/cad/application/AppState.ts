@@ -57,6 +57,13 @@ export type RoomEditMode = "select" | "rectangle" | "polyline" | "circle";
 /** Wall-tool sub-mode: "add" draws new walls, "select" picks sketch lines. */
 export type WallSubMode = "add" | "select";
 
+/** Top-level design mode (per docs/specification/new.md §8). */
+export type DesignMode = "freeZoning" | "jpResidentialGrid";
+
+/** Primary / secondary residential grid spacing, in metres. */
+export const RESIDENTIAL_GRID_PRIMARY_M = 0.910;
+export const RESIDENTIAL_GRID_SECONDARY_M = 0.455;
+
 export interface AppState {
     elements: Record<ElementId, BaseElement>;
     selection: ElementId[];
@@ -70,6 +77,14 @@ export interface AppState {
 
     // Wall tool sub-mode (add / select)
     wallSubMode: WallSubMode;
+
+    /**
+     * Top-level design mode (per docs/specification/new.md §8).
+     *  - freeZoning:        no background grid, room blocks edited freely.
+     *  - jpResidentialGrid: 910mm primary + 455mm secondary grid is rendered
+     *                       and mouse / vertex motion snaps to it.
+     */
+    designMode: DesignMode;
 
     // 通芯 (Grid) — building-level reference elements (per spec §4)
     grids: GridLine[];
@@ -103,6 +118,9 @@ export interface AppState {
 
     // Wall tool sub-mode action
     setWallSubMode: (mode: WallSubMode) => void;
+
+    // Design mode action
+    setDesignMode: (mode: DesignMode) => void;
 
     // 通芯 actions
     addGrid: (start: Vec3, end: Vec3, kind?: "Primary" | "Auxiliary") => string;
@@ -163,6 +181,7 @@ export const useAppState = create<AppState>((set, get) => ({
     activeRoomId: null,
     roomEditMode: "select",
     wallSubMode: "add",
+    designMode: "freeZoning",
     grids: [],
     gridNaming: DEFAULT_GRID_NAMING,
     gridlineDrafting: false,
@@ -213,6 +232,8 @@ export const useAppState = create<AppState>((set, get) => ({
         // user starts fresh when they toggle.
         sketchSelection: mode === state.wallSubMode ? state.sketchSelection : [],
     })),
+
+    setDesignMode: (mode) => set({ designMode: mode }),
 
     addGrid: (start, end, kind = "Primary") => {
         const id = generateId();

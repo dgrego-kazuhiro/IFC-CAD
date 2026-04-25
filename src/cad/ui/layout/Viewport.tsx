@@ -26,6 +26,8 @@ import { Profile } from "../../model/profiles/Profile";
 import ConstraintPanel from "../constraint/ConstraintPanel";
 import ConstraintIconOverlay from "../constraint/ConstraintIconOverlay";
 import RoomLabelOverlay from "../room/RoomLabelOverlay";
+import ResidentialGridOverlay from "../grid/ResidentialGridOverlay";
+import DesignModeToggle from "./DesignModeToggle";
 import { GcsBackend } from "../../constraint/GcsBackend";
 import { WallElement } from "../../model/elements/WallElement";
 import { OpeningElement } from "../../model/elements/OpeningElement";
@@ -2419,6 +2421,11 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 getCamera={() => cameraRef.current}
                 getCanvas={() => canvasRef.current}
             />
+            <ResidentialGridOverlay
+                getCamera={() => cameraRef.current}
+                getCanvas={() => canvasRef.current}
+            />
+            <DesignModeToggle />
             <div className="absolute top-4 left-4 text-xs text-zinc-600 bg-white/80 border border-zinc-200 px-2 py-1 rounded shadow-sm pointer-events-none" style={{ zIndex: 20 }}>
                 Navigation: Orbit (LMB), Pan (RMB/MMB), Zoom (Scroll)
                 {activeTool === "wall" && " | Wall mode: Click to place points. Right-click to cancel/finish."}

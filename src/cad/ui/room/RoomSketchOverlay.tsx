@@ -2,7 +2,7 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { mat4, vec4 } from "gl-matrix";
-import { useAppState, AppState } from "../../application/AppState";
+import { useAppState, AppState, RESIDENTIAL_GRID_SECONDARY_M } from "../../application/AppState";
 import { SpaceElement, RoomPolygon, polygonEdges, isPolygonClosed } from "../../model/elements/SpaceElement";
 import { WallElement } from "../../model/elements/WallElement";
 import { Camera } from "../../renderer/camera/Camera";
@@ -335,6 +335,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const activeTool = useAppState((s: AppState) => s.activeTool);
     const roomEditMode = useAppState((s: AppState) => s.roomEditMode);
     const grids = useAppState((s: AppState) => s.grids);
+    const designMode = useAppState((s: AppState) => s.designMode);
     const setRoomEditMode = useAppState((s: AppState) => s.setRoomEditMode);
     const elements = useAppState((s: AppState) => s.elements);
     const selection = useAppState((s: AppState) => s.selection);
@@ -395,6 +396,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const lastDraggedPolyIdRef = useRef(lastDraggedPolyId); lastDraggedPolyIdRef.current = lastDraggedPolyId;
     const sketchSelectionRef = useRef(sketchSelection); sketchSelectionRef.current = sketchSelection;
     const gridsRef = useRef<GridLine[]>(grids); gridsRef.current = grids;
+    const designModeRef = useRef(designMode); designModeRef.current = designMode;
     const gridSnapInfoRef = useRef(gridSnapInfo); gridSnapInfoRef.current = gridSnapInfo;
     const snapBVH = useMemo(() => SnapBVH.fromGrids(grids), [grids]);
     const snapBVHRef = useRef(snapBVH); snapBVHRef.current = snapBVH;
@@ -789,6 +791,18 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         if (bvhHit) {
             const p: [number, number] = [bvhHit.x, bvhHit.z];
             return { p, info: { point: p, kind: "obj" } };
+        }
+        // Residential grid step snap (910mm primary / 455mm secondary). The
+        // secondary step covers both — every 910mm intersection is also a
+        // 455mm one. Skipped in freeZoning mode.
+        if (designModeRef.current === "jpResidentialGrid") {
+            const step = RESIDENTIAL_GRID_SECONDARY_M;
+            const sx = Math.round(xy[0] / step) * step;
+            const sz = Math.round(xy[1] / step) * step;
+            if (Math.hypot(xy[0] - sx, xy[1] - sz) <= DEFAULT_GRID_SNAP_TOLERANCE) {
+                const p: [number, number] = [sx, sz];
+                return { p, info: { point: p, kind: "obj" } };
+            }
         }
         const gs = gridsRef.current;
         if (!gs || gs.length === 0) return { p: xy, info: null };
@@ -2071,19 +2085,25 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 // vertices and shift the delta so that vertex lands exactly
                 // on the snap point.
                 const bvh = snapBVHRef.current;
+                const useResStep = designModeRef.current === "jpResidentialGrid";
+                const resStep = RESIDENTIAL_GRID_SECONDARY_M;
                 let bestCorr: { dx: number; dz: number; target: [number, number]; dist: number } | null = null;
                 for (const pt of dpoly.origOuter) {
                     const tx = pt[0] + dx, tz = pt[1] + dz;
                     const hit = bvh.nearestWithin(tx, tz, DEFAULT_GRID_SNAP_TOLERANCE);
-                    if (!hit) continue;
-                    const d = Math.hypot(tx - hit.x, tz - hit.z);
-                    if (!bestCorr || d < bestCorr.dist) {
-                        bestCorr = {
-                            dx: hit.x - pt[0],
-                            dz: hit.z - pt[1],
-                            target: [hit.x, hit.z],
-                            dist: d,
-                        };
+                    if (hit) {
+                        const d = Math.hypot(tx - hit.x, tz - hit.z);
+                        if (!bestCorr || d < bestCorr.dist) {
+                            bestCorr = { dx: hit.x - pt[0], dz: hit.z - pt[1], target: [hit.x, hit.z], dist: d };
+                        }
+                    }
+                    if (useResStep) {
+                        const sx = Math.round(tx / resStep) * resStep;
+                        const sz = Math.round(tz / resStep) * resStep;
+                        const d = Math.hypot(tx - sx, tz - sz);
+                        if (d <= DEFAULT_GRID_SNAP_TOLERANCE && (!bestCorr || d < bestCorr.dist)) {
+                            bestCorr = { dx: sx - pt[0], dz: sz - pt[1], target: [sx, sz], dist: d };
+                        }
                     }
                 }
                 if (bestCorr) {
