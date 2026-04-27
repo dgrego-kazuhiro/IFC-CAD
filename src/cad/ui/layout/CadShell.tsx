@@ -14,6 +14,7 @@ import { RemoveConstraintCommand } from "../../commands/create/AddConstraintComm
 import { CreateSpaceCommand } from "../../commands/create/CreateSpaceCommand";
 import { pickNewRoomName } from "../room/roomNaming";
 import { saveScene, loadScene, clearScene, hasSavedScene } from "../../application/Persistence";
+import { downloadIfc } from "../../io/ifc/IfcExporter";
 
 export default function CadShell() {
     const activeTool = useAppState((state: AppState) => state.activeTool);
@@ -126,6 +127,18 @@ export default function CadShell() {
                         }}
                         title="保存データを削除し、シーンも初期化"
                     >Clear</button>
+                    <button
+                        className="px-3 py-1 rounded border bg-zinc-800 border-transparent hover:bg-zinc-700 text-emerald-300"
+                        onClick={() => {
+                            try {
+                                downloadIfc(useAppState.getState());
+                            } catch (e) {
+                                console.error("[IFC export] failed:", e);
+                                alert("IFC エクスポートに失敗しました。コンソールを確認してください。");
+                            }
+                        }}
+                        title="現在のシーンを IFC2X3 ファイル (.ifc) として書き出し"
+                    >Export IFC</button>
                 </div>
                 <div className="ml-auto flex gap-2 text-sm">
                     <button

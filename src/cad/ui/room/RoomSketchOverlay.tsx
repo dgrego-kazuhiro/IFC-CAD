@@ -9,6 +9,7 @@ import { Camera } from "../../renderer/camera/Camera";
 import { ViewportHandle } from "../layout/Viewport";
 import { generateId } from "../../utils/ids";
 import { computeMiteredCorners, computeMiteredWallAxes } from "./wallSync";
+import { computeWallHexagon } from "../../geometry/wall/EdgeGeometry";
 import { Vec2 } from "../../geometry/math/Vec2";
 import { Vec3 } from "../../geometry/math/Vec3";
 import polygonClipping from "polygon-clipping";
@@ -278,6 +279,12 @@ const C_WHITE         = rgba(255, 255, 255);
 const C_HL_ORANGE     = rgba(234, 88, 12);
 const C_HL_FILL       = rgba(234, 88, 12, 0.25);
 const C_WALL_SLAB     = rgba(140, 140, 145, 0.85);
+// 仮壁 (provisional wall) — light gray band shown outside a freshly drawn
+// room polygon, before walls have been generated. Per docs/specification/new.md
+// §1: "仮壁: 薄いグレー" / §4: "仮壁: 薄いグレーの帯".
+const C_VIRTUAL_WALL  = rgba(160, 170, 185, 0.55);
+// Default wall thickness for the provisional band (105mm — residential mode default).
+const VIRTUAL_WALL_THICKNESS_M = 0.105;
 const C_OVERLAP       = rgba(236, 72, 153);
 const C_OVERLAP_FILL  = rgba(236, 72, 153, 0.18);
 const C_SNAP_OBJ      = rgba(25, 204, 102);
@@ -1158,6 +1165,75 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         const hovPVtx = hoveredPolyVertexRef.current;
         const sketchSel = sketchSelectionRef.current;
 
+        // Shared walls live on the boundary between two polygons; both
+        // polygons reference the same wallId in their per-edge `wallIds`.
+        // Pre-scan every Space's polygons so the wall-slab loop knows
+        // upfront (a) which wallId is shared, (b) which polygon owns the
+        // single render (canonical owner = lex-smallest poly id), and (c)
+        // for each adjacency, whether the next/prev wall is shared.
+        const wallToPolyIds = new Map<string, Set<string>>();
+        for (const elId in els) {
+            const e = els[elId];
+            if (!e || e.type !== "Space") continue;
+            const sp = e as SpaceElement;
+            for (const p of sp.polygons ?? []) {
+                for (const wid of p.wallIds ?? []) {
+                    if (!wid) continue;
+                    let s = wallToPolyIds.get(wid);
+                    if (!s) { s = new Set(); wallToPolyIds.set(wid, s); }
+                    s.add(p.id);
+                }
+            }
+        }
+        const isWallShared = (wid: string) =>
+            (wallToPolyIds.get(wid)?.size ?? 0) >= 2;
+        const isWallOwner = (wid: string, polyId: string) => {
+            const refs = wallToPolyIds.get(wid);
+            if (!refs || refs.size === 0) return false;
+            if (refs.size === 1) return refs.has(polyId);
+            // Deterministic owner: lex-smallest polyId in the referrer set.
+            let owner = "";
+            for (const id of refs) if (owner === "" || id < owner) owner = id;
+            return owner === polyId;
+        };
+
+        // 他ポリゴンを id で逆引きする lookup。`vertexConnections` で
+        // クロスポリゴンの incident edge を引くときに `computeWallHexagon`
+        // へ渡す。
+        const polygonLookup = (polyId: string): RoomPolygon | undefined => {
+            for (const elId in els) {
+                const e2 = els[elId];
+                if (!e2 || e2.type !== "Space") continue;
+                const sp = e2 as SpaceElement;
+                const found = sp.polygons?.find((p) => p.id === polyId);
+                if (found) return found;
+            }
+            return undefined;
+        };
+
+        /** 6 頂点ヘキサゴン (`computeWallHexagon`) を `earcut` で三角化し、
+         *  `SketchQuad[]` (= 1 quad per triangle, p2 == p3) にして返す。
+         *  3+ 接続交差点があると hex が非凸になる場合があるので earcut を使う。 */
+        const buildWallSlabQuads = (poly: RoomPolygon, edgeIdx: number): SketchQuad[] => {
+            const hex = computeWallHexagon(poly, edgeIdx, polygonLookup);
+            if (!hex) return [];
+            const flat: number[] = [];
+            for (const p of hex.vertices) { flat.push(p[0], p[1]); }
+            const tris = earcut(flat, undefined, 2);
+            const out: SketchQuad[] = [];
+            for (let i = 0; i < tris.length; i += 3) {
+                const a = tris[i] * 2, b = tris[i + 1] * 2, c = tris[i + 2] * 2;
+                out.push({
+                    p0: [flat[a],     flat[a + 1]],
+                    p1: [flat[b],     flat[b + 1]],
+                    p2: [flat[c],     flat[c + 1]],
+                    p3: [flat[c],     flat[c + 1]],
+                    color: C_WALL_SLAB,
+                });
+            }
+            return out;
+        };
+
         // Origin symbol: short X (red) / Z (green) axes with a center dot
         lines.push({ ax: 0, az: 0, bx: ORIGIN_AXIS_LEN, bz: 0, color: C_ORIGIN_X, width: 1.5 });
         lines.push({ ax: 0, az: 0, bx: 0, bz: ORIGIN_AXIS_LEN, color: C_ORIGIN_Z, width: 1.5 });
@@ -1165,6 +1241,104 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             wx: 0, wz: 0, radius: 4, shape: "circle",
             fill: C_WHITE, stroke: C_ORIGIN_DOT, strokeWidth: 1.5,
         });
+
+        // ── Passive pass: render OTHER rooms' polygons behind the active one.
+        // The active-room polygon loop below only iterates `rm.polygons`, so
+        // without this pass switching the active room would make every
+        // previously-drawn room disappear from the 2D overlay. We draw their
+        // outlines + virtual-wall bands + faint fill, but no edit handles.
+        for (const otherId in els) {
+            if (otherId === rid) continue;
+            const other = els[otherId];
+            if (!other || other.type !== "Space") continue;
+            const otherRoom = other as SpaceElement;
+            if (!otherRoom.polygons) continue;
+            for (const poly of otherRoom.polygons) {
+                if (poly.wallOutlineOf) continue;
+                if (poly.outer.length < 3) continue;
+
+                // Confirmed walls (other rooms) — per-edge 6-vertex hexagon
+                // via computeWallHexagon. Shared edges render only on the
+                // canonical owner (lex-smallest polyId in wallToPolyIds).
+                if (poly.wallIds && poly.wallIds.length === poly.outer.length
+                    && (poly.wallThickness != null
+                        || (poly.innerThickness != null && poly.outerThickness != null))) {
+                    const n = poly.outer.length;
+                    for (let i = 0; i < n; i++) {
+                        const wid = poly.wallIds[i];
+                        if (!wid) continue;
+                        if (!isWallOwner(wid, poly.id)) continue;
+                        for (const q of buildWallSlabQuads(poly, i)) quads.push(q);
+                    }
+                } else if (isPolygonClosed(poly)) {
+                    // 仮壁 band for other rooms too — centred on the polyline
+                    // (axis-on-centre per spec §4: 区画線 ≒ 壁芯).
+                    const half = VIRTUAL_WALL_THICKNESS_M / 2;
+                    let cx = 0, cy = 0;
+                    for (const p of poly.outer) { cx += p[0]; cy += p[1]; }
+                    cx /= poly.outer.length; cy /= poly.outer.length;
+                    const axis = poly.outer;
+                    const n = axis.length;
+                    const outerRing = computeMiteredCorners(axis, [cx, cy], half);
+                    const innerRing = computeMiteredCorners(axis, [cx, cy], -half);
+                    for (let i = 0; i < n; i++) {
+                        const j = (i + 1) % n;
+                        quads.push({
+                            p0: [innerRing[i][0], innerRing[i][1]],
+                            p1: [innerRing[j][0], innerRing[j][1]],
+                            p2: [outerRing[j][0], outerRing[j][1]],
+                            p3: [outerRing[i][0], outerRing[i][1]],
+                            color: C_VIRTUAL_WALL,
+                        });
+                    }
+                }
+
+                // Faint interior fill (closed only)
+                if (isPolygonClosed(poly)) {
+                    const flat: number[] = [];
+                    for (const p of poly.outer) { flat.push(p[0], p[1]); }
+                    const holeIdx: number[] = [];
+                    for (const h of poly.holes ?? []) {
+                        holeIdx.push(flat.length / 2);
+                        for (const p of h) flat.push(p[0], p[1]);
+                    }
+                    const tris = earcut(flat, holeIdx.length > 0 ? holeIdx : undefined, 2);
+                    const inactiveFill: RGBA = rgba(100, 116, 139, 0.05);
+                    for (let i = 0; i < tris.length; i += 3) {
+                        const ai = tris[i] * 2, bi = tris[i + 1] * 2, ci = tris[i + 2] * 2;
+                        quads.push({
+                            p0: [flat[ai], flat[ai + 1]],
+                            p1: [flat[bi], flat[bi + 1]],
+                            p2: [flat[ci], flat[ci + 1]],
+                            p3: [flat[ci], flat[ci + 1]],
+                            color: inactiveFill,
+                        });
+                    }
+                }
+
+                // Outline edges in muted slate so the active room visually wins.
+                const inactiveStroke: RGBA = rgba(100, 116, 139, 0.65);
+                const polyEdgeList = polygonEdges(poly);
+                for (const [ai, bi] of polyEdgeList) {
+                    const a = poly.outer[ai], b = poly.outer[bi];
+                    lines.push({
+                        ax: a[0], az: a[1], bx: b[0], bz: b[1],
+                        color: inactiveStroke, width: 1.2,
+                    });
+                }
+                for (const h of poly.holes ?? []) {
+                    if (h.length < 2) continue;
+                    for (let i = 0; i < h.length; i++) {
+                        const a = h[i];
+                        const b = h[(i + 1) % h.length];
+                        lines.push({
+                            ax: a[0], az: a[1], bx: b[0], bz: b[1],
+                            color: inactiveStroke, width: 1.2,
+                        });
+                    }
+                }
+            }
+        }
 
         // Detect overlaps (focus polygon vs others) — drives the merge button
         const overlapping = new Set<string>();
@@ -1223,58 +1397,48 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const fillA: RGBA = [fill[0], fill[1], fill[2], fill[3] * alphaMul];
                 const strokeA: RGBA = [stroke[0], stroke[1], stroke[2], stroke[3] * alphaMul];
 
-                // Gray wall slabs + explicit outer outline stroke (if walls
-                // exist for this polygon's outer ring). Outline is DERIVED
-                // geometry — drawn here directly from inner + wallThickness,
-                // NOT stored as a separate RoomPolygon.
-                if (poly.wallIds && poly.wallIds.length === poly.outer.length && poly.wallThickness) {
-                    const T = poly.wallThickness;
+                // Gray wall slabs — per-edge 6-vertex hexagon
+                // (innerPrev / s / outerPrev / outerNext / e / innerNext)
+                // computed by `computeWallHexagon`. Inner / outer thickness
+                // come from `resolveWallThicknesses(poly)`. Shared walls
+                // render only in the canonical owner.
+                if (poly.wallIds && poly.wallIds.length === poly.outer.length
+                    && (poly.wallThickness != null
+                        || (poly.innerThickness != null && poly.outerThickness != null))) {
+                    const n = poly.outer.length;
+                    for (let i = 0; i < n; i++) {
+                        const wid = poly.wallIds[i];
+                        if (!wid) continue;
+                        if (!isWallOwner(wid, poly.id)) continue;
+                        for (const q of buildWallSlabQuads(poly, i)) quads.push(q);
+                    }
+                }
+
+                // 仮壁 (provisional wall band) — drawn around the polyline
+                // when no walls have been generated yet. Per spec §4 the
+                // polyline acts as 壁芯 (wall centre axis), so the band
+                // straddles it ±thickness/2.
+                const hasConfirmedWalls = !!(poly.wallIds && poly.wallIds.some(Boolean));
+                if (!isWallOutline && !hasConfirmedWalls
+                    && poly.outer.length >= 3 && isPolygonClosed(poly)) {
+                    const half = VIRTUAL_WALL_THICKNESS_M / 2;
                     let cx = 0, cy = 0;
                     for (const p of poly.outer) { cx += p[0]; cy += p[1]; }
                     cx /= poly.outer.length; cy /= poly.outer.length;
-                    const inner = poly.outer;
-                    const n = inner.length;
-                    const outer = computeMiteredCorners(inner, [cx, cy], T);
-                    // Per-wall outward normal scaled by T — used for square
-                    // caps at ends where the neighbouring wall is absent (so
-                    // the remaining wall doesn't render a mitred triangle tip
-                    // poking into empty space).
-                    const capOffset: [number, number][] = [];
+                    const axis = poly.outer;
+                    const n = axis.length;
+                    const outerRing = computeMiteredCorners(axis, [cx, cy], half);
+                    const innerRing = computeMiteredCorners(axis, [cx, cy], -half);
                     for (let i = 0; i < n; i++) {
                         const j = (i + 1) % n;
-                        const dx = inner[j][0] - inner[i][0];
-                        const dy = inner[j][1] - inner[i][1];
-                        const len = Math.hypot(dx, dy) || 1;
-                        let nx = -dy / len * T, ny = dx / len * T;
-                        const mx = (inner[i][0] + inner[j][0]) / 2;
-                        const my = (inner[i][1] + inner[j][1]) / 2;
-                        if (nx * (cx - mx) + ny * (cy - my) > 0) { nx = -nx; ny = -ny; }
-                        capOffset.push([nx, ny]);
-                    }
-                    for (let i = 0; i < n; i++) {
-                        if (!poly.wallIds[i]) continue;
-                        const j = (i + 1) % n;
-                        const prev = (i - 1 + n) % n;
-                        const hasPrev = !!poly.wallIds[prev];
-                        const hasNext = !!poly.wallIds[j];
-                        const p3: [number, number] = hasPrev
-                            ? [outer[i][0], outer[i][1]]
-                            : [inner[i][0] + capOffset[i][0], inner[i][1] + capOffset[i][1]];
-                        const p2: [number, number] = hasNext
-                            ? [outer[j][0], outer[j][1]]
-                            : [inner[j][0] + capOffset[i][0], inner[j][1] + capOffset[i][1]];
                         quads.push({
-                            p0: [inner[i][0], inner[i][1]],
-                            p1: [inner[j][0], inner[j][1]],
-                            p2,
-                            p3,
-                            color: C_WALL_SLAB,
+                            p0: [innerRing[i][0], innerRing[i][1]],
+                            p1: [innerRing[j][0], innerRing[j][1]],
+                            p2: [outerRing[j][0], outerRing[j][1]],
+                            p3: [outerRing[i][0], outerRing[i][1]],
+                            color: C_VIRTUAL_WALL,
                         });
                     }
-                    // Outer outline lines + corner markers are drawn by the
-                    // separate wall-outline polygon (wallOutlineOf === poly.id)
-                    // in the general polygon rendering loop — that's where
-                    // they're selectable as sketch targets too.
                 }
 
                 // Triangulated fill via earcut — skip for wall outline polygons
@@ -1961,6 +2125,77 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     moved: false,
                 });
                 return;
+            }
+
+            // Inactive-room interior pick: clicking inside a polygon that
+            // belongs to a non-active Space switches focus to that room AND
+            // starts an interior drag in the same gesture, so previously-
+            // drawn rooms stay editable. Vertex/edge handles are still only
+            // rendered for the active room — to vertex-edit an inactive
+            // room, click its interior first to activate it.
+            {
+                let hitOtherRoomId: ElementId | null = null;
+                let hitOtherPoly: RoomPolygon | null = null;
+                for (const oid in elements) {
+                    if (oid === activeRoomId) continue;
+                    const oel = elements[oid];
+                    if (!oel || oel.type !== "Space") continue;
+                    const ospace = oel as SpaceElement;
+                    if (!ospace.polygons) continue;
+                    for (let i = ospace.polygons.length - 1; i >= 0; i--) {
+                        const op = ospace.polygons[i];
+                        if (op.wallOutlineOf) continue;
+                        if (!isPolygonClosed(op)) continue;
+                        if (pointInRoomPolygon(cx, cz, op.outer, op.holes ?? [])) {
+                            hitOtherRoomId = oid;
+                            hitOtherPoly = op;
+                            break;
+                        }
+                    }
+                    if (hitOtherRoomId) break;
+                }
+                if (hitOtherRoomId && hitOtherPoly) {
+                    // Snapshot any walls owned by this polygon so the drag
+                    // translates them in lockstep (same as the active path).
+                    const otherWallAxes: { id: string; a: Vec3; b: Vec3 }[] = [];
+                    if (hitOtherPoly.wallIds) {
+                        for (const wid of hitOtherPoly.wallIds) {
+                            if (!wid) continue;
+                            const wEl = elements[wid] as WallElement | undefined;
+                            if (wEl && wEl.type === "Wall") {
+                                otherWallAxes.push({
+                                    id: wid,
+                                    a: [wEl.axis[0][0], wEl.axis[0][1], wEl.axis[0][2]],
+                                    b: [wEl.axis[1][0], wEl.axis[1][1], wEl.axis[1][2]],
+                                });
+                            }
+                        }
+                    }
+                    setActiveRoom(hitOtherRoomId);
+                    // Sync the ref synchronously so that the pointer-move
+                    // handler — which may fire before React commits the new
+                    // active room — already reads the right room id.
+                    activeRoomIdRef.current = hitOtherRoomId;
+                    setSelection([`poly:${hitOtherPoly.id}`]);
+                    setLastDraggedPolyId(null);
+                    setDragState({
+                        kind: "poly",
+                        polyId: hitOtherPoly.id,
+                        startWorld: wp,
+                        origOuter: hitOtherPoly.outer.map(p => [p[0], p[1]] as Vec2),
+                        origHoles: (hitOtherPoly.holes ?? []).map(h => h.map(p => [p[0], p[1]] as Vec2)),
+                        origShapeCenter: hitOtherPoly.shape?.type === "circle"
+                            ? [hitOtherPoly.shape.center[0], hitOtherPoly.shape.center[1]]
+                            : undefined,
+                        origShapeRadius: hitOtherPoly.shape?.type === "circle"
+                            ? hitOtherPoly.shape.radius : undefined,
+                        origWallAxes: otherWallAxes,
+                        origConcentric: [],
+                        origOutlines: [],
+                        moved: false,
+                    });
+                    return;
+                }
             }
 
             // Empty click — preserve selection when Shift/Ctrl is held

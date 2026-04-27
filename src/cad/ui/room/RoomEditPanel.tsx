@@ -1,9 +1,11 @@
 "use client";
 
 import React, { useState } from "react";
-import { RectangleHorizontal, Trash2, MousePointer2, Square, Spline, Circle } from "lucide-react";
+import { RectangleHorizontal, Trash2, MousePointer2, Square, Spline, Circle, Boxes } from "lucide-react";
 import { useAppState, AppState } from "../../application/AppState";
-import { SpaceElement, RoomPolygon, polygonEdges, isPolygonClosed } from "../../model/elements/SpaceElement";
+import { SpaceElement, RoomPolygon, polygonEdges, isPolygonClosed, WallReferenceLine } from "../../model/elements/SpaceElement";
+import { ensureCCW, computeWallHexagon } from "../../geometry/wall/EdgeGeometry";
+import { generateId } from "../../utils/ids";
 import { WallElement } from "../../model/elements/WallElement";
 import { CreateWallCommand } from "../../commands/create/CreateWallCommand";
 import {
@@ -14,6 +16,7 @@ import {
 import { Constraint } from "../../model/constraint/Constraint";
 import { Vec2 } from "../../geometry/math/Vec2";
 import { Vec3 } from "../../geometry/math/Vec3";
+import { ElementId } from "../../model/base/ElementId";
 
 import { computeMiteredWallAxes, computeWalledOutlineGeometry } from "./wallSync";
 
@@ -304,6 +307,650 @@ export default function RoomEditPanel() {
             polygons: updatedPolys,
             dirtyFlags: new Set([...room.dirtyFlags, "Geometry", "Mesh", "Render"]),
         } as any);
+    };
+
+    /**
+     * 全部屋の壁を一括生成。エッジ単位ではなく **コリニア部分区間** 単位で
+     * 共有判定するので、長さの違うエッジが一部だけ重なるケース (spec §6) に
+     * 対応する:
+     *
+     *   1. 閉じたポリゴンのエッジを「同一直線上」のクラスタに集約
+     *   2. 各クラスタ内で全エンドポイントを 1D 投影し、ブレークポイントを抽出
+     *   3. 各エッジを (≥1 個の) 部分区間に分割。同じ (cluster, tA, tB) を共有
+     *      する部分区間は 1 本の壁として束ねる
+     *   4. 区間を共有するポリゴン数 ≥ 2 ⇒ 共通壁 / = 1 ⇒ 外壁
+     *   5. 必要なら poly.outer にブレークポイント頂点を挿入し、wallIds を
+     *      新エッジ数に合わせて再構築
+     *   6. 修正されたポリゴンに乗っていた拘束は破棄し、新エッジに対して
+     *      水平/垂直 (≈軸並行) 拘束を再付与して矩形性を維持
+     */
+    const handleGenerateAllWalls = () => {
+        const wallThickness = (parseFloat(wallThicknessMm) || 200) / 1000;
+        const circleAngleDeg = Math.max(1, Math.min(180, parseFloat(circleWallAngleDeg) || 30));
+        const circleAngleRad = (circleAngleDeg * Math.PI) / 180;
+
+        // 新データモデルでの壁基準線。現状 UI が無いので "Center" で固定。
+        // RoomPolygon.wallReference (および inner/outerThickness) を別 UI で
+        // 切り替え可能にしたら、ここをそのフィールドから読むように変える。
+        const wallReference: WallReferenceLine = "Center";
+        const innerT = wallThickness / 2;
+        const outerT = wallThickness / 2;
+
+        interface PolyWork {
+            roomId: ElementId;
+            room: SpaceElement;
+            poly: RoomPolygon;
+            workingOuter: Vec2[];
+        }
+        const works: PolyWork[] = [];
+        for (const eid in elements) {
+            const el = elements[eid];
+            if (!el || el.type !== "Space") continue;
+            const space = el as SpaceElement;
+            if (!space.polygons || space.polygons.length === 0) continue;
+            for (const poly of space.polygons) {
+                if (poly.wallOutlineOf) continue;
+                if (poly.shape?.type !== "circle" && !isPolygonClosed(poly)) continue;
+
+                let workingOuter = poly.outer;
+                if (poly.shape?.type === "circle") {
+                    const n = Math.max(3, Math.round((Math.PI * 2) / circleAngleRad));
+                    const c = poly.shape.center, r = poly.shape.radius;
+                    const pts: Vec2[] = [];
+                    for (let i = 0; i < n; i++) {
+                        const a = (i / n) * Math.PI * 2;
+                        pts.push([c[0] + Math.cos(a) * r, c[1] + Math.sin(a) * r]);
+                    }
+                    workingOuter = pts;
+                }
+                // 新データモデルでは CCW を前提とするので、ここで正規化する。
+                workingOuter = ensureCCW(workingOuter);
+                works.push({ roomId: eid as ElementId, room: space, poly, workingOuter });
+            }
+        }
+        if (works.length === 0) return;
+
+        // ── 1. Cluster edges by collinear line (cross-room) ─────────────
+        const ANGLE_TOL = (3 * Math.PI) / 180;
+        // DIST_TOL: クラスタ化での「同一直線」垂直距離許容 (= 壁厚以上で
+        // 多少アライメントがズレた壁同士もまとめる)。
+        // T_QUANTUM: 軸方向 t 値のスナップ量子。FP ノイズ吸収目的のみで、
+        // ブレークポイント位置を歪めないよう 1 mm に固定する (旧コードでは
+        // DIST_TOL を流用しており、壁厚と同サイズ ≒ 200mm グリッドに丸めて
+        // しまっていた → 重なり境界が壁厚分ズレ、頂点クラスタが立たない)。
+        const DIST_TOL = Math.max(0.02, wallThickness);
+        const T_QUANTUM = 0.001; // 1 mm
+
+        interface ClusterEdge {
+            workIdx: number;
+            edgeIdx: number;
+            tStart: number;  // projection of p1 onto cluster.dir
+            tEnd: number;    // projection of p2
+        }
+        interface Cluster {
+            theta: number;                 // [0, π)
+            dir: [number, number];         // (cos θ, sin θ)
+            normal: [number, number];      // (-sin θ, cos θ)
+            refPoint: Vec2;                // origin for projection
+            edges: ClusterEdge[];
+        }
+        const clusters: Cluster[] = [];
+        for (let wi = 0; wi < works.length; wi++) {
+            const outer = works[wi].workingOuter;
+            const n = outer.length;
+            for (let ei = 0; ei < n; ei++) {
+                const p1 = outer[ei];
+                const p2 = outer[(ei + 1) % n];
+                const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+                const len = Math.hypot(dx, dy);
+                if (len < 1e-9) continue;
+                let theta = Math.atan2(dy, dx);
+                if (theta < 0) theta += Math.PI;
+                if (theta >= Math.PI) theta -= Math.PI;
+
+                let cluster: Cluster | null = null;
+                for (const c of clusters) {
+                    let dTh = Math.abs(theta - c.theta);
+                    if (dTh > Math.PI / 2) dTh = Math.PI - dTh;
+                    if (dTh > ANGLE_TOL) continue;
+                    const perp = Math.abs(
+                        (p1[0] - c.refPoint[0]) * c.normal[0] +
+                        (p1[1] - c.refPoint[1]) * c.normal[1],
+                    );
+                    if (perp > DIST_TOL) continue;
+                    cluster = c;
+                    break;
+                }
+                if (!cluster) {
+                    const dir: [number, number] = [Math.cos(theta), Math.sin(theta)];
+                    const normal: [number, number] = [-Math.sin(theta), Math.cos(theta)];
+                    cluster = { theta, dir, normal, refPoint: [p1[0], p1[1]], edges: [] };
+                    clusters.push(cluster);
+                }
+                const tStart =
+                    (p1[0] - cluster.refPoint[0]) * cluster.dir[0] +
+                    (p1[1] - cluster.refPoint[1]) * cluster.dir[1];
+                const tEnd =
+                    (p2[0] - cluster.refPoint[0]) * cluster.dir[0] +
+                    (p2[1] - cluster.refPoint[1]) * cluster.dir[1];
+                cluster.edges.push({ workIdx: wi, edgeIdx: ei, tStart, tEnd });
+            }
+        }
+
+        // ── 2/3. Per cluster, derive sub-segments per edge ───────────────
+        // Quantize t-values so endpoints from different polygons that align
+        // within the tolerance share a single canonical breakpoint.
+        const quantize = (t: number) => Math.round(t / T_QUANTUM) * T_QUANTUM;
+
+        interface SubSeg {
+            clusterIdx: number;
+            tA: number;        // canonical (ascending) sub-range
+            tB: number;
+            startWorld: Vec2;  // matches p1 → p2 direction of the edge
+            endWorld: Vec2;
+        }
+        // perEdgeSubs[wi][ei] = subs in edge's natural direction (p1 → p2)
+        const perEdgeSubs: SubSeg[][][] = works.map((w) =>
+            w.workingOuter.map(() => []),
+        );
+
+        for (let ci = 0; ci < clusters.length; ci++) {
+            const cluster = clusters[ci];
+            const tSet = new Set<number>();
+            for (const e of cluster.edges) {
+                tSet.add(quantize(e.tStart));
+                tSet.add(quantize(e.tEnd));
+            }
+            const breakpoints = [...tSet].sort((a, b) => a - b);
+
+            for (const e of cluster.edges) {
+                const qS = quantize(e.tStart);
+                const qE = quantize(e.tEnd);
+                const tMin = Math.min(qS, qE);
+                const tMax = Math.max(qS, qE);
+                if (tMax - tMin < T_QUANTUM / 2) continue; // degenerate
+                const reverse = qS > qE;
+
+                const interior = breakpoints.filter(
+                    (t) => t > tMin + T_QUANTUM / 2 && t < tMax - T_QUANTUM / 2,
+                );
+                const tValues = [tMin, ...interior, tMax];
+
+                const subRanges: SubSeg[] = [];
+                for (let k = 0; k < tValues.length - 1; k++) {
+                    const tA = tValues[k];
+                    const tB = tValues[k + 1];
+                    const wA: Vec2 = [
+                        cluster.refPoint[0] + cluster.dir[0] * tA,
+                        cluster.refPoint[1] + cluster.dir[1] * tA,
+                    ];
+                    const wB: Vec2 = [
+                        cluster.refPoint[0] + cluster.dir[0] * tB,
+                        cluster.refPoint[1] + cluster.dir[1] * tB,
+                    ];
+                    subRanges.push({ clusterIdx: ci, tA, tB, startWorld: wA, endWorld: wB });
+                }
+                // Re-orient subs in p1 → p2 direction. When the edge runs
+                // against the cluster direction, swap each sub's start/end
+                // and reverse the array so subs[0].startWorld == p1.
+                if (reverse) {
+                    subRanges.reverse();
+                    for (const s of subRanges) {
+                        const tmp = s.startWorld; s.startWorld = s.endWorld; s.endWorld = tmp;
+                    }
+                }
+                perEdgeSubs[e.workIdx][e.edgeIdx] = subRanges;
+            }
+        }
+
+        // ── 4. Group sub-segments across polygons ────────────────────────
+        const groupKey = (clusterIdx: number, tA: number, tB: number) =>
+            `${clusterIdx}|${tA.toFixed(4)}|${tB.toFixed(4)}`;
+
+        interface SubGroupContributor {
+            workIdx: number;
+            oldEdgeIdx: number;
+            /** subIdx within `perEdgeSubs[workIdx][oldEdgeIdx]`. */
+            subIdx: number;
+        }
+        interface SubGroup {
+            polysContributing: Set<string>;
+            axis: [Vec3, Vec3];
+            contributors: SubGroupContributor[];
+        }
+        const subGroups = new Map<string, SubGroup>();
+        for (let wi = 0; wi < works.length; wi++) {
+            const polyId = works[wi].poly.id;
+            for (let ei = 0; ei < works[wi].workingOuter.length; ei++) {
+                const subList = perEdgeSubs[wi][ei];
+                for (let si = 0; si < subList.length; si++) {
+                    const sub = subList[si];
+                    const key = groupKey(sub.clusterIdx, sub.tA, sub.tB);
+                    let g = subGroups.get(key);
+                    if (!g) {
+                        // Use cluster-canonical (ascending) world axis so
+                        // every contributor agrees on the wall geometry.
+                        const cluster = clusters[sub.clusterIdx];
+                        const aWorld: Vec2 = [
+                            cluster.refPoint[0] + cluster.dir[0] * sub.tA,
+                            cluster.refPoint[1] + cluster.dir[1] * sub.tA,
+                        ];
+                        const bWorld: Vec2 = [
+                            cluster.refPoint[0] + cluster.dir[0] * sub.tB,
+                            cluster.refPoint[1] + cluster.dir[1] * sub.tB,
+                        ];
+                        g = {
+                            polysContributing: new Set(),
+                            axis: [
+                                [aWorld[0], 0, aWorld[1]],
+                                [bWorld[0], 0, bWorld[1]],
+                            ] as [Vec3, Vec3],
+                            contributors: [],
+                        };
+                        subGroups.set(key, g);
+                    }
+                    g.polysContributing.add(polyId);
+                    g.contributors.push({ workIdx: wi, oldEdgeIdx: ei, subIdx: si });
+                }
+            }
+        }
+
+        // ── 5. Build new outer + new wallIds per polygon ─────────────────
+        interface PolyRebuild {
+            workIdx: number;
+            newOuter: Vec2[];
+            newWallIds: string[];
+            /** Per new edge: 共通エッジなら SharedEdge.id、無ければ undefined。 */
+            newSharedEdgeIds: (string | undefined)[];
+            /** Per new edge: 永続 edgeId (今世代で振り直し)。 */
+            newEdgeIds: string[];
+            modified: boolean;
+            // oldEdgeIdx → list of new edge indices (length = subs.length, or 1 for un-clustered edges)
+            oldEdgeToNewEdges: number[][];
+            // oldVertexIdx → newVertexIdx
+            oldVertexToNew: number[];
+        }
+
+        // Allocate placeholder so groupKey-to-wallId can be filled before
+        // we build wallIds (next loop creates the walls).
+        const groupWallId = new Map<string, string>();
+        // 同じ groupKey に対して 1 個の SharedEdge.id (≥2 寄与で生成)。
+        const groupSharedEdgeId = new Map<string, string>();
+
+        const polyRebuilds: PolyRebuild[] = [];
+        for (let wi = 0; wi < works.length; wi++) {
+            const w = works[wi];
+            const oldOuter = w.workingOuter;
+            const oldN = oldOuter.length;
+            const newOuter: Vec2[] = [];
+            const oldVertexToNew: number[] = new Array(oldN);
+            const oldEdgeToNewEdges: number[][] = [];
+            let modified = false;
+            for (let ei = 0; ei < oldN; ei++) {
+                oldVertexToNew[ei] = newOuter.length;
+                newOuter.push([oldOuter[ei][0], oldOuter[ei][1]]);
+                const subs = perEdgeSubs[wi][ei];
+                const startEdgeIdx = oldVertexToNew[ei];
+                const newEdges: number[] = [];
+                if (subs.length <= 1) {
+                    newEdges.push(startEdgeIdx);
+                } else {
+                    modified = true;
+                    for (let k = 0; k < subs.length; k++) {
+                        if (k > 0) {
+                            // Insert breakpoint vertex (start of sub k = end of sub k-1)
+                            newOuter.push([subs[k].startWorld[0], subs[k].startWorld[1]]);
+                        }
+                        newEdges.push(startEdgeIdx + k);
+                    }
+                }
+                oldEdgeToNewEdges.push(newEdges);
+            }
+            const newEdgeCount = newOuter.length;
+            polyRebuilds.push({
+                workIdx: wi,
+                newOuter,
+                newWallIds: new Array(newEdgeCount).fill(""),
+                newSharedEdgeIds: new Array(newEdgeCount).fill(undefined),
+                newEdgeIds: Array.from({ length: newEdgeCount }, () => generateId()),
+                modified,
+                oldEdgeToNewEdges,
+                oldVertexToNew,
+            });
+        }
+
+        // ── 6. Drop existing walls referenced by any contributing polygon ─
+        const prevWallIds = new Set<string>();
+        for (const w of works) {
+            for (const wid of w.poly.wallIds ?? []) if (wid) prevWallIds.add(wid);
+        }
+        for (const wid of prevWallIds) {
+            if (elements[wid]) removeElement(wid);
+        }
+
+        // Drop wall-outline polygons of regenerated inners + their constraints.
+        const innerIds = new Set<string>();
+        for (const w of works) innerIds.add(w.poly.id);
+        const staleOutlineIds = new Set<string>();
+        for (const w of works) {
+            for (const p of w.room.polygons) {
+                if (p.wallOutlineOf && innerIds.has(p.wallOutlineOf)) {
+                    staleOutlineIds.add(p.id);
+                }
+            }
+        }
+
+        // Modified polygons get their constraints dropped too — edge / vertex
+        // indices are about to shift in arbitrary ways. Axis alignment is
+        // re-established below by re-applying Horizontal / Vertical to each
+        // new edge whose direction is within tolerance of an axis.
+        const modifiedPolyIds = new Set<string>();
+        for (const r of polyRebuilds) {
+            if (r.modified) modifiedPolyIds.add(works[r.workIdx].poly.id);
+        }
+
+        for (const cid in constraints) {
+            const c = constraints[cid];
+            const drop = c.targets.some((t) => {
+                const tt = t as any;
+                if (t.kind !== "SketchEdge" && t.kind !== "SketchPoint" && t.kind !== "SketchCircle") {
+                    return false;
+                }
+                return staleOutlineIds.has(tt.polyId) || modifiedPolyIds.has(tt.polyId);
+            });
+            if (drop) executeCommand(new RemoveConstraintCommand(cid));
+        }
+
+        // ── 7. Create one wall per sub-group ──────────────────────────────
+        // 各壁に polyRef (canonical = lex-smallest polyId の参加者) と
+        // inner/outerThickness を付け、3D 側で `RoomPolygon` を逆引きして
+        // ヘキサゴンフットプリントを作れるようにしておく。
+        let sharedGroups = 0;
+        for (const [key, group] of subGroups) {
+            const isShared = group.polysContributing.size > 1;
+            if (isShared) {
+                sharedGroups++;
+                groupSharedEdgeId.set(key, generateId());
+            }
+            // Canonical contributor: lex-smallest polyId.
+            let canonical = group.contributors[0];
+            for (const c of group.contributors) {
+                const cId = works[c.workIdx].poly.id;
+                const bestId = works[canonical.workIdx].poly.id;
+                if (cId < bestId) canonical = c;
+            }
+            const canonicalWork = works[canonical.workIdx];
+            const canonicalRebuild = polyRebuilds[canonical.workIdx];
+            const newEdges = canonicalRebuild.oldEdgeToNewEdges[canonical.oldEdgeIdx];
+            const canonicalNewEdgeIdx =
+                canonical.subIdx < newEdges.length ? newEdges[canonical.subIdx] : -1;
+
+            const cmd = new CreateWallCommand(
+                group.axis,
+                wallThickness,
+                canonicalWork.room.height,
+                undefined,
+                canonicalWork.room.levelId,
+            );
+            executeCommand(cmd);
+            const wid = cmd.getElementId();
+            updateElement(wid, {
+                wallCategory: isShared ? "shared" : "exterior",
+                innerThickness: innerT,
+                outerThickness: outerT,
+                polyRef: canonicalNewEdgeIdx >= 0 ? {
+                    spaceId: canonicalWork.roomId,
+                    polyId: canonicalWork.poly.id,
+                    edgeIdx: canonicalNewEdgeIdx,
+                } : undefined,
+            } as any);
+            groupWallId.set(key, wid);
+        }
+
+        // ── 8. Wire wallIds + sharedEdgeIds into each polygon's new outer ─
+        for (const rebuild of polyRebuilds) {
+            const wi = rebuild.workIdx;
+            const oldN = works[wi].workingOuter.length;
+            for (let ei = 0; ei < oldN; ei++) {
+                const subs = perEdgeSubs[wi][ei];
+                const newEdges = rebuild.oldEdgeToNewEdges[ei];
+                if (subs.length === 0) continue; // un-clustered (degenerate)
+                for (let k = 0; k < subs.length; k++) {
+                    const sub = subs[k];
+                    const key = groupKey(sub.clusterIdx, sub.tA, sub.tB);
+                    const wid = groupWallId.get(key);
+                    const sharedId = groupSharedEdgeId.get(key);
+                    if (k < newEdges.length) {
+                        if (wid)      rebuild.newWallIds[newEdges[k]] = wid;
+                        if (sharedId) rebuild.newSharedEdgeIds[newEdges[k]] = sharedId;
+                    }
+                }
+            }
+        }
+
+        // ── 8.5. Build vertexConnections (cross-polygon vertex incidence) ──
+        // 各ポリゴンの新 outer 上の頂点を世界座標でクラスタ化し、2 ポリ
+        // ゴン以上が同じ点に集まれば「交差点」とみなす。各メンバーには
+        // 「他ポリゴンの incident edge 一覧」を vertexConnections に詰める。
+        // 同一ポリゴンの prev/next は computeWallHexagon が outer 索引で
+        // 取れるため除外する。3+ ポリゴンが集まる + 字交差にも対応。
+        interface VCEntry { polyId: string; vertexIdx: number; pos: Vec2; outerLen: number; }
+        const vcEntries: VCEntry[] = [];
+        for (const rebuild of polyRebuilds) {
+            const polyId = works[rebuild.workIdx].poly.id;
+            const outerLen = rebuild.newOuter.length;
+            for (let i = 0; i < outerLen; i++) {
+                vcEntries.push({
+                    polyId,
+                    vertexIdx: i,
+                    pos: rebuild.newOuter[i],
+                    outerLen,
+                });
+            }
+        }
+        const VERTEX_TOL_M = 0.005; // 5 mm
+        const vcClusters: VCEntry[][] = [];
+        for (const v of vcEntries) {
+            let placed = false;
+            for (const c of vcClusters) {
+                const ref = c[0];
+                if (Math.hypot(v.pos[0] - ref.pos[0], v.pos[1] - ref.pos[1]) < VERTEX_TOL_M) {
+                    c.push(v);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) vcClusters.push([v]);
+        }
+        type VCList = Array<{ polyId: string; edgeIdx: number }>;
+        const vcByPoly = new Map<string, Map<number, VCList>>();
+        for (const cluster of vcClusters) {
+            if (cluster.length < 2) continue;
+            // Incident edges at this cluster: for each member, its prev and
+            // next edges (= outer 索引 (vertexIdx - 1 + N) % N と vertexIdx)。
+            interface Inc { polyId: string; edgeIdx: number; }
+            const incidents: Inc[] = [];
+            for (const m of cluster) {
+                const prevE = (m.vertexIdx - 1 + m.outerLen) % m.outerLen;
+                const nextE = m.vertexIdx; // edge i = vertex i → vertex i+1
+                incidents.push({ polyId: m.polyId, edgeIdx: prevE });
+                incidents.push({ polyId: m.polyId, edgeIdx: nextE });
+            }
+            // 各メンバーに、自分以外のポリゴンの incident edge を割当
+            for (const m of cluster) {
+                const seen = new Set<string>();
+                const list: VCList = [];
+                for (const inc of incidents) {
+                    if (inc.polyId === m.polyId) continue;
+                    const k = `${inc.polyId}:${inc.edgeIdx}`;
+                    if (seen.has(k)) continue;
+                    seen.add(k);
+                    list.push(inc);
+                }
+                if (list.length === 0) continue;
+                if (!vcByPoly.has(m.polyId)) vcByPoly.set(m.polyId, new Map());
+                vcByPoly.get(m.polyId)!.set(m.vertexIdx, list);
+            }
+        }
+
+        // ── 9. Push polygon updates per room ─────────────────────────────
+        const rebuildByPolyId = new Map<string, PolyRebuild>();
+        for (const r of polyRebuilds) rebuildByPolyId.set(works[r.workIdx].poly.id, r);
+        const roomIds = new Set<ElementId>();
+        for (const w of works) roomIds.add(w.roomId);
+        for (const rid of roomIds) {
+            const space = elements[rid] as SpaceElement;
+            if (!space) continue;
+            const updatedPolys: RoomPolygon[] = [];
+            for (const poly of space.polygons) {
+                if (staleOutlineIds.has(poly.id)) continue;
+                const rebuild = rebuildByPolyId.get(poly.id);
+                if (!rebuild) { updatedPolys.push(poly); continue; }
+                const work = works[rebuild.workIdx];
+                if (work.poly === poly) {
+                    // Also drop `edges` if previously materialized — the new
+                    // outer is canonical (cyclic) once more.
+                    const { edges: _legacyEdges, ...rest } = poly;
+                    void _legacyEdges;
+                    // vertex i に他ポリゴンの incident edge があれば、その
+                    // 一覧をセット。無ければ null。長さは newOuter.length。
+                    const polyVCons = vcByPoly.get(poly.id);
+                    const newVertexConnections: (Array<{ polyId: string; edgeIdx: number }> | null)[] =
+                        new Array(rebuild.newOuter.length).fill(null);
+                    if (polyVCons) {
+                        for (const [vi, list] of polyVCons) {
+                            if (vi >= 0 && vi < newVertexConnections.length) {
+                                newVertexConnections[vi] = list;
+                            }
+                        }
+                    }
+                    updatedPolys.push({
+                        ...rest,
+                        outer: rebuild.newOuter,
+                        wallIds: rebuild.newWallIds,
+                        // 旧 API 互換 (単一壁厚)
+                        wallThickness,
+                        // 新データモデル
+                        innerThickness: innerT,
+                        outerThickness: outerT,
+                        wallReference,
+                        edgeIds: rebuild.newEdgeIds,
+                        sharedEdgeIds: rebuild.newSharedEdgeIds,
+                        vertexConnections: newVertexConnections,
+                    });
+                }
+            }
+            updateElement(rid, {
+                polygons: updatedPolys,
+                dirtyFlags: new Set([...space.dirtyFlags, "Geometry", "Mesh", "Render"]),
+            } as any);
+        }
+
+        // ── 10. Re-add Horizontal / Vertical on modified polys ───────────
+        // Constraints touching modified polys were dropped above. Restore
+        // axis alignment by tagging each new edge that's nearly horizontal /
+        // vertical so subsequent vertex drags stay on-axis.
+        const AXIS_DOT_TOL = Math.cos((2 * Math.PI) / 180); // within 2°
+        for (const rebuild of polyRebuilds) {
+            if (!rebuild.modified) continue;
+            const polyId = works[rebuild.workIdx].poly.id;
+            const spaceId = works[rebuild.workIdx].roomId;
+            const newOuter = rebuild.newOuter;
+            const n = newOuter.length;
+            for (let i = 0; i < n; i++) {
+                const a = newOuter[i];
+                const b = newOuter[(i + 1) % n];
+                const dx = b[0] - a[0], dy = b[1] - a[1];
+                const len = Math.hypot(dx, dy);
+                if (len < 1e-9) continue;
+                const ax = Math.abs(dx / len), ay = Math.abs(dy / len);
+                let type: "Horizontal" | "Vertical" | null = null;
+                if (ax >= AXIS_DOT_TOL) type = "Horizontal";
+                else if (ay >= AXIS_DOT_TOL) type = "Vertical";
+                if (!type) continue;
+                executeCommand(new AddConstraintCommand({
+                    id: generateConstraintId(),
+                    type,
+                    targets: [{ kind: "SketchEdge", spaceId, polyId, edgeIdx: i }],
+                }));
+            }
+        }
+
+        // eslint-disable-next-line no-console
+        console.log(
+            `[Walls/all] rooms=${roomIds.size} polys=${works.length} ` +
+            `walls=${subGroups.size} shared=${sharedGroups} ` +
+            `modifiedPolys=${modifiedPolyIds.size}`,
+        );
+
+        // ── 11. Debug: vertex clusters + per-edge hex computation ────────
+        // 全壁生成のたびに 1 回ダンプ。多すぎるようなら local 変数で
+        // false にするか、後で feature flag に。
+        const DEBUG_DUMP = true;
+        if (DEBUG_DUMP) {
+            // (a) クラスタ概要
+            // eslint-disable-next-line no-console
+            console.group("[Walls/debug] Vertex clusters");
+            let multiCount = 0;
+            for (const c of vcClusters) {
+                if (c.length < 2) continue;
+                multiCount++;
+                const pos = `(${c[0].pos[0].toFixed(3)}, ${c[0].pos[1].toFixed(3)})`;
+                const members = c
+                    .map((m) => `${m.polyId.slice(0, 6)}/v${m.vertexIdx}`)
+                    .join(", ");
+                // eslint-disable-next-line no-console
+                console.log(`${pos} size=${c.length} members=[${members}]`);
+            }
+            // eslint-disable-next-line no-console
+            console.log(
+                `total clusters=${vcClusters.length}, multi-member=${multiCount}`,
+            );
+            // eslint-disable-next-line no-console
+            console.groupEnd();
+
+            // (b) 更新済み state から polygon を引き、各 edge について
+            //     computeWallHexagon を debug=true で呼んでダンプする。
+            const dbgState = useAppState.getState();
+            const dbgLookup = (polyId: string): RoomPolygon | undefined => {
+                for (const eid in dbgState.elements) {
+                    const ee = dbgState.elements[eid];
+                    if (!ee || ee.type !== "Space") continue;
+                    const sp = ee as SpaceElement;
+                    const f = sp.polygons?.find((p) => p.id === polyId);
+                    if (f) return f;
+                }
+                return undefined;
+            };
+            // eslint-disable-next-line no-console
+            console.group("[Walls/debug] Per-edge hex computation");
+            for (const rebuild of polyRebuilds) {
+                const polyId = works[rebuild.workIdx].poly.id;
+                const updPoly = dbgLookup(polyId);
+                if (!updPoly) {
+                    // eslint-disable-next-line no-console
+                    console.warn(`poly ${polyId.slice(0, 6)} not found in state`);
+                    continue;
+                }
+                const vcSummary =
+                    updPoly.vertexConnections
+                        ?.map((v, i) => (v && v.length ? `v${i}:${v.length}` : null))
+                        .filter(Boolean)
+                        .join(", ") ?? "";
+                // eslint-disable-next-line no-console
+                console.group(
+                    `poly=${polyId.slice(0, 6)} verts=${updPoly.outer.length} ` +
+                    `intersections=[${vcSummary}]`,
+                );
+                for (let ei = 0; ei < updPoly.outer.length; ei++) {
+                    computeWallHexagon(updPoly, ei, dbgLookup, true);
+                }
+                // eslint-disable-next-line no-console
+                console.groupEnd();
+            }
+            // eslint-disable-next-line no-console
+            console.groupEnd();
+        }
     };
 
     const handleDeleteWall = () => {
@@ -680,6 +1327,14 @@ export default function RoomEditPanel() {
             >
                 <Square size={14} />
                 Create Walls
+            </button>
+            <button
+                className={btnClass(false)}
+                onClick={handleGenerateAllWalls}
+                title={`全部屋の境界から壁を一括生成 (${wallThicknessMm}mm)。重なるエッジ ⇒ 共通壁、それ以外 ⇒ 外壁`}
+            >
+                <Boxes size={14} />
+                全壁生成
             </button>
             <button
                 className={canDelete ? btnClass(false) : disabledBtnClass}

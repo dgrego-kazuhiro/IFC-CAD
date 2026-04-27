@@ -3,6 +3,7 @@ import { WallGeometryData } from "../../geometry/builders/WallGeometryBuilder";
 import { AABB } from "../../geometry/primitives/AABB";
 import { vec3 } from "gl-matrix";
 import { Vec3 } from "../../geometry/math/Vec3";
+import earcut from "earcut";
 
 export interface WallMeshOptions {
     joinedStart?: boolean;
@@ -43,8 +44,17 @@ export class WallMeshBuilder {
         options?: WallMeshOptions,
         openings?: WallOpeningInfo[],
     ): MeshData {
+        // 6 頂点の hex フットプリントは別パスで処理する。openings を伴うと
+        // hex 断面のオープニング切り取りが現状未対応なので、呼び出し側で
+        // openings を持つ壁は legacy rect path に落とすこと。
+        if (data.isHexFootprint) {
+            return WallMeshBuilder.buildHexPrism(data);
+        }
         const h = data.height;
-        const [c0, c1, c2, c3] = data.footprint;
+        const c0 = data.footprint[0];
+        const c1 = data.footprint[1];
+        const c2 = data.footprint[2];
+        const c3 = data.footprint[3];
         const yBaseWall = c0[1];
         const yTopWall = yBaseWall + h;
 
@@ -208,6 +218,158 @@ export class WallMeshBuilder {
             addEdge(F_TR, B_TR);
         }
 
+        const posArray = new Float32Array(positions);
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+        if (posArray.length > 0) {
+            for (let i = 0; i < posArray.length; i += 3) {
+                const x = posArray[i], y = posArray[i + 1], z = posArray[i + 2];
+                if (x < minX) minX = x; if (x > maxX) maxX = x;
+                if (y < minY) minY = y; if (y > maxY) maxY = y;
+                if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+            }
+        } else {
+            minX = minY = minZ = 0;
+            maxX = maxY = maxZ = 0;
+        }
+        const bounds: AABB = { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
+
+        return {
+            positions: posArray,
+            normals: new Float32Array(normals),
+            indices: new Uint32Array(indices),
+            edgeIndices: new Uint32Array(edges),
+            bounds,
+        };
+    }
+
+    /**
+     * Hex (= N 頂点) フットプリントを縦に押し出してメッシュ化する。
+     * `data.footprint` は CCW (上から見て) で、`computeWallHexagon` の
+     * 6 頂点 [innerPrev, s, outerPrev, outerNext, e, innerNext] を想定。
+     *
+     * 構成:
+     *   - 側面 (1 quad / 底辺): N 個
+     *   - 天井 (Y=yTop): フットプリントを `earcut` で三角化
+     *   - 床   (Y=yBase): 同じ三角化を逆向き winding で
+     *
+     * Openings (door / window) は現状未対応 — 持つ壁は呼び出し側で legacy
+     * rect path に落とすこと。
+     */
+    private static buildHexPrism(data: WallGeometryData): MeshData {
+        // computeWallHexagon は CCW (= 標準数学 convention の正 signedArea)
+        // で hex を返す。一方 WallMeshBuilder の addQuad / addTri は legacy
+        // rect path (CW フットプリント) の winding を前提に外向き法線を出す。
+        // よってここで fp を反転して CW にしておくと、側面の外向き法線、
+        // 天面 +Y、底面 -Y がすべて揃う。
+        const fp = [...data.footprint].reverse();
+        const n = fp.length;
+        const yBase = fp.length > 0 ? fp[0][1] : 0;
+        const yTop = yBase + data.height;
+
+        // ── DEBUG: hex prism construction summary ───────────────────────
+        // (top/bottom が出ていないバグ調査用。安定したら削除可。)
+        if ((globalThis as any).__hexPrismDebug !== false) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[hexPrism] verts=${n} h=${data.height.toFixed(3)} ` +
+                `yBase=${yBase.toFixed(3)} yTop=${yTop.toFixed(3)} ` +
+                `fp=[${fp.map((p) => `(${p[0].toFixed(2)},${p[2].toFixed(2)})`).join(",")}]`,
+            );
+        }
+
+        const positions: number[] = [];
+        const normals: number[] = [];
+        const indices: number[] = [];
+        const edges: number[] = [];
+        let indexOffset = 0;
+
+        const addQuad = (p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) => {
+            positions.push(...p0, ...p1, ...p2, ...p3);
+            const v1 = vec3.subtract(vec3.create(), p1, p0);
+            const v2 = vec3.subtract(vec3.create(), p2, p1);
+            const nrm = vec3.cross(vec3.create(), v1, v2);
+            vec3.normalize(nrm, nrm);
+            for (let i = 0; i < 4; i++) normals.push(...nrm);
+            indices.push(
+                indexOffset,     indexOffset + 1, indexOffset + 2,
+                indexOffset,     indexOffset + 2, indexOffset + 3,
+            );
+            indexOffset += 4;
+        };
+        const addTri = (p0: Vec3, p1: Vec3, p2: Vec3) => {
+            positions.push(...p0, ...p1, ...p2);
+            const v1 = vec3.subtract(vec3.create(), p1, p0);
+            const v2 = vec3.subtract(vec3.create(), p2, p0);
+            const nrm = vec3.cross(vec3.create(), v1, v2);
+            vec3.normalize(nrm, nrm);
+            for (let i = 0; i < 3; i++) normals.push(...nrm);
+            indices.push(indexOffset, indexOffset + 1, indexOffset + 2);
+            indexOffset += 3;
+        };
+
+        // ── Side faces: one quad per base edge ───────────────────────────
+        // Winding (base[i], base[i+1], top[i+1], top[i]) で CCW hex の
+        // 「右手」(= 外向き) 法線になる (cross product で確認済)。
+        const baseAt = (i: number): Vec3 => [fp[i][0], yBase, fp[i][2]];
+        const topAt  = (i: number): Vec3 => [fp[i][0], yTop,  fp[i][2]];
+        for (let i = 0; i < n; i++) {
+            const a = baseAt(i);
+            const b = baseAt((i + 1) % n);
+            const at = topAt(i);
+            const bt = topAt((i + 1) % n);
+            addQuad(a, b, bt, at);
+        }
+
+        // ── Top + bottom (triangulated via earcut) ───────────────────────
+        // earcut は入力の signedArea を見て **常に内部 CCW に正規化** して
+        // 三角化するため、出力 triangle は CCW math。3D で
+        //   - CCW math at y=yTop  → -Y 法線 (= 上から見て背面 = 不可視)
+        //   - CCW math at y=yBase → -Y 法線 (= 下から見て表面 = 可視 = 底面 OK)
+        // よって TOP は winding を逆転 (a,b,c → c,b,a) して CW math に直し、
+        // +Y 法線に揃える。BOTTOM は CCW のままで -Y で OK。
+        const flat: number[] = [];
+        for (const p of fp) flat.push(p[0], p[2]);
+        const tris = earcut(flat, undefined, 2);
+        if ((globalThis as any).__hexPrismDebug !== false) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `  earcut: ${tris.length / 3} tri(s)` +
+                (tris.length === 0 ? " ⚠ NO TOP/BOTTOM TRIANGLES" : ""),
+            );
+        }
+        // Top face (+Y normal): reverse earcut output (CCW → CW math).
+        for (let i = 0; i < tris.length; i += 3) {
+            const a = tris[i], b = tris[i + 1], c = tris[i + 2];
+            addTri(topAt(c), topAt(b), topAt(a));
+        }
+        // Bottom face (-Y normal): keep earcut output as-is (CCW math).
+        for (let i = 0; i < tris.length; i += 3) {
+            const a = tris[i], b = tris[i + 1], c = tris[i + 2];
+            addTri(baseAt(a), baseAt(b), baseAt(c));
+        }
+
+        // ── Edge silhouettes: top, bottom, vertical ──────────────────────
+        const addEdgePoint = (p: Vec3): number => {
+            const idx = positions.length / 3;
+            positions.push(p[0], p[1], p[2]);
+            normals.push(0, 1, 0);
+            return idx;
+        };
+        const addEdge = (a: Vec3, b: Vec3) => {
+            edges.push(addEdgePoint(a), addEdgePoint(b));
+        };
+        for (let i = 0; i < n; i++) {
+            const a = baseAt(i);
+            const b = baseAt((i + 1) % n);
+            const at = topAt(i);
+            const bt = topAt((i + 1) % n);
+            addEdge(a, b);   // bottom
+            addEdge(at, bt); // top
+            addEdge(a, at);  // vertical
+        }
+
+        // ── Bounds ───────────────────────────────────────────────────────
         const posArray = new Float32Array(positions);
         let minX = Infinity, minY = Infinity, minZ = Infinity;
         let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;

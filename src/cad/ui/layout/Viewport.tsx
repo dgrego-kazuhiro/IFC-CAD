@@ -822,12 +822,34 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [140 / 255, 140 / 255, 145 / 255, 0.85],
                     });
                 } else {
-                    // 3D Geometry with join overrides
-                    const joins = joinMap.get(el.id as string);
-                    const geomData = WallGeometryBuilder.build(el, joins);
+                    // 3D Geometry: hex footprint when wall has polyRef AND
+                    // no openings (hex prism with openings は未対応)。それ
+                    // 以外は従来の 4 隅 rect path + WallJoinResolver。
+                    const wallOpenings = collectOpenings(el);
+                    const usesHex = !!el.polyRef && wallOpenings.length === 0;
+                    let parentPolygon: SpaceElement["polygons"][number] | undefined;
+                    if (usesHex && el.polyRef) {
+                        const sp = elements[el.polyRef.spaceId] as SpaceElement | undefined;
+                        if (sp && sp.type === "Space") {
+                            parentPolygon = sp.polygons?.find((p) => p.id === el.polyRef!.polyId);
+                        }
+                    }
+                    // 3+ 接続交差で他ポリゴンの incident edge を引く lookup。
+                    const polygonLookup = (polyId: string) => {
+                        for (const eid in elements) {
+                            const ee = elements[eid];
+                            if (!ee || ee.type !== "Space") continue;
+                            const sp = ee as SpaceElement;
+                            const found = sp.polygons?.find((p) => p.id === polyId);
+                            if (found) return found;
+                        }
+                        return undefined;
+                    };
+                    // joinMap は hex 経路では使わない (hex 自体がコーナー解決済み)。
+                    const joins = usesHex && parentPolygon ? undefined : joinMap.get(el.id as string);
+                    const geomData = WallGeometryBuilder.build(el, joins, parentPolygon, polygonLookup);
                     const hasStartJoin = joins?.some((j: WallJoinResult) => j.at === "Start");
                     const hasEndJoin = joins?.some((j: WallJoinResult) => j.at === "End");
-                    const wallOpenings = collectOpenings(el);
                     const meshData = WallMeshBuilder.build(geomData, {
                         joinedStart: hasStartJoin,
                         joinedEnd:   hasEndJoin,

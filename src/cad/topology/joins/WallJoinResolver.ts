@@ -44,10 +44,6 @@ function mul(v: Vec2, s: number): Vec2 {
   return { x: v.x * s, y: v.y * s };
 }
 
-function dot(a: Vec2, b: Vec2): number {
-  return a.x * b.x + a.y * b.y;
-}
-
 function cross(a: Vec2, b: Vec2): number {
   return a.x * b.y - a.y * b.x;
 }
@@ -452,19 +448,216 @@ function addResult(map: Map<string, WallJoinResult[]>, wallId: string, result: W
     else arr.push(result);
 }
 
+// ─── Junction-cluster resolution ───
+// Walls produced by 全壁生成 (bulk regenerate) routinely have 3+ walls
+// meeting at a single endpoint — a collinear chain (e.g., the upper /
+// shared / lower sub-segments of a split right edge) plus a perpendicular
+// wall butting onto it from a side room. Resolving such a junction one
+// pair at a time produces conflicting corner overrides and visible
+// overlap blocks at the corner.
+//
+// Approach: cluster every joinable wall endpoint by 2D position. For each
+// cluster:
+//   * single direction group  → all collinear; mark joined, no corner
+//                                override (cap suppressed, walls flow flat)
+//   * two direction groups    → for any group with ≥ 2 ends (a collinear
+//                                chain), its members are flat-joined; ends
+//                                in the OTHER group are T-junction butts
+//                                trimmed to the chain's face. Pure 1-vs-1
+//                                falls back to the classic 2-way miter.
+//   * 3+ direction groups     → rare; fall back to pairwise miter.
+
+interface WallEnd {
+    wall: WallElement;
+    end: "Start" | "End";
+    pos: [number, number];   // (x, z) in the floor plane
+    /** Unit vector pointing FROM the endpoint INTO the wall's body. */
+    inDir: [number, number];
+}
+
+function collectWallEnds(walls: WallElement[]): WallEnd[] {
+    const ends: WallEnd[] = [];
+    for (const w of walls) {
+        const [a0, a1] = w.axis;
+        const dx = a1[0] - a0[0], dz = a1[2] - a0[2];
+        const len = Math.hypot(dx, dz);
+        if (len < 1e-9) continue;
+        const ux = dx / len, uz = dz / len;
+        if (w.joinStart) ends.push({ wall: w, end: "Start", pos: [a0[0], a0[2]], inDir: [ux, uz] });
+        if (w.joinEnd)   ends.push({ wall: w, end: "End",   pos: [a1[0], a1[2]], inDir: [-ux, -uz] });
+    }
+    return ends;
+}
+
+function clusterEndsByPosition(ends: WallEnd[]): WallEnd[][] {
+    const clusters: WallEnd[][] = [];
+    for (const e of ends) {
+        let placed = false;
+        for (const c of clusters) {
+            const ref = c[0];
+            if (Math.hypot(e.pos[0] - ref.pos[0], e.pos[1] - ref.pos[1]) < TOLERANCE) {
+                c.push(e);
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) clusters.push([e]);
+    }
+    return clusters;
+}
+
+const PARALLEL_DOT = Math.cos((2 * Math.PI) / 180); // 2° tolerance
+
+function groupEndsByDirection(cluster: WallEnd[]): WallEnd[][] {
+    const groups: WallEnd[][] = [];
+    for (const e of cluster) {
+        let placed = false;
+        for (const g of groups) {
+            const ref = g[0];
+            const dot = e.inDir[0] * ref.inDir[0] + e.inDir[1] * ref.inDir[1];
+            if (Math.abs(dot) >= PARALLEL_DOT) {
+                g.push(e);
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) groups.push([e]);
+    }
+    return groups;
+}
+
+function markJoinedNoCorners(
+    results: Map<string, WallJoinResult[]>,
+    e: WallEnd,
+): void {
+    addResult(results, e.wall.id as string, {
+        wallId: e.wall.id as string,
+        at: e.end,
+    });
+}
+
+/**
+ * Cluster T-junction trim. The chain (≥ 2 collinear walls) and a
+ * cross-direction wall meet at the same vertex `e.pos`. We trim `e`'s end
+ * to the chain's near face (junction + half_chain * inDir of the cross
+ * wall) and emit flat corners perpendicular to the cross wall's axis.
+ *
+ * `chainHalfThickness` is the chain wall's half-thickness — chain and cross
+ * walls may differ in thickness, so we use the chain's value here.
+ * `wall.thickness / 2` is used for the perpendicular offsets to the cross
+ * wall's own corners.
+ */
+function trimToChainFace(
+    e: WallEnd,
+    chainHalfThickness: number,
+    results: Map<string, WallJoinResult[]>,
+): void {
+    const wall = e.wall;
+    const halfB = wall.thickness / 2;
+    // Endpoint pushed inward along the wall by the chain's half-thickness so
+    // the cross wall stops at the chain face, not at the chain centerline.
+    const cap: [number, number] = [
+        e.pos[0] + e.inDir[0] * chainHalfThickness,
+        e.pos[1] + e.inDir[1] * chainHalfThickness,
+    ];
+    // Wall's left normal = rotate inDir 90° CCW, but inDir points INTO the
+    // wall; the wall axis natural direction (axis[0] → axis[1]) is +inDir at
+    // Start and −inDir at End. The footprint normal n = (-dirZ, dirX) follows
+    // the natural direction. Reproduce that orientation here so left/right
+    // match WallGeometryBuilder's expectations.
+    const sign = e.end === "Start" ? 1 : -1;
+    const dirX = e.inDir[0] * sign;
+    const dirZ = e.inDir[1] * sign;
+    const nx = -dirZ;
+    const nz = dirX;
+    const left: Vec3 = [cap[0] + nx * halfB, wall.axis[0][1] + wall.baseOffset, cap[1] + nz * halfB];
+    const right: Vec3 = [cap[0] - nx * halfB, wall.axis[0][1] + wall.baseOffset, cap[1] - nz * halfB];
+    addResult(results, wall.id as string, {
+        wallId: wall.id as string,
+        at: e.end,
+        corners: [left, right],
+    });
+}
+
 // ─── Public API ───
 
 export class WallJoinResolver {
     public static resolve(walls: WallElement[]): Map<string, WallJoinResult[]> {
         const results = new Map<string, WallJoinResult[]>();
-        const candidates = detectJoins(walls);
+        if (walls.length < 2) return results;
 
-        for (const c of candidates) {
-            if (c.type === "miter") {
-                resolveMiter(c.wallA, c.endA, c.wallB, c.endB, results);
-            } else {
-                resolveButt(c.wallA, c.endA, c.wallB, results);
+        // ── (1) Endpoint-clustered resolution ─────────────────────────────
+        const ends = collectWallEnds(walls);
+        const clusters = clusterEndsByPosition(ends);
+        const handledEnds = new Set<string>(); // "wallId|end"
+        const markHandled = (e: WallEnd) =>
+            handledEnds.add(`${e.wall.id}|${e.end}`);
+
+        for (const cluster of clusters) {
+            if (cluster.length < 2) continue;
+            const dirGroups = groupEndsByDirection(cluster);
+
+            if (dirGroups.length === 1) {
+                // All collinear at this point → flat continuation.
+                for (const e of cluster) { markJoinedNoCorners(results, e); markHandled(e); }
+                continue;
             }
+
+            if (dirGroups.length === 2) {
+                const [gA, gB] = dirGroups;
+                const chainA = gA.length >= 2;
+                const chainB = gB.length >= 2;
+
+                if (gA.length === 1 && gB.length === 1) {
+                    // Pure 2-way miter — preserves the original behaviour.
+                    resolveMiter(gA[0].wall, gA[0].end, gB[0].wall, gB[0].end, results);
+                    markHandled(gA[0]); markHandled(gB[0]);
+                } else {
+                    // Collinear chain on at least one side. Chain members are
+                    // flat-joined; cross-direction ends are trimmed to the
+                    // chain's near face via trimToChainFace (resolveButt's
+                    // tie-breaker doesn't reliably pick the correct face when
+                    // the cross wall's endpoint is exactly on the chain axis).
+                    if (chainA) for (const e of gA) { markJoinedNoCorners(results, e); markHandled(e); }
+                    if (chainB) for (const e of gB) { markJoinedNoCorners(results, e); markHandled(e); }
+                    if (chainA) {
+                        const chainHalf = gA[0].wall.thickness / 2;
+                        for (const e of gB) {
+                            trimToChainFace(e, chainHalf, results);
+                            markHandled(e);
+                        }
+                    }
+                    if (chainB) {
+                        const chainHalf = gB[0].wall.thickness / 2;
+                        for (const e of gA) {
+                            trimToChainFace(e, chainHalf, results);
+                            markHandled(e);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // 3+ direction groups (non-orthogonal star) → pairwise miter.
+            for (let i = 0; i < cluster.length; i++) {
+                for (let j = i + 1; j < cluster.length; j++) {
+                    resolveMiter(
+                        cluster[i].wall, cluster[i].end,
+                        cluster[j].wall, cluster[j].end,
+                        results,
+                    );
+                }
+                markHandled(cluster[i]);
+            }
+        }
+
+        // ── (2) Endpoint-on-body T-joins (only for ends not yet handled) ──
+        // Picks up cases where one wall's endpoint lands mid-axis of another.
+        for (const cand of detectJoins(walls)) {
+            if (cand.type !== "butt") continue;
+            const key = `${cand.wallA.id}|${cand.endA}`;
+            if (handledEnds.has(key)) continue;
+            resolveButt(cand.wallA, cand.endA, cand.wallB, results);
         }
 
         return results;
