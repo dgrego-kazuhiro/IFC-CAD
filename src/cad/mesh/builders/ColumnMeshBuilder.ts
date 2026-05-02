@@ -1,6 +1,7 @@
 import { MeshData } from "../MeshData";
 import { AABB } from "../../geometry/primitives/AABB";
 import { Vec3 } from "../../geometry/math/Vec3";
+import { Vec2 } from "../../geometry/math/Vec2";
 import { vec3 } from "gl-matrix";
 import { ColumnElement } from "../../model/elements/ColumnElement";
 import { Profile } from "../../model/profiles/Profile";
@@ -14,7 +15,7 @@ export interface ColumnMeshParams {
 }
 
 /** Build a 2D profile ring (closed, CCW from +Y top view). */
-function profileRing(profile: Profile, rotation: number): [number, number][] {
+export function profileRing(profile: Profile, rotation: number): [number, number][] {
     const c = Math.cos(rotation);
     const s = Math.sin(rotation);
     const rot = (x: number, z: number): [number, number] => [x * c - z * s, x * s + z * c];
@@ -42,6 +43,15 @@ function profileRing(profile: Profile, rotation: number): [number, number][] {
             return [rot(-0.2, -0.2), rot(0.2, -0.2), rot(0.2, 0.2), rot(-0.2, 0.2)];
         }
     }
+}
+
+/**
+ * Column の 2D 床面フットプリントを世界 XZ 座標で返す (CCW)。
+ * Clipper diff の被クリップ形状として壁矩形から差し引くために使う。
+ */
+export function columnFootprint2D(col: ColumnElement): Vec2[] {
+    const ring = profileRing(col.profile, col.rotation);
+    return ring.map<Vec2>((r) => [col.basePoint[0] + r[0], col.basePoint[2] + r[1]]);
 }
 
 export class ColumnMeshBuilder {

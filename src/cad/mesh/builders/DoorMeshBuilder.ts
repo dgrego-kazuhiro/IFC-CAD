@@ -56,12 +56,15 @@ export class DoorMeshBuilder {
             off += 4;
         };
 
-        addFace(b0, b1, t1, t0); // back (-n)
-        addFace(b2, b3, t3, t2); // front (+n)
-        addFace(b1, b2, t2, t1); // right end
-        addFace(b3, b0, t0, t3); // left end
-        addFace(t0, t1, t2, t3); // top
-        addFace(b3, b2, b1, b0); // bottom
+        // 単一 winding。Renderer 側で `noCull: true` の pipeline を使うため
+        // back-face culling は無効化されており、カメラから見て裏向きの面も
+        // そのまま描画される (= 開口部のどちら側からでも panel が見える)。
+        addFace(b0, t0, t1, b1); // back (-n)
+        addFace(b2, t2, t3, b3); // front (+n)
+        addFace(b1, t1, t2, b2); // right end (+ax)
+        addFace(b3, t3, t0, b0); // left end (-ax)
+        addFace(t0, t3, t2, t1); // top (+Y)
+        addFace(b3, b0, b1, b2); // bottom (-Y)
 
         // Door panel outline: only the front + back rectangle frames so we
         // don't emit overlapping edges along the side / top / bottom faces

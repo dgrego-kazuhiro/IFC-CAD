@@ -19,6 +19,15 @@ import { Vec3 } from "../../geometry/math/Vec3";
 import { ElementId } from "../../model/base/ElementId";
 
 import { computeMiteredWallAxes, computeWalledOutlineGeometry } from "./wallSync";
+import {
+    buildJunctionGraph,
+    resolveJunctions,
+    applyCaps,
+    virtualEdgeFootprint,
+    type ColumnFootprint,
+} from "../../topology/junctions/JunctionGraph";
+import { ColumnElement } from "../../model/elements/ColumnElement";
+import { columnFootprint2D } from "../../mesh/builders/ColumnMeshBuilder";
 
 export default function RoomEditPanel() {
     const [wallThicknessMm, setWallThicknessMm] = useState("200");
@@ -661,10 +670,55 @@ export default function RoomEditPanel() {
             if (drop) executeCommand(new RemoveConstraintCommand(cid));
         }
 
+        // ── 6.5. Build JunctionGraph from rebuilt polygons ────────────────
+        // 仮想エッジ生成 → resolve (共線 → 同部屋ペア → Clipper) → cap で
+        // 各仮想エッジの両端 3 点を確定。後段 (§7) で各壁に precomputed
+        // footprint を割り当てる。
+        const rebuiltPolysForGraph: RoomPolygon[] = polyRebuilds.map((r) => {
+            const w = works[r.workIdx];
+            return {
+                ...w.poly,
+                outer: r.newOuter,
+                wallIds: r.newWallIds,
+                wallsPerEdge: r.newWallIds.map((id) => (id ? [id] : [])),
+                wallThickness,
+                innerThickness: innerT,
+                outerThickness: outerT,
+                wallReference,
+                edgeIds: r.newEdgeIds,
+                sharedEdgeIds: r.newSharedEdgeIds,
+            };
+        });
+        // 同一レベルに置かれた柱を Clipper diff の被クリップ形状として
+        // 集める。柱が壁の交差点を覆う場合、壁端は柱面で切り落とされる。
+        const roomLevelIds = new Set<ElementId>();
+        for (const w of works) {
+            if (w.room.levelId) roomLevelIds.add(w.room.levelId);
+        }
+        const columnFootprints: ColumnFootprint[] = [];
+        for (const eid in elements) {
+            const el = elements[eid];
+            if (!el || el.type !== "Column") continue;
+            const col = el as ColumnElement;
+            if (col.baseLevelId && roomLevelIds.size > 0
+                && !roomLevelIds.has(col.baseLevelId)) {
+                continue;
+            }
+            const fp = columnFootprint2D(col);
+            if (fp.length >= 3) {
+                columnFootprints.push({ id: col.id as string, points: ensureCCW(fp) });
+            }
+        }
+
+        const jgraph = buildJunctionGraph(rebuiltPolysForGraph);
+        resolveJunctions(jgraph, rebuiltPolysForGraph, columnFootprints);
+        applyCaps(jgraph, rebuiltPolysForGraph);
+
         // ── 7. Create one wall per sub-group ──────────────────────────────
         // 各壁に polyRef (canonical = lex-smallest polyId の参加者) と
-        // inner/outerThickness を付け、3D 側で `RoomPolygon` を逆引きして
-        // ヘキサゴンフットプリントを作れるようにしておく。
+        // inner/outerThickness を付け、JunctionGraph から canonical edge の
+        // 仮想エッジ footprint を引いて壁に precomputed フットプリントとして
+        // 渡す。
         let sharedGroups = 0;
         for (const [key, group] of subGroups) {
             const isShared = group.polysContributing.size > 1;
@@ -694,6 +748,26 @@ export default function RoomEditPanel() {
             );
             executeCommand(cmd);
             const wid = cmd.getElementId();
+            // JunctionGraph から canonical edge に対応する仮想エッジを取り出し、
+            // 確定済み 6 点フットプリントを wall に埋め込む。複数の virtual
+            // edge が紐づく場合 (元エッジが分割されたケース) は最初の 1 本を
+            // 採用 — canonical edge は §5 で既に sub-group ごとに分割済みの
+            // ため通常 1 本。
+            let footprint: Vec2[] | null = null;
+            let veIsShared = false;
+            let veFound: { id: string; start: Vec2; end: Vec2 } | null = null;
+            if (canonicalNewEdgeIdx >= 0) {
+                const veKey = `${canonicalWork.poly.id}:${canonicalNewEdgeIdx}`;
+                const veIds = jgraph.edgeToVes.get(veKey);
+                if (veIds && veIds.length > 0) {
+                    const ve = jgraph.virtualEdges.get(veIds[0]);
+                    if (ve) {
+                        footprint = virtualEdgeFootprint(ve);
+                        veIsShared = ve.isShared;
+                        veFound = { id: ve.id, start: ve.start, end: ve.end };
+                    }
+                }
+            }
             updateElement(wid, {
                 wallCategory: isShared ? "shared" : "exterior",
                 innerThickness: innerT,
@@ -703,8 +777,25 @@ export default function RoomEditPanel() {
                     polyId: canonicalWork.poly.id,
                     edgeIdx: canonicalNewEdgeIdx,
                 } : undefined,
+                footprint: footprint ?? undefined,
+                isShared: veIsShared || isShared,
             } as any);
             groupWallId.set(key, wid);
+
+            // Debug log: each created wall with its axis/footprint/ve linkage
+            if ((globalThis as any).__jgraphDebug !== false) {
+                const ax0 = group.axis[0];
+                const ax1 = group.axis[1];
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[wall] ${wid.slice(0, 6)} src=${canonicalWork.poly.id.slice(0,6)}#${canonicalNewEdgeIdx} ` +
+                    `axis=[(${ax0[0].toFixed(3)},${ax0[2].toFixed(3)})→(${ax1[0].toFixed(3)},${ax1[2].toFixed(3)})] ` +
+                    `${isShared ? "SHARED" : "exterior"} ` +
+                    `ve=${veFound ? veFound.id : "MISSING"} ` +
+                    `${veFound ? `veStart=(${veFound.start[0].toFixed(3)},${veFound.start[1].toFixed(3)}) veEnd=(${veFound.end[0].toFixed(3)},${veFound.end[1].toFixed(3)})` : ""} ` +
+                    `fp=${footprint ? footprint.map(p => `(${p[0].toFixed(3)},${p[1].toFixed(3)})`).join(",") : "NONE"}`,
+                );
+            }
         }
 
         // ── 8. Wire wallIds + sharedEdgeIds into each polygon's new outer ─
@@ -824,10 +915,17 @@ export default function RoomEditPanel() {
                             }
                         }
                     }
+                    // 新パイプライン: §5 で polygon edge は既に仮想エッジ
+                    // 単位に分割済み。各 outer edge に 1 wall が 1:1 で紐付く
+                    // (共通エッジ含めて canonical wall ID をそのまま使用)。
+                    const wallsPerEdge: string[][] = rebuild.newWallIds.map(
+                        (id) => (id ? [id] : []),
+                    );
                     updatedPolys.push({
                         ...rest,
                         outer: rebuild.newOuter,
                         wallIds: rebuild.newWallIds,
+                        wallsPerEdge,
                         // 旧 API 互換 (単一壁厚)
                         wallThickness,
                         // 新データモデル

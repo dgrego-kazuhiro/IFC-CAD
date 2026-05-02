@@ -8,7 +8,7 @@ import { Renderer } from "../../renderer/core/Renderer";
 import { CameraController } from "../../renderer/camera/CameraController";
 import { MeshBuilder } from "../../mesh/MeshBuilder";
 import { mat4, vec3, vec4 } from "gl-matrix";
-import { useAppState, AppState, SketchSelectionItem } from "../../application/AppState";
+import { useAppState, AppState, SketchSelectionItem, RESIDENTIAL_GRID_SECONDARY_M } from "../../application/AppState";
 import { CreateWallCommand } from "../../commands/create/CreateWallCommand";
 import { CreateDoorCommand } from "../../commands/create/CreateDoorCommand";
 import { CreateWindowCommand } from "../../commands/create/CreateWindowCommand";
@@ -21,7 +21,16 @@ import { unifiedSnap, SnapSource, SnapInfo } from "../../snapping/UnifiedSnap";
 import { BeamElement } from "../../model/elements/BeamElement";
 import { ColumnElement } from "../../model/elements/ColumnElement";
 import { BeamMeshBuilder } from "../../mesh/builders/BeamMeshBuilder";
-import { ColumnMeshBuilder } from "../../mesh/builders/ColumnMeshBuilder";
+import { ColumnMeshBuilder, columnFootprint2D } from "../../mesh/builders/ColumnMeshBuilder";
+import {
+    buildJunctionGraph,
+    resolveJunctions,
+    applyCaps,
+    virtualEdgeFootprint,
+    type ColumnFootprint,
+} from "../../topology/junctions/JunctionGraph";
+import { ensureCCW } from "../../geometry/wall/EdgeGeometry";
+import type { RoomPolygon } from "../../model/elements/SpaceElement";
 import { Profile } from "../../model/profiles/Profile";
 import ConstraintPanel from "../constraint/ConstraintPanel";
 import ConstraintIconOverlay from "../constraint/ConstraintIconOverlay";
@@ -46,6 +55,7 @@ import { LineMeshBuilder } from "../../mesh/builders/LineMeshBuilder";
 import { Camera } from "../../renderer/camera/Camera";
 import { OrthographicCamera } from "../../renderer/camera/OrthographicCamera";
 import { Vec3 } from "../../geometry/math/Vec3";
+import { Vec2 } from "../../geometry/math/Vec2";
 import { rayIntersectsAABB } from "../../geometry/math/Raycast";
 import { WallJoinResolver, WallJoinResult } from "../../topology/joins/WallJoinResolver";
 import { snapToGrids, pickGrid, snapAngle, snapAxisAlign, GridSnapResult, AxisAlignSnapResult } from "../../model/grid/GridSnap";
@@ -113,17 +123,35 @@ function pickWallByRay(
     elements: Record<string, any>,
     sceneObjects: { id: string; mesh: { bounds: { min: Vec3; max: Vec3 } } }[],
 ): { wallId: string; position: number } | null {
+    const debug = (globalThis as any).__pickDebug === true;
     // 1. Ray vs wall AABB — works in 3D
     let bestHit: { wallId: string; dist: number } | null = null;
+    let wallObjCount = 0;
     for (const obj of sceneObjects) {
         const sid = obj.id.toString();
         if (sid.startsWith("handle-") || sid.startsWith("grid-") || sid === "preview-fill" || sid === "temp-wall-sketch") continue;
         const el = elements[sid];
         if (!el || el.type !== "Wall") continue;
+        wallObjCount++;
         const dist = rayIntersectsAABB(rayOrigin, rayDir, obj.mesh.bounds);
+        if (debug) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `  wall=${sid.slice(0,6)} bounds=[(${obj.mesh.bounds.min.map(v=>v.toFixed(2)).join(",")})-` +
+                `(${obj.mesh.bounds.max.map(v=>v.toFixed(2)).join(",")})] ` +
+                `dist=${dist === null ? "miss" : dist.toFixed(3)}`,
+            );
+        }
         if (dist !== null && (!bestHit || dist < bestHit.dist)) {
             bestHit = { wallId: sid, dist };
         }
+    }
+    if (debug) {
+        // eslint-disable-next-line no-console
+        console.log(
+            `[pickWall] sceneObjs=${sceneObjects.length} wallObjs=${wallObjCount} ` +
+            `bestHit=${bestHit ? bestHit.wallId.slice(0,6) : "null"} ground=${groundPoint ? `(${groundPoint[0].toFixed(2)},${groundPoint[2].toFixed(2)})` : "null"}`,
+        );
     }
     if (bestHit) {
         const w = elements[bestHit.wallId] as WallElement;
@@ -136,9 +164,11 @@ function pickWallByRay(
     if (!groundPoint) return null;
     const tolerance = 0.6;
     let best: { wallId: string; position: number; dist: number } | null = null;
+    let wallElCount = 0;
     for (const id in elements) {
         const el = elements[id];
         if (!el || el.type !== "Wall") continue;
+        wallElCount++;
         const w = el as WallElement;
         const a = w.axis[0];
         const b = w.axis[1];
@@ -155,6 +185,12 @@ function pickWallByRay(
         if (dist <= margin && (!best || dist < best.dist)) {
             best = { wallId: id, position: tc, dist };
         }
+    }
+    if (debug) {
+        // eslint-disable-next-line no-console
+        console.log(
+            `[pickWall fallback] wallEls=${wallElCount} best=${best ? `${best.wallId.slice(0,6)} t=${best.position.toFixed(3)} d=${best.dist.toFixed(3)}` : "null"}`,
+        );
     }
     return best ? { wallId: best.wallId, position: best.position } : null;
 }
@@ -221,7 +257,8 @@ function snapForBeam(
     elements: Record<string, any>,
     grids: { id: string; visible: boolean; curve: any }[],
     tolerance: number = 0.5,
-): { point: Vec3; kind: "Column" | "BeamEndpoint" | "GridIntersection" | "Grid" | null } {
+    residentialStep?: number,
+): { point: Vec3; kind: "Column" | "BeamEndpoint" | "GridIntersection" | "Grid" | "ResidentialGrid" | null } {
     // 1. Column center
     let best: { dist: number; point: Vec3 } | null = null;
     for (const id in elements) {
@@ -260,6 +297,17 @@ function snapForBeam(
             point: [gsnap.point[0], raw[1], gsnap.point[2]],
             kind: gsnap.kind === "Intersection" ? "GridIntersection" : "Grid",
         };
+    }
+
+    // 5. Residential background grid (910 / 455mm step) — only when active.
+    //    Same handling as RoomSketchOverlay: snap when within tolerance of
+    //    the nearest secondary-step intersection (covers primary too).
+    if (residentialStep && residentialStep > 0) {
+        const sx = Math.round(raw[0] / residentialStep) * residentialStep;
+        const sz = Math.round(raw[2] / residentialStep) * residentialStep;
+        if (Math.hypot(raw[0] - sx, raw[2] - sz) <= tolerance) {
+            return { point: [sx, raw[1], sz], kind: "ResidentialGrid" };
+        }
     }
     return { point: raw, kind: null };
 }
@@ -345,6 +393,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
     const levels = useAppState((state: AppState) => state.levels);
     const activeRoomId = useAppState((state: AppState) => state.activeRoomId);
     const grids = useAppState((state: AppState) => state.grids);
+    const designMode = useAppState((state: AppState) => state.designMode);
     const gridlineDrafting = useAppState((state: AppState) => state.gridlineDrafting);
     const setGridlineDrafting = useAppState((state: AppState) => state.setGridlineDrafting);
     const gridDraftMode = useAppState((state: AppState) => state.gridDraftMode);
@@ -415,7 +464,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
     const [beamDepthInput, setBeamDepthInput] = useState("0.6");
     const [beamTopOffsetInput, setBeamTopOffsetInput] = useState("0");
     const [beamZJust, setBeamZJust] = useState<"Top" | "Center" | "Bottom">("Top");
-    const [beamSnap, setBeamSnap] = useState<{ kind: "Column" | "Grid" | "GridIntersection" | "BeamEndpoint" | null }>({ kind: null });
+    const [beamSnap, setBeamSnap] = useState<{ kind: "Column" | "Grid" | "GridIntersection" | "BeamEndpoint" | "ResidentialGrid" | null }>({ kind: null });
     // Column tool (spec §5)
     const [columnHover, setColumnHover] = useState<Vec3 | null>(null);
     const [columnSnap, setColumnSnap] = useState<{ kind: string | null }>({ kind: null });
@@ -733,6 +782,54 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             }
         }
 
+        // 単体壁 (= 部屋から派生していない壁) の交差処理。各壁を
+        // 退化 2 頂点ポリゴンに包み、部屋壁と全く同じ JunctionGraph
+        // パイプライン (buildJunctionGraph → resolveJunctions → applyCaps)
+        // を通して、L / T / X 接合を統一的に解決する。
+        const standaloneFootprints = new Map<string, Vec2[]>();
+        if (!inRoomMode) {
+            const standaloneWalls = allWalls.filter((w) => !w.polyRef);
+            if (standaloneWalls.length > 0) {
+                const synthPolys: RoomPolygon[] = standaloneWalls.map((w) => ({
+                    id: `synth-${w.id}`,
+                    outer: [
+                        [w.axis[0][0], w.axis[0][2]] as Vec2,
+                        [w.axis[1][0], w.axis[1][2]] as Vec2,
+                    ],
+                    // 明示的に 1 エッジのみ。これで JunctionGraph は forward
+                    // 方向の仮想エッジ 1 本しか生成せず、L 字交差点では
+                    // 2 incident になり cross-poly miter が効く。
+                    edges: [[0, 1]],
+                    holes: [],
+                    wallThickness: w.thickness,
+                    wallReference: "Center",
+                    innerThickness: w.thickness / 2,
+                    outerThickness: w.thickness / 2,
+                }));
+                try {
+                    const jgraph = buildJunctionGraph(synthPolys);
+                    resolveJunctions(jgraph, synthPolys);
+                    applyCaps(jgraph, synthPolys);
+                    for (let i = 0; i < standaloneWalls.length; i++) {
+                        const poly = synthPolys[i];
+                        const veIds = jgraph.edgeToVes.get(`${poly.id}:0`);
+                        if (!veIds || veIds.length === 0) continue;
+                        const ve = jgraph.virtualEdges.get(veIds[0]);
+                        if (!ve) continue;
+                        const fp = virtualEdgeFootprint(ve);
+                        if (fp) {
+                            standaloneFootprints.set(
+                                standaloneWalls[i].id as string,
+                                fp,
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.warn("Standalone wall JunctionGraph failed:", e);
+                }
+            }
+        }
+
         // Helper: collect WallOpeningInfo for a given wall, including any in-flight preview
         const collectOpenings = (w: WallElement): WallOpeningInfo[] => {
             const result: WallOpeningInfo[] = [];
@@ -778,6 +875,27 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             return m;
         };
 
+        // 同一レベルに置かれた柱の 2D フットプリントをレベル ID 単位で
+        // 集約。`WallGeometryBuilder.build` に渡し、壁矩形を Clipper diff で
+        // 切り抜く (= 柱を優先)。レベル ID なしの柱は空文字列キーで束ね、
+        // 同じくレベル ID なしの壁にだけ作用させる。
+        const columnsByLevel = new Map<string, ColumnFootprint[]>();
+        for (const cid in elements) {
+            const ce = elements[cid];
+            if (!ce || ce.type !== "Column") continue;
+            const col = ce as ColumnElement;
+            const fp = columnFootprint2D(col);
+            if (fp.length < 3) continue;
+            const key = (col.baseLevelId as string | undefined) ?? "";
+            let arr = columnsByLevel.get(key);
+            if (!arr) { arr = []; columnsByLevel.set(key, arr); }
+            arr.push({ id: col.id as string, points: ensureCCW(fp) });
+        }
+        const columnsForWall = (w: WallElement): ColumnFootprint[] | undefined => {
+            const key = (w.baseLevelId as string | undefined) ?? "";
+            return columnsByLevel.get(key);
+        };
+
         for (const id in elements) {
             const el = elements[id] as WallElement;
             if (el.type === "Wall") {
@@ -787,7 +905,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 if (activeTool === "wall") {
                     // 2D plan view: render the wall as a flat rectangle using
                     // the mitered footprint corners so adjacent walls meet
-                    // without a gap at the join.
+                    // without a gap at the join. 柱クリップは 3D path のみ。
                     const joins = joinMap.get(el.id as string);
                     const [c0, c1, c2, c3] = WallGeometryBuilder.build(el, joins).footprint;
                     const Y = 0.02;
@@ -826,6 +944,15 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     // no openings (hex prism with openings は未対応)。それ
                     // 以外は従来の 4 隅 rect path + WallJoinResolver。
                     const wallOpenings = collectOpenings(el);
+                    if ((window as any).__wallOpeningsDebug) {
+                        // eslint-disable-next-line no-console
+                        console.log(
+                            `[wallMesh] ${(el.id as string).slice(0, 6)} ` +
+                            `openings=${wallOpenings.length} ` +
+                            `el.openings=[${(el.openings ?? []).map((id) => (id as string).slice(0, 6)).join(",")}] ` +
+                            `fpLen=${el.footprint?.length ?? "none"}`,
+                        );
+                    }
                     const usesHex = !!el.polyRef && wallOpenings.length === 0;
                     let parentPolygon: SpaceElement["polygons"][number] | undefined;
                     if (usesHex && el.polyRef) {
@@ -847,7 +974,23 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     };
                     // joinMap は hex 経路では使わない (hex 自体がコーナー解決済み)。
                     const joins = usesHex && parentPolygon ? undefined : joinMap.get(el.id as string);
-                    const geomData = WallGeometryBuilder.build(el, joins, parentPolygon, polygonLookup);
+                    // 単体壁向けに合成したフットプリント (= 部屋壁と同じ
+                    // JunctionGraph 経路で解決された 4 隅) があれば
+                    // wall.footprint を一時的に上書きして WallGeometryBuilder に渡す。
+                    // openings を持つ壁は legacy rect path を保つため適用しない。
+                    const synthFp = standaloneFootprints.get(el.id as string);
+                    const elForBuild = (synthFp && wallOpenings.length === 0)
+                        ? { ...el, footprint: synthFp }
+                        : el;
+                    // wallOpenings は hover preview を含むので、wall.openings
+                    // ではなくこちらの長さを WallGeometryBuilder に渡す。
+                    // これで preview 段階でも legacy rect path に分岐し、
+                    // opening 切り欠きが描画される。
+                    const geomData = WallGeometryBuilder.build(
+                        elForBuild, joins, parentPolygon, polygonLookup,
+                        wallOpenings.length,
+                        columnsForWall(el),
+                    );
                     const hasStartJoin = joins?.some((j: WallJoinResult) => j.at === "Start");
                     const hasEndJoin = joins?.some((j: WallJoinResult) => j.at === "End");
                     const meshData = WallMeshBuilder.build(geomData, {
@@ -1382,6 +1525,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         transform: openingTransform,
                         visible: true,
                         color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [0.55, 0.35, 0.18, 1.0],
+                        noCull: true,
                     });
                 } else {
                     const mesh = WindowMeshBuilder.build({
@@ -1398,6 +1542,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         transform: openingTransform,
                         visible: true,
                         color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [0.6, 0.78, 0.92, 0.85],
+                        noCull: true,
                     });
                 }
             }
@@ -1439,6 +1584,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         transform: previewTransform,
                         visible: true,
                         color: activeTool === "door" ? [0.9, 0.55, 0.2, 0.7] : [0.55, 0.85, 1.0, 0.7],
+                        noCull: true,
                     });
                 }
             }
@@ -2050,7 +2196,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             (window as any).__viewportInteracting = true;
             const raw = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
             if (!raw) return;
-            const snap = snapForBeam(raw, elements, grids as any);
+            const snap = snapForBeam(raw, elements, grids as any, 0.5, designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined);
             const pt = snap.point;
             const profile: Profile = columnProfileKind === "Circle"
                 ? { kind: "Circle", radius: Math.max(0.05, parseFloat(columnRadiusInput) || 0.25) }
@@ -2077,7 +2223,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             (window as any).__viewportInteracting = true;
             const raw = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
             if (!raw) return;
-            const snap = snapForBeam(raw, elements, grids as any);
+            const snap = snapForBeam(raw, elements, grids as any, 0.5, designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined);
             const pt = snap.point;
             if (!beamStart) {
                 setBeamStart(pt);
@@ -2180,6 +2326,18 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             const hit = pickWallByRay(ray.origin, ray.dir, ground, elements, sceneRef.current.getObjects());
             if (!hit) return;
             const def = activeTool === "door" ? doorDefaults : windowDefaults;
+            const hostWall = elements[hit.wallId] as WallElement | undefined;
+            // eslint-disable-next-line no-console
+            console.log(
+                `[create ${activeTool}] hit=${(hit.wallId as string).slice(0, 6)} ` +
+                `pos=${hit.position.toFixed(3)} ` +
+                `existingOpenings=${(hostWall?.openings ?? []).length} ` +
+                `wallAxis=[(${hostWall?.axis[0][0].toFixed(2)},${hostWall?.axis[0][2].toFixed(2)})→` +
+                `(${hostWall?.axis[1][0].toFixed(2)},${hostWall?.axis[1][2].toFixed(2)})] ` +
+                `wallFp=${hostWall?.footprint
+                    ? hostWall.footprint.map((p) => `(${p[0].toFixed(2)},${p[1].toFixed(2)})`).join(",")
+                    : "NONE"}`,
+            );
             if (activeTool === "door") {
                 executeCommand(new CreateDoorCommand(hit.wallId, hit.position, def.width, def.height));
             } else {
@@ -2342,7 +2500,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         if (activeTool === "beam") {
             const raw = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
             if (raw) {
-                const snap = snapForBeam(raw, elements, grids as any);
+                const snap = snapForBeam(raw, elements, grids as any, 0.5, designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined);
                 setBeamSnap({ kind: snap.kind });
                 setBeamHover(snap.point);
             }
@@ -2351,7 +2509,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         if (activeTool === "column") {
             const raw = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
             if (raw) {
-                const snap = snapForBeam(raw, elements, grids as any);
+                const snap = snapForBeam(raw, elements, grids as any, 0.5, designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined);
                 setColumnSnap({ kind: snap.kind });
                 setColumnHover(snap.point);
             }
@@ -2435,10 +2593,12 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 getCamera={() => cameraRef.current}
                 getCanvas={() => canvasRef.current}
             />
-            <ConstraintIconOverlay
-                getCamera={() => cameraRef.current}
-                getCanvas={() => canvasRef.current}
-            />
+            {activeRoomId && (
+                <ConstraintIconOverlay
+                    getCamera={() => cameraRef.current}
+                    getCanvas={() => canvasRef.current}
+                />
+            )}
             <RoomLabelOverlay
                 getCamera={() => cameraRef.current}
                 getCanvas={() => canvasRef.current}

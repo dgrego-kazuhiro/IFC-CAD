@@ -1,5 +1,6 @@
 import { BaseElement } from "../base/BaseElement";
 import { Vec3 } from "../../geometry/math/Vec3";
+import { Vec2 } from "../../geometry/math/Vec2";
 import { ElementId } from "../base/ElementId";
 
 export interface WallElement extends BaseElement {
@@ -42,4 +43,18 @@ export interface WallElement extends BaseElement {
     innerThickness?: number;
     /** 外側厚さ (m)。RoomPolygon 由来。未設定なら `thickness/2` 互換。 */
     outerThickness?: number;
+    /**
+     * 事前計算済みの 2D フットプリント (XZ 平面、CCW)。
+     * Junction-graph パイプラインが交差点解析の結果として書き込む。
+     * 設定されていれば WallGeometryBuilder はこれを優先して 3D 化し、
+     * `computeWallHexagon` / legacy rect 経路を呼ばない。
+     * 単位は wall axis と同じワールド座標 (m)。
+     */
+    footprint?: Vec2[];
+    /**
+     * 共線重なり区間で生成された仮想エッジ由来の壁かどうか。
+     * 同一 axis に複数のポリゴン由来仮想エッジが乗っている場合 true。
+     * 表示・選択・IFC 出力での区別に利用。
+     */
+    isShared?: boolean;
 }

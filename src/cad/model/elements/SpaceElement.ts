@@ -43,8 +43,15 @@ export interface RoomPolygon {
      * 真。`polygonEdges(poly)` で常に同じ形式で取得する。
      */
     edges?: [number, number][];
-    /** IDs of the walls generated from this polygon's outer ring */
+    /** IDs of the walls generated from this polygon's outer ring (legacy 1:1).
+     *  新パイプライン（junction-graph 経由）が生成した場合は `wallsPerEdge` を
+     *  使用するため空または未設定。読み出し側は両方を許容する。 */
     wallIds?: string[];
+    /** outer 各エッジから派生した壁 ID 配列。長さは `outer.length`。
+     *  共線重なりで分割された場合 `wallsPerEdge[i]` は 2+ 要素となる。
+     *  順序は仮想エッジが outer[i] → outer[(i+1)%N] の方向に並ぶ順。
+     *  新パイプラインで設定される。未設定なら従来の `wallIds` 経路。 */
+    wallsPerEdge?: string[][];
 
     // ── 壁厚モデル ─────────────────────────────────────────────
     /** 旧 API: 単一壁厚 (m)。新しい inner/outer 分離フィールドが両方

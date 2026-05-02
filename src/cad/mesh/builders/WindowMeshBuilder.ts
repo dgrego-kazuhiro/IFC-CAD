@@ -53,12 +53,15 @@ export class WindowMeshBuilder {
             off += 4;
         };
 
-        addFace(b0, b1, t1, t0);
-        addFace(b2, b3, t3, t2);
-        addFace(b1, b2, t2, t1);
-        addFace(b3, b0, t0, t3);
-        addFace(t0, t1, t2, t3);
-        addFace(b3, b2, b1, b0);
+        // 単一 winding。Renderer 側で `noCull: true` の pipeline を使うため
+        // back-face culling は無効化されており、カメラから見て裏向きの面も
+        // そのまま描画される (= 開口部のどちら側からでも panel が見える)。
+        addFace(b0, t0, t1, b1); // back (-nx)
+        addFace(b2, t2, t3, b3); // front (+nx)
+        addFace(b1, t1, t2, b2); // right (+ax end)
+        addFace(b3, t3, t0, b0); // left  (-ax end)
+        addFace(t0, t3, t2, t1); // top (+Y)
+        addFace(b3, b0, b1, b2); // bottom (-Y)
 
         // Glass pane outline: only the 4-sided rectangle on each face,
         // appended as edge-only vertices so we don't reuse the per-face

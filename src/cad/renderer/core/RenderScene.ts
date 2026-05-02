@@ -14,6 +14,15 @@ export interface RenderObject {
      * markers that must never be occluded by 3D walls or other geometry.
      */
     overlay?: boolean;
+    /**
+     * Render with `cullMode: "none"` (no back-face culling) but the regular
+     * depth test/write. Used for thin double-sided geometry like door / window
+     * panels where the panel orientation depends on the host wall direction
+     * and may not consistently face outward — without this, half the
+     * windows of a rectangular room render invisibly because their winding
+     * is back-facing for the current camera angle.
+     */
+    noCull?: boolean;
 }
 
 export class RenderScene {

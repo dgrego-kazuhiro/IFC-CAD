@@ -196,57 +196,6 @@ export function computeWallHexagon(
         vertex[1] + cur.nOut[1] * resolveWallThicknesses(poly).outer,
     ];
 
-    const midX = (s[0] + e[0]) / 2;
-    const midY = (s[1] + e[1]) / 2;
-    const dist2ToMid = (p: Vec2): number =>
-        (p[0] - midX) * (p[0] - midX) + (p[1] - midY) * (p[1] - midY);
-
-    /** 現エッジ + 他 incident エッジを `EdgeOffsetLines` で集める。
-     *  - own = 同一ポリゴンの prev/next (引数で渡す)
-     *  - cross = `poly.vertexConnections[vertexIdx]` から polygonLookup
-     *           で他ポリゴンを引いて edgeOffsetLines を作る */
-    const gatherIncident = (
-        vertexIdx: number,
-        own: EdgeOffsetLines | null,
-    ): EdgeOffsetLines[] => {
-        const out: EdgeOffsetLines[] = [];
-        if (own) out.push(own);
-        const cons = poly.vertexConnections?.[vertexIdx];
-        if (cons && cons.length > 0 && polygonLookup) {
-            for (const c of cons) {
-                const otherPoly = polygonLookup(c.polyId);
-                if (!otherPoly) continue;
-                const ol = edgeOffsetLines(otherPoly, c.edgeIdx);
-                if (ol) out.push(ol);
-            }
-        }
-        return out;
-    };
-
-    /** `srcLine` (cur.inner または cur.outer) と各 incident エッジの
-     *  L_in / L_out との交点のうち、`midpoint` への距離が最小のものを返す。
-     *  候補無しなら null。 */
-    const closestCandidate = (
-        srcLine: Line2,
-        incidents: EdgeOffsetLines[],
-    ): Vec2 | null => {
-        let best: Vec2 | null = null;
-        let bestD = Infinity;
-        for (const other of incidents) {
-            for (const otherLine of [other.inner, other.outer]) {
-                const p = intersectLines(srcLine, otherLine);
-                if (!p) continue;
-                const d = dist2ToMid(p);
-                if (d < bestD) { bestD = d; best = p; }
-            }
-        }
-        return best;
-    };
-
-    const hasIntersectionAt = (vertexIdx: number): boolean =>
-        !!poly.vertexConnections && !!poly.vertexConnections[vertexIdx]
-        && (poly.vertexConnections[vertexIdx]?.length ?? 0) > 0;
-
     // 共有エッジ判定。現エッジ自身、または隣接 (prev/next) が共有エッジの
     // 場合、その側の **inner コーナー** だけ miter / 最近接を使わずに
     // 現エッジの法線方向に innerThickness 分だけ垂直オフセットした点を
@@ -259,45 +208,37 @@ export function computeWallHexagon(
     const innerPerpAtStart = curIsShared || prevIsShared;
     const innerPerpAtEnd = curIsShared || nextIsShared;
 
-    /** outer コーナーを既存ロジック (vertexConnections → standard miter) で
-     *  決める。`vert` は対象頂点 (s か e)、`incidentsForIntersection` は
-     *  交差点モード時に渡す incident edge 群、`miterNeighbor` は standard
-     *  miter モード時に使う隣接エッジ。 */
+    /** outer コーナーを決める (1 本目 = cur, 2 本目 = polygon prev/next の
+     *  standard miter)。共線 (180°) の場合 intersectLines が parallel で
+     *  null を返し、端点の垂直オフセットへ fallback する → 外オフ・端点・
+     *  内オフが直線で並ぶ。 */
     const resolveOuter = (
         vert: Vec2,
-        vertexIdx: number,
         miterNeighbor: EdgeOffsetLines | null,
     ): Vec2 => {
-        if (hasIntersectionAt(vertexIdx)) {
-            const incidents = gatherIncident(vertexIdx, miterNeighbor);
-            return closestCandidate(cur.outer, incidents) ?? fallbackOuterAt(vert);
-        }
         if (miterNeighbor) {
             return intersectLines(miterNeighbor.outer, cur.outer) ?? fallbackOuterAt(vert);
         }
         return fallbackOuterAt(vert);
     };
-    /** inner コーナーを既存ロジックで決める (上の outer と対の関数)。
-     *  共有エッジ近傍では呼ばれず、垂直オフセットが優先される。 */
+    /** inner コーナーを決める (上の outer と対)。共有エッジ近傍では呼ばれず、
+     *  垂直オフセットが優先される。 */
     const resolveInner = (
         vert: Vec2,
-        vertexIdx: number,
         miterNeighbor: EdgeOffsetLines | null,
     ): Vec2 => {
-        if (hasIntersectionAt(vertexIdx)) {
-            const incidents = gatherIncident(vertexIdx, miterNeighbor);
-            return closestCandidate(cur.inner, incidents) ?? fallbackInnerAt(vert);
-        }
         if (miterNeighbor) {
             return intersectLines(miterNeighbor.inner, cur.inner) ?? fallbackInnerAt(vert);
         }
         return fallbackInnerAt(vert);
     };
 
-    // ── start side (vertex s) ──────────────────────────────────────
+    // ── 1 本目 (cur) + 2 本目 (polygon prev/next) の standard miter で
+    //    6 頂点 hex を計算する。共線 (180°) の場合は intersectLines が
+    //    parallel で null を返し、垂直オフセット fallback で外/端点/内が
+    //    直線並びになる。この経路はユーザ仕様の「直線関係を優先」を満たす。
     if (debug) {
         const tag = innerPerpAtStart ? "INNER-PERP" :
-            hasIntersectionAt(aiCur) ? "INTERSECTION" :
             prev ? "miter" : "no-prev";
         console.log(
             `  start v${aiCur} ${tag} (cur_shared=${curIsShared} ` +
@@ -306,16 +247,14 @@ export function computeWallHexagon(
     }
     const innerPrev: Vec2 = innerPerpAtStart
         ? fallbackInnerAt(s)
-        : resolveInner(s, aiCur, prev);
-    const outerPrev: Vec2 = resolveOuter(s, aiCur, prev);
+        : resolveInner(s, prev);
+    const outerPrev: Vec2 = resolveOuter(s, prev);
     if (debug) {
         console.log(`    innerPrev=${fmt(innerPrev)} outerPrev=${fmt(outerPrev)}`);
     }
 
-    // ── end side (vertex e) ────────────────────────────────────────
     if (debug) {
         const tag = innerPerpAtEnd ? "INNER-PERP" :
-            hasIntersectionAt(biCur) ? "INTERSECTION" :
             next ? "miter" : "no-next";
         console.log(
             `  end v${biCur} ${tag} (cur_shared=${curIsShared} ` +
@@ -324,8 +263,8 @@ export function computeWallHexagon(
     }
     const innerNext: Vec2 = innerPerpAtEnd
         ? fallbackInnerAt(e)
-        : resolveInner(e, biCur, next);
-    const outerNext: Vec2 = resolveOuter(e, biCur, next);
+        : resolveInner(e, next);
+    const outerNext: Vec2 = resolveOuter(e, next);
     if (debug) {
         console.log(`    innerNext=${fmt(innerNext)} outerNext=${fmt(outerNext)}`);
     }

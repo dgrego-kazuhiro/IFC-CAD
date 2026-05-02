@@ -19,6 +19,10 @@ export class Renderer {
     // depth test / write and premultiplied-alpha blending so sketch lines
     // always sit on top of walls regardless of Y.
     private overlayPipeline: GPURenderPipeline | null = null;
+    // Same as `pipeline` but with `cullMode: "none"`. Used for thin
+    // double-sided geometry (door / window panels) whose face orientation
+    // can't be guaranteed by the mesh builder.
+    private noCullPipeline: GPURenderPipeline | null = null;
 
     private depthTexture: GPUTexture | null = null;
     private depthView: GPUTextureView | null = null;
@@ -266,6 +270,15 @@ export class Renderer {
             multisample: msaa,
         });
 
+        this.noCullPipeline = device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: { module: objectModule, entryPoint: "vs_main", buffers: vertexBuffers },
+            fragment: { module: objectModule, entryPoint: "fs_main", targets: [{ format: this.gpu.format }] },
+            primitive: { topology: "triangle-list", cullMode: "none" },
+            depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+            multisample: msaa,
+        });
+
         this.overlayPipeline = device.createRenderPipeline({
             layout: pipelineLayout,
             vertex: { module: objectModule, entryPoint: "vs_main", buffers: vertexBuffers },
@@ -458,7 +471,9 @@ export class Renderer {
                 continue;
             }
 
-            const targetPipeline = obj.mesh.topology === "line-list" ? this.linePipeline! : this.pipeline!;
+            const targetPipeline = obj.mesh.topology === "line-list"
+                ? this.linePipeline!
+                : (obj.noCull ? this.noCullPipeline! : this.pipeline!);
             if (currentPipeline !== targetPipeline) {
                 currentPipeline = targetPipeline;
                 passEncoder.setPipeline(currentPipeline);

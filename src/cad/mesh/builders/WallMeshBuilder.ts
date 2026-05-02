@@ -81,13 +81,91 @@ export class WallMeshBuilder {
             indexOffset += 4;
         };
 
+        // Interior block boundary projection.
+        //   c0..c3 が mitered な場合 (= JunctionGraph 由来 fp で wall 端が
+        //   斜め切り)、c0-c3 の長さ ≠ c1-c2 の長さ となり、lerp(c0,c3,t) と
+        //   lerp(c1,c2,t) が同じ t でも異なる world 位置を返す。これが原因で
+        //   opening hole の outer / inner 境界が傾き、door preview (axis ベース)
+        //   とズレる。
+        //   data.axisStart / axisEnd が指定されていれば、それを使って
+        //   interior 境界 (= block.coversStart=false / coversEnd=false の側)
+        //   は axis 上の t 位置に **垂直方向オフセットだけを**当てた
+        //   axis-aligned な点を採用する。wall 端 (= coversStart/End=true 側)
+        //   はミター保持のため c0..c3 をそのまま使う。
+        const aS = data.axisStart;
+        const aE = data.axisEnd;
+        let outerPerpX = 0, outerPerpZ = 0;
+        let innerPerpX = 0, innerPerpZ = 0;
+        let axLen = 0, axUx = 0, axUz = 0;
+        const haveAxis = aS && aE;
+        if (haveAxis) {
+            const dx = aE![0] - aS![0];
+            const dz = aE![2] - aS![2];
+            axLen = Math.hypot(dx, dz);
+            if (axLen > 1e-9) {
+                axUx = dx / axLen;
+                axUz = dz / axLen;
+                // c0 = outerStart, c1 = innerStart. 軸方向成分を除いた
+                // 垂直オフセットを抽出 (= start 側の thickness に対応する
+                // perpendicular 位置)。
+                const c0OffX = c0[0] - aS![0];
+                const c0OffZ = c0[2] - aS![2];
+                const c0AxisProj = c0OffX * axUx + c0OffZ * axUz;
+                outerPerpX = c0OffX - c0AxisProj * axUx;
+                outerPerpZ = c0OffZ - c0AxisProj * axUz;
+                const c1OffX = c1[0] - aS![0];
+                const c1OffZ = c1[2] - aS![2];
+                const c1AxisProj = c1OffX * axUx + c1OffZ * axUz;
+                innerPerpX = c1OffX - c1AxisProj * axUx;
+                innerPerpZ = c1OffZ - c1AxisProj * axUz;
+            }
+        }
+        const axisProject = (t: number, side: "outer" | "inner"): Vec3 => {
+            if (!haveAxis || axLen <= 1e-9) {
+                // フォールバック: 旧来の lerp(c0..c3) を使う
+                if (side === "outer") return lerp(c0, c3, t);
+                return lerp(c1, c2, t);
+            }
+            const x = aS![0] + axUx * (t * axLen);
+            const z = aS![2] + axUz * (t * axLen);
+            const px = side === "outer" ? outerPerpX : innerPerpX;
+            const pz = side === "outer" ? outerPerpZ : innerPerpZ;
+            return [x + px, aS![1], z + pz];
+        };
+
+        // ── Winding orientation detection ────────────────────────────────
+        // 各 addFace は cross((p1-p0), (p2-p1)) で法線を出すため、面の winding
+        // が外向きになるかは fp の "inner" 側が wall.axis に対してどちら側
+        // (90° CCW = "left" / 90° CW = "right") に来るかで決まる。
+        //
+        //   - JunctionGraph の virtual edge が wall.axis と同じ向きで走る wall:
+        //     polygon CCW → inner は axis の 90° CCW = cross(axis, +Y) の方向。
+        //     現状の winding (b1, b2, t2, t1) で外向き法線 OK。
+        //   - virtual edge が wall.axis と逆向きで走る wall (= WallGeometryBuilder
+        //     で fp を反転したケース): inner は axis の 90° CW 側 =
+        //     -cross(axis, +Y) 方向。現状 winding だと法線が壁内部を向き、
+        //     `cullMode: "back"` で表面が消えて、奥の面だけ描かれた結果、
+        //     窓 panel が壁から飛び出して見える、という症状が出る。
+        //     その場合 winding を反転 (p1 ↔ p3) して法線を外向きに揃える。
+        let flipWinding = false;
+        if (haveAxis) {
+            const cxX = -axUz;
+            const cxZ = axUx;
+            const innerDot = cxX * innerPerpX + cxZ * innerPerpZ;
+            flipWinding = innerDot < 0;
+        }
+        const addFaceOriented = (p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) => {
+            if (flipWinding) addFace(p0, p3, p2, p1);
+            else addFace(p0, p1, p2, p3);
+        };
+
         for (const block of blocks) {
-            // Interpolate the four base footprint corners along the wall length.
-            // c0=start-left(-n), c1=start-right(+n), c2=end-right(+n), c3=end-left(-n)
-            const sLeft  = lerp(c0, c3, block.tStart);
-            const sRight = lerp(c1, c2, block.tStart);
-            const eLeft  = lerp(c0, c3, block.tEnd);
-            const eRight = lerp(c1, c2, block.tEnd);
+            // wall 端 (coversStart/End) はミター保持のため c0..c3 を直接使い、
+            // interior block 境界 (= opening 境界) は axis 投影で揃える。
+            const sLeft  = block.coversStart ? c0 : axisProject(block.tStart, "outer");
+            const sRight = block.coversStart ? c1 : axisProject(block.tStart, "inner");
+            const eLeft  = block.coversEnd   ? c3 : axisProject(block.tEnd,   "outer");
+            const eRight = block.coversEnd   ? c2 : axisProject(block.tEnd,   "inner");
 
             const b0: Vec3 = [sLeft[0],  block.yBase, sLeft[2]];
             const b1: Vec3 = [sRight[0], block.yBase, sRight[2]];
@@ -99,19 +177,30 @@ export class WallMeshBuilder {
             const t3: Vec3 = [eLeft[0],  block.yTop, eLeft[2]];
 
             // front (+n side)
-            addFace(b1, b2, t2, t1);
+            addFaceOriented(b1, b2, t2, t1);
             // back (-n side)
-            addFace(b3, b0, t0, t3);
+            addFaceOriented(b3, b0, t0, t3);
+            // sill / lintel block かどうか (= 全高でない部分壁)。
+            // sill / lintel の side cap は隣接する wall block の side cap と
+            // 同一 X-Z 平面に位置し、Y 範囲が wall block 側 (full height) の
+            // 部分集合となるため、両方描画すると Z-fighting で「窓の両側に
+            // 灰色の縦帯」が見える。wall block 側だけが jamb を描画するよう
+            // sill / lintel の side cap は省略する。
+            const isPartialHeight = block.yBase !== yBaseWall || block.yTop !== yTopWall;
             // start cap: external if it covers the wall start (and not joined),
-            // or interior reveal where an opening cut the wall
-            const showStartCap = block.coversStart ? !options?.joinedStart : true;
-            if (showStartCap) addFace(b0, b1, t1, t0);
-            const showEndCap = block.coversEnd ? !options?.joinedEnd : true;
-            if (showEndCap) addFace(b2, b3, t3, t2);
+            // or interior reveal (jamb) where an opening cut the wall.
+            const showStartCap = block.coversStart
+                ? !options?.joinedStart
+                : !isPartialHeight; // sill / lintel は省略
+            if (showStartCap) addFaceOriented(b0, b1, t1, t0);
+            const showEndCap = block.coversEnd
+                ? !options?.joinedEnd
+                : !isPartialHeight;
+            if (showEndCap) addFaceOriented(b2, b3, t3, t2);
             // top
-            addFace(t0, t1, t2, t3);
+            addFaceOriented(t0, t1, t2, t3);
             // bottom
-            addFace(b3, b2, b1, b0);
+            addFaceOriented(b3, b2, b1, b0);
         }
 
         // ── Edges ─────────────────────────────────────────────────────────
@@ -150,12 +239,20 @@ export class WallMeshBuilder {
             return result;
         };
         const doorOpenings = norm.filter((o) => o.sillHeight <= 1e-6);
+        // edge lerp は face と同じ axis-projection を使う。t が wall 端 (0 / 1)
+        // のときは miter 保持のため c0..c3 を直接使い、interior の t は axis
+        // 投影で揃える。これで face と edge が一致して、開口境界に余計な線が
+        // 出ない。
         const lerpFront = (t: number): Vec3 => {
-            const p = lerp(C1, C2, t);
+            if (t <= 0) return [C1[0], yBaseWall, C1[2]];
+            if (t >= 1) return [C2[0], yBaseWall, C2[2]];
+            const p = axisProject(t, "inner");
             return [p[0], yBaseWall, p[2]];
         };
         const lerpBack = (t: number): Vec3 => {
-            const p = lerp(C0, C3, t);
+            if (t <= 0) return [C0[0], yBaseWall, C0[2]];
+            if (t >= 1) return [C3[0], yBaseWall, C3[2]];
+            const p = axisProject(t, "outer");
             return [p[0], yBaseWall, p[2]];
         };
         for (const [s, e] of intervalsExcluding(doorOpenings)) {
@@ -183,13 +280,15 @@ export class WallMeshBuilder {
 
         // Per-opening edges: the rectangular hole on each face plus the
         // 4 inside-reveal depth lines connecting front and back.
+        // axis-projection で face と同じ位置を使う (mitered fp で c0-c3 と
+        // c1-c2 の長さが異なるケースで edge と face がズレるのを防止)。
         for (const o of norm) {
             const sillY = yBaseWall + o.sillHeight;
             const topY = yBaseWall + o.sillHeight + o.height;
-            const fL = lerp(C1, C2, o.startT);
-            const fR = lerp(C1, C2, o.endT);
-            const bL = lerp(C0, C3, o.startT);
-            const bR = lerp(C0, C3, o.endT);
+            const fL = axisProject(o.startT, "inner");
+            const fR = axisProject(o.endT, "inner");
+            const bL = axisProject(o.startT, "outer");
+            const bR = axisProject(o.endT, "outer");
             const F_BL: Vec3 = [fL[0], sillY, fL[2]];
             const F_BR: Vec3 = [fR[0], sillY, fR[2]];
             const F_TL: Vec3 = [fL[0], topY,  fL[2]];
@@ -271,11 +370,13 @@ export class WallMeshBuilder {
         // (top/bottom が出ていないバグ調査用。安定したら削除可。)
         if ((globalThis as any).__hexPrismDebug !== false) {
             // eslint-disable-next-line no-console
+            /*
             console.log(
                 `[hexPrism] verts=${n} h=${data.height.toFixed(3)} ` +
                 `yBase=${yBase.toFixed(3)} yTop=${yTop.toFixed(3)} ` +
                 `fp=[${fp.map((p) => `(${p[0].toFixed(2)},${p[2].toFixed(2)})`).join(",")}]`,
             );
+            */
         }
 
         const positions: number[] = [];
