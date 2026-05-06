@@ -14,18 +14,25 @@ import {
     curveFromVertices,
 } from '../model/grid/GridLine';
 import { Constraint } from '../model/constraint/Constraint';
+import type { SketchEntity, SketchEntityId } from '../model/sketch/SketchEntity';
+import type { SpaceElement } from '../model/elements/SpaceElement';
+import { derivePolygonsFromEntities } from '../model/sketch/PolygonDerive';
 
 // スケッチ内の頂点 / 辺の選択。ConstraintPanel が参照する。
-//   - edge / point / circle : 部屋ポリゴンに紐づく sketch 要素
-//   - wallAxis : 壁モードで単独作成した壁の中心線。WallElement.axis を一本の
-//     作図線として扱い、Horizontal / Vertical / Parallel / Length 等の拘束の
-//     ターゲットにする。
-//   - wallPoint : 壁軸の端点。Coincident / PerpDistance / PointOnGrid など点
-//     ターゲット拘束の対象になる。endIdx=0 は axis[0]、1 は axis[1]。
+//   - edge / point / circle : 部屋ポリゴンに紐づく sketch 要素 (polygon 経路)
+//   - entityVertex / entityEdge / entity : SketchEntity 経路 (line / arc /
+//     open polyline 等、polygon 化されないエンティティ向け)
+//   - wallAxis : 壁モードで単独作成した壁の中心線。
+//   - wallPoint : 壁軸の端点。endIdx=0 は axis[0]、1 は axis[1]。
 export type SketchSelectionItem =
     | { kind: "edge"; spaceId: ElementId; polyId: string; edgeIdx: number }
     | { kind: "point"; spaceId: ElementId; polyId: string; vertexIdx: number }
     | { kind: "circle"; spaceId: ElementId; polyId: string }
+    | { kind: "entityVertex"; spaceId: ElementId; entityId: SketchEntityId; vertex:
+        | { type: "endpoint"; pointIdx: number }
+        | { type: "center" } }
+    | { kind: "entityEdge"; spaceId: ElementId; entityId: SketchEntityId; edgeIdx?: number }
+    | { kind: "entity"; spaceId: ElementId; entityId: SketchEntityId }
     | { kind: "wallAxis"; wallId: ElementId }
     | { kind: "wallPoint"; wallId: ElementId; endIdx: 0 | 1 };
 
@@ -33,6 +40,13 @@ export function sketchSelectionKey(s: SketchSelectionItem): string {
     if (s.kind === "edge") return `e:${s.spaceId}:${s.polyId}:${s.edgeIdx}`;
     if (s.kind === "point") return `p:${s.spaceId}:${s.polyId}:${s.vertexIdx}`;
     if (s.kind === "circle") return `c:${s.spaceId}:${s.polyId}`;
+    if (s.kind === "entityVertex") {
+        const v = s.vertex.type === "center"
+            ? "c" : `e${s.vertex.pointIdx}`;
+        return `ev:${s.spaceId}:${s.entityId}:${v}`;
+    }
+    if (s.kind === "entityEdge") return `ee:${s.spaceId}:${s.entityId}:${s.edgeIdx ?? 0}`;
+    if (s.kind === "entity") return `en:${s.spaceId}:${s.entityId}`;
     if (s.kind === "wallAxis") return `w:${s.wallId}`;
     return `wp:${s.wallId}:${s.endIdx}`;
 }
@@ -52,7 +66,16 @@ export interface LevelData {
     elevation: number;
 }
 
-export type RoomEditMode = "select" | "rectangle" | "polyline" | "circle";
+export type RoomEditMode =
+    | "select"
+    | "rectangle"
+    | "polyline"
+    | "circle"
+    | "line"     // 単一直線 (2 点)。SketchEntity の line を生成。
+    | "arc"      // 3 点指定の円弧 (start, mid, end)。SketchEntity の arc を生成。
+    | "arcEdge"  // 既存エッジ → Arc 化。chord は固定、マウスで bulge を決定。
+    | "trim"     // 既存エンティティ (主に circle) を 2 点で部分化 → arc 化。
+    | "wallPath";
 
 /** Wall-tool sub-mode: "add" draws new walls, "select" picks sketch lines. */
 export type WallSubMode = "add" | "select";
@@ -75,6 +98,15 @@ export interface AppState {
     activeRoomId: ElementId | null;
     roomEditMode: RoomEditMode;
 
+    /**
+     * 部屋作成モードに入ったが、まだ最初の図形を描いていない状態を保持する。
+     * - レベル右クリックの「Add Room」/ Room ボタンで部屋モードに入った時点で
+     *   set される。Tree に空の Space を即時生成しないための仕組み。
+     * - 最初の Rectangle / Polyline / Circle 確定時に CreateSpaceCommand を
+     *   実行し、ここを null へ戻して activeRoomId を新しい Space にする。
+     */
+    pendingRoomLevelId: ElementId | null;
+
     // Wall tool sub-mode (add / select)
     wallSubMode: WallSubMode;
 
@@ -94,6 +126,22 @@ export interface AppState {
     gridDraftMode: "line" | "polyline";
     selectedGridIds: string[];
 
+    /**
+     * 部屋編集モードの壁厚 (mm)。RoomEditPanel の入力フィールドと、
+     * 図形コミット直後・ドラッグ完了時のリアルタイム壁生成で共有する。
+     * 文字列で持つのは入力中の "200mm" 等を直接束縛するため。
+     */
+    wallThicknessMm: string;
+    /** 円ポリゴンの壁分割角 (deg)。同じくリアルタイム生成と共有する。 */
+    circleWallAngleDeg: string;
+    /**
+     * 部屋編集モードでのリアルタイム壁生成を有効にするか。
+     *  - true (既定): 矩形・ポリライン・円の確定直後と、ポリゴンの
+     *    ドラッグ完了直後に `regenerateAllWalls` を自動実行する。
+     *  - false: 「全壁生成」ボタンを押した時のみ生成する従来挙動。
+     */
+    realtimeWallGen: boolean;
+
     // 2D 幾何拘束 (docs/specification/2d_constraint_system_spec.md)
     constraints: Record<string, Constraint>;
     sketchSelection: SketchSelectionItem[];
@@ -112,9 +160,26 @@ export interface AppState {
     setSelection: (ids: ElementId[]) => void;
     setActiveTool: (tool: string) => void;
 
+    /**
+     * Space の `entities` を更新し、`polygons` をエンティティから派生し直す。
+     * 真実の単一情報源は entities — 編集はすべてこの API を経由するのが望ましい。
+     *  - updater: 現在の entities を受け取り、新リストを返す関数 (または直リスト)。
+     *  - polygons は閉ループ (closed polyline / circle) のみが派生される。
+     *    壁参照 (wallIds / wallsPerEdge / edgeIds) は polyId が一致する限り保持。
+     *  - polyId 安定性のため `polyIdByEntity` を維持する。
+     */
+    setSpaceEntities: (
+        spaceId: ElementId,
+        updater: SketchEntity[] | ((entities: SketchEntity[]) => SketchEntity[]),
+    ) => void;
+
     // Room editing actions
     setActiveRoom: (id: ElementId | null) => void;
     setRoomEditMode: (mode: RoomEditMode) => void;
+    setPendingRoomLevel: (levelId: ElementId | null) => void;
+    setWallThicknessMm: (mm: string) => void;
+    setCircleWallAngleDeg: (deg: string) => void;
+    setRealtimeWallGen: (on: boolean) => void;
 
     // Wall tool sub-mode action
     setWallSubMode: (mode: WallSubMode) => void;
@@ -180,6 +245,10 @@ export const useAppState = create<AppState>((set, get) => ({
     activeLevelId: null,
     activeRoomId: null,
     roomEditMode: "select",
+    pendingRoomLevelId: null,
+    wallThicknessMm: "200",
+    circleWallAngleDeg: "15",
+    realtimeWallGen: true,
     wallSubMode: "add",
     designMode: "freeZoning",
     grids: [],
@@ -224,8 +293,56 @@ export const useAppState = create<AppState>((set, get) => ({
     }),
     setSelection: (ids) => set({ selection: ids }),
     setActiveTool: (tool) => set({ activeTool: tool }),
-    setActiveRoom: (id) => set({ activeRoomId: id, roomEditMode: "select" }),
+
+    setSpaceEntities: (spaceId, updater) => {
+        set((state) => {
+            const el = state.elements[spaceId] as SpaceElement | undefined;
+            if (!el || el.type !== "Space") return state;
+            const cur = el.entities ?? [];
+            const next = typeof updater === "function" ? updater(cur) : updater;
+
+            // チェイン検出を含む派生は PolygonDerive 側に集約。返り値の
+            // polyIdByEntity は「自己閉 entity 1:1」+「同じチェイン内全 entity
+            // が同じ polyId を共有」する正準的なマップ。
+            const { polygons: newPolygons, polyIdByEntity: nextMap } =
+                derivePolygonsFromEntities(next, {
+                    polyIdByEntity: el.polyIdByEntity,
+                    previous: el.polygons,
+                    nextPolyId: () => generateId(),
+                });
+
+            const updated: SpaceElement = {
+                ...el,
+                entities: next,
+                polygons: newPolygons,
+                polyIdByEntity: nextMap,
+                dirtyFlags: new Set([...(el.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+            };
+            return { elements: { ...state.elements, [spaceId]: updated } };
+        });
+        // 拘束ソルバはエンティティ変更にも反応する想定 (vertex 移動など)。
+        const mod = require('../constraint/SketchSolver') as typeof import('../constraint/SketchSolver');
+        mod.runSketchSolver();
+    },
+    setActiveRoom: (id) =>
+        set({
+            activeRoomId: id,
+            roomEditMode: "select",
+            // 実体ある Space をアクティブにした時点で「pending」状態は終わり。
+            // 部屋モード解除 (id=null) でも pending を残さないようクリアする。
+            pendingRoomLevelId: null,
+        }),
     setRoomEditMode: (mode) => set({ roomEditMode: mode }),
+    setPendingRoomLevel: (levelId) =>
+        set({
+            pendingRoomLevelId: levelId,
+            // pending に入る時は activeRoomId を握ったままだと
+            // 古い部屋に追記してしまうので、合わせてクリアする。
+            ...(levelId ? { activeRoomId: null, roomEditMode: "select" } : {}),
+        }),
+    setWallThicknessMm: (mm) => set({ wallThicknessMm: mm }),
+    setCircleWallAngleDeg: (deg) => set({ circleWallAngleDeg: deg }),
+    setRealtimeWallGen: (on) => set({ realtimeWallGen: on }),
     setWallSubMode: (mode) => set((state) => ({
         wallSubMode: mode,
         // Switching sub-modes clears any in-flight sketch selection so the

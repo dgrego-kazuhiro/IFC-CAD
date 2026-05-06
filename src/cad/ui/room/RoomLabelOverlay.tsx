@@ -5,7 +5,7 @@ import { mat4, vec4 } from "gl-matrix";
 import { useAppState, AppState } from "../../application/AppState";
 import { Camera } from "../../renderer/camera/Camera";
 import { Vec3 } from "../../geometry/math/Vec3";
-import { SpaceElement, RoomPolygon } from "../../model/elements/SpaceElement";
+import { SpaceElement, RoomPolygon, isPolygonClosed } from "../../model/elements/SpaceElement";
 import { computeRoomMetrics } from "./roomMetrics";
 
 interface Props {
@@ -34,6 +34,9 @@ function labelPolygons(space: SpaceElement): RoomPolygon[] {
     for (const p of space.polygons) {
         if (p.wallOutlineOf) continue;
         if (!p.outer || p.outer.length < 3) continue;
+        // 開いたポリライン (= wallPath ツールで描いた単独壁) は部屋では
+        // 無いのでラベル / 畳数を出さない。
+        if (!isPolygonClosed(p)) continue;
         out.push(p);
     }
     return out;

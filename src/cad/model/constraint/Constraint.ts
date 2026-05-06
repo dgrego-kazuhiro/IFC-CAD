@@ -1,4 +1,5 @@
 import { ElementId } from "../base/ElementId";
+import type { SketchEntityId } from "../sketch/SketchEntity";
 
 // 2D 幾何拘束（軽量: docs/specification/2d_constraint_system_spec.md）
 // 拘束は Space 内のポリゴン (RoomPolygon) の頂点 / 辺に付与する。矩形ツールで
@@ -23,7 +24,10 @@ export type ConstraintType =
     | "Tangent"
     | "PointOnCircle"
     | "ConcentricCircle"
-    | "EqualRadius";
+    | "EqualRadius"
+    // 弧 (ArcEntity) / 円 (CircleEntity) 自体の半径・直径拘束 (entity 直接参照)
+    | "ArcRadius"
+    | "ArcDiameter";
 
 // 拘束対象 = ポリゴン外周の頂点 or 辺、もしくは参照系（通芯・柱・円）。
 // 穴 (holes) の頂点・辺は対象外。
@@ -35,6 +39,9 @@ export type ConstraintTarget =
     | { kind: "SketchPoint"; spaceId: ElementId; polyId: string; vertexIdx: number }
     | { kind: "SketchEdge"; spaceId: ElementId; polyId: string; edgeIdx: number }
     | { kind: "SketchCircle"; spaceId: ElementId; polyId: string }
+    /** Arc / Circle entity 直接参照。Polygon ではなく SketchEntity に拘束を
+     *  付ける場合に使う (= 弧の半径拘束など)。 */
+    | { kind: "SketchEntity"; spaceId: ElementId; entityId: SketchEntityId }
     | { kind: "WallAxis"; wallId: ElementId }
     | { kind: "WallAxisPoint"; wallId: ElementId; endIdx: 0 | 1 }
     | { kind: "Grid"; gridId: string }

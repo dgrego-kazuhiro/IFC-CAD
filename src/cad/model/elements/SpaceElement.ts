@@ -1,6 +1,7 @@
 import { BaseElement } from "../base/BaseElement";
 import { Vec2 } from "../../geometry/math/Vec2";
 import { ElementId } from "../base/ElementId";
+import type { SketchEntity, SketchEntityId } from "../sketch/SketchEntity";
 
 /**
  * 部屋を構成する 1 個のポリゴン。矩形・マージ後の任意形状ともこの型で表す。
@@ -97,7 +98,53 @@ export interface RoomPolygon {
      *  アウトラインは編集可能な辺／頂点を持ち、Parallel + PerpDistance 拘束で
      *  元ポリゴンに連動する。 */
     wallOutlineOf?: string;
+
+    /** スナップ確定の T 字接合ヒント。WallPath 作図中に
+     *  `applyWallPathSnap` で他ポリゴンの頂点 / 辺にスナップした場合に
+     *  保存される。`regen` および `JunctionGraph` がこの情報を最優先で
+     *  使い、幾何検出 (5mm tol) に頼らずに確実な接合処理を行う。 */
+    joints?: PolygonJoint[];
+
+    /**
+     * outer の各 edge を生成した SketchEntity の id。長さ = outer.length。
+     * 単独直線エッジは `LineEntity.id` または `PolylineEntity.id`、円弧由来の
+     * 連続したテッセレーション辺はすべて同じ `ArcEntity.id` を共有する。
+     *
+     * これにより wallRegenerate は **同じ arc に属する複数 edge を 1 wall に
+     * グループ化**できる (= 円弧 1 本 = 1 Wall)。設定されていない polygon
+     * (旧データ等) は従来通り 1 edge = 1 wall。
+     */
+    edgeOwners?: string[];
 }
+
+/**
+ * ポリゴン頂点が他ポリゴンの幾何にスナップされた接続情報。WallPath を
+ * 既存壁にスナップ着地させた際に作図時点で確定する明示的な T 字接合ヒント。
+ *
+ * これがあれば JunctionGraph 側は **幾何検出 (5mm 距離判定)** に頼らず、
+ * 確定的に T 字 split を入れられる。FP 誤差や oblique snap で検出が外れる
+ * ケースでも信頼性のある接合処理が可能になる。
+ */
+export type PolygonJoint = {
+    /** この polygon の outer 頂点 idx (= スナップした側)。 */
+    vertexIdx: number;
+    /** スナップ先。 */
+    target:
+        | {
+            kind: "polyVertex";
+            spaceId: ElementId;
+            polyId: string;
+            targetVertexIdx: number;
+        }
+        | {
+            kind: "polyEdge";
+            spaceId: ElementId;
+            polyId: string;
+            targetEdgeIdx: number;
+            /** 0..1, edge.start→edge.end 上の比率位置。 */
+            t: number;
+        };
+};
 
 /**
  * 共通エッジ (= 2 つの RoomPolygon が部分的にでも重なっている境界)。
@@ -183,6 +230,19 @@ export interface SpaceElement extends BaseElement {
     type: "Space";
     boundary: Vec2[];
     polygons: RoomPolygon[];
+    /**
+     * First-class スケッチエンティティ (line / polyline / circle / arc)。
+     * 部屋の作図要素はここに格納する。`polygons` は閉ループのエンティティから
+     * 派生したキャッシュ (壁/IFC パイプラインが消費)。
+     *
+     * 既存データの後方互換: 未設定なら polygons から逆生成される (loader)。
+     */
+    entities: SketchEntity[];
+    /**
+     * `entities[i].id` → `polygons[j].id` の対応表。entity を編集したとき
+     * 同じ polyId で polygon を再生成し、壁/エッジ ID 紐付けを維持する。
+     */
+    polyIdByEntity?: Record<SketchEntityId, string>;
     area: number;
     height: number;
     levelId?: ElementId;

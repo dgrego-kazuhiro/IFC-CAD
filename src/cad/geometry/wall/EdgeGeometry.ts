@@ -167,12 +167,29 @@ export function computeWallHexagon(
     if (n === 0) return null;
     const cur = edgeOffsetLines(poly, edgeIdx);
     if (!cur) return null;
-    const prevIdx = (edgeIdx - 1 + n) % n;
-    const nextIdx = (edgeIdx + 1) % n;
-    const prev = edgeOffsetLines(poly, prevIdx);
-    const next = edgeOffsetLines(poly, nextIdx);
-
     const [aiCur, biCur] = edges[edgeIdx];
+    // 閉じ図形は cyclic 隣接で OK。開いたポリライン (wallPath 等) は
+    // 端点で wrap せず、頂点接続から prev / next を探す。マッチが無ければ
+    // null (= rectangular cap fallback) になる。
+    let prevIdx: number;
+    let nextIdx: number;
+    if (poly.edges) {
+        // 明示 edges を持つケース (= 開いたポリラインを許容)。頂点同士の接続で隣接を決める。
+        prevIdx = -1;
+        nextIdx = -1;
+        for (let i = 0; i < n; i++) {
+            if (i === edgeIdx) continue;
+            const [a, b] = edges[i];
+            if (b === aiCur && prevIdx === -1) prevIdx = i;
+            if (a === biCur && nextIdx === -1) nextIdx = i;
+        }
+    } else {
+        prevIdx = (edgeIdx - 1 + n) % n;
+        nextIdx = (edgeIdx + 1) % n;
+    }
+    const prev = prevIdx >= 0 ? edgeOffsetLines(poly, prevIdx) : null;
+    const next = nextIdx >= 0 ? edgeOffsetLines(poly, nextIdx) : null;
+
     const s = poly.outer[aiCur];
     const e = poly.outer[biCur];
 

@@ -35,6 +35,7 @@ export class CreateSpaceCommand implements Command {
             shape: null,
             boundary: [],
             polygons: [],
+            entities: [],
             area: 0,
             height: this.height,
             levelId: this.baseLevelId,

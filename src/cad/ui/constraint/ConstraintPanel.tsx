@@ -9,7 +9,7 @@ import { AddConstraintCommand, RemoveConstraintCommand, generateConstraintId } f
 
 // Tessellation density used when re-generating a circle's outer ring from
 // its parametric (center, radius) — must match RoomSketchOverlay's value.
-const CIRCLE_TESS = 128;
+const CIRCLE_TESS = 256;
 function tessellateCircle(center: Vec2, radius: number): Vec2[] {
     const pts: Vec2[] = [];
     for (let i = 0; i < CIRCLE_TESS; i++) {
@@ -52,7 +52,13 @@ function itemLabel(item: SketchSelectionItem, labelMap: Map<string, string>): st
     else if (item.kind === "point") k = `p:${item.polyId}:${item.vertexIdx}`;
     else if (item.kind === "circle") k = `c:${item.polyId}`;
     else if (item.kind === "wallAxis") k = `w:${item.wallId}`;
-    else k = `wp:${item.wallId}:${item.endIdx}`;
+    else if (item.kind === "wallPoint") k = `wp:${item.wallId}:${item.endIdx}`;
+    else if (item.kind === "entityVertex") {
+        const v = item.vertex.type === "center" ? "c" : `e${item.vertex.pointIdx}`;
+        k = `ev:${item.entityId}:${v}`;
+    }
+    else if (item.kind === "entityEdge") k = `ee:${item.entityId}:${item.edgeIdx ?? 0}`;
+    else k = `en:${item.entityId}`;
     return labelMap.get(k) ?? k;
 }
 
@@ -73,6 +79,7 @@ export default function ConstraintPanel() {
     const [radiusValue, setRadiusValue] = useState<string>("");
     const [diameterValue, setDiameterValue] = useState<string>("");
     const [perpDistValue, setPerpDistValue] = useState<string>("");
+    const [arcRadiusValue, setArcRadiusValue] = useState("1.0");
 
     const room = activeRoomId ? (elements[activeRoomId as string] as SpaceElement | undefined) : undefined;
     const polys: RoomPolygon[] = room?.polygons ?? [];
@@ -398,10 +405,22 @@ export default function ConstraintPanel() {
         return poly?.shape?.type === "circle" ? poly : null;
     };
 
+    /** 同じターゲットに対する既存の半径系拘束を削除する。値の上書きを意図した
+     *  操作で重複登録されないようにするための前処理。 */
+    const dropExistingRadiusForCircle = (spaceId: string, polyId: string) => {
+        for (const cid in constraints) {
+            const c = constraints[cid];
+            if (c.type !== "CircleRadius" && c.type !== "CircleDiameter") continue;
+            const matches = c.targets.some((t) => t.kind === "SketchCircle"
+                && t.spaceId === spaceId && t.polyId === polyId);
+            if (matches) executeCommand(new RemoveConstraintCommand(cid));
+        }
+    };
     const addCircleRadius = () => {
         const v = parseFloat(radiusValue);
         if (!Number.isFinite(v) || v <= 0) return;
         for (const c of circleSel) {
+            dropExistingRadiusForCircle(c.spaceId as string, c.polyId);
             add(mkC("CircleRadius", [{ kind: "SketchCircle", spaceId: c.spaceId, polyId: c.polyId }], v));
         }
     };
@@ -409,6 +428,7 @@ export default function ConstraintPanel() {
         const v = parseFloat(diameterValue);
         if (!Number.isFinite(v) || v <= 0) return;
         for (const c of circleSel) {
+            dropExistingRadiusForCircle(c.spaceId as string, c.polyId);
             add(mkC("CircleDiameter", [{ kind: "SketchCircle", spaceId: c.spaceId, polyId: c.polyId }], v));
         }
     };
@@ -586,6 +606,71 @@ export default function ConstraintPanel() {
     const btn = "text-[10px] py-1 px-2 rounded border bg-zinc-800 border-zinc-700 hover:bg-zinc-700 text-zinc-200";
     const btnWide = `w-full ${btn}`;
 
+    // 選択された edge / circle から **Arc / Circle entity** を解決する。
+    //  - edgeSel の各 edge について、所属 polygon の `edgeOwners[edgeIdx]` を
+    //    辿って owning entityId を取得 → 対応 entity が Arc なら抽出。
+    //  - circleSel の各 circle について、所属 polygon の `polyIdByEntity` 逆引き
+    //    → CircleEntity を抽出。
+    //  ユーザが弧の任意のテッセレーション辺をクリックしただけで「弧 1 本」を
+    //  対象に半径拘束を付けられる。
+    type ArcEntitySel = {
+        spaceId: string; entityId: string;
+        kind: "arc" | "circle";
+        radius: number;
+    };
+    const arcEntitySel: ArcEntitySel[] = (() => {
+        const seen = new Set<string>();
+        const out: ArcEntitySel[] = [];
+        const collect = (spaceId: string, entityId: string) => {
+            const key = `${spaceId}:${entityId}`;
+            if (seen.has(key)) return;
+            const sp = elements[spaceId as string] as SpaceElement | undefined;
+            if (!sp || sp.type !== "Space") return;
+            const ent = (sp.entities ?? []).find((e: any) => e.id === entityId);
+            if (!ent || (ent.kind !== "arc" && ent.kind !== "circle")) return;
+            seen.add(key);
+            out.push({
+                spaceId, entityId,
+                kind: ent.kind, radius: ent.radius,
+            });
+        };
+        for (const e of edgeSel) {
+            const sp = elements[e.spaceId as string] as SpaceElement | undefined;
+            const poly = sp?.polygons?.find((p) => p.id === e.polyId);
+            const ownerId = poly?.edgeOwners?.[e.edgeIdx];
+            if (ownerId) collect(e.spaceId as string, ownerId);
+        }
+        for (const c of circleSel) {
+            const sp = elements[c.spaceId as string] as SpaceElement | undefined;
+            const map = sp?.polyIdByEntity ?? {};
+            for (const eid in map) {
+                if (map[eid] === c.polyId) { collect(c.spaceId as string, eid); break; }
+            }
+        }
+        return out;
+    })();
+    // Arc / Circle 両方に対する半径拘束。Circle は既存の CircleRadius でも
+    // 設定できるが、エッジ選択経由でも統一的に付与できるよう ArcRadius
+    // (= SketchEntity ターゲット) を許容する。
+    //
+    // 値を変更したとき重複登録されないよう、対象 entity に対する既存の
+    // ArcRadius / ArcDiameter は事前に削除する (= 値の上書きとして振る舞う)。
+    const addArcRadius = () => {
+        const v = parseFloat(arcRadiusValue);
+        if (!Number.isFinite(v) || v <= 0) return;
+        for (const a of arcEntitySel) {
+            // 既存の同 entity に対する半径系拘束を全部 drop。
+            for (const cid in constraints) {
+                const c = constraints[cid];
+                if (c.type !== "ArcRadius" && c.type !== "ArcDiameter") continue;
+                const matches = c.targets.some((t) => t.kind === "SketchEntity"
+                    && t.spaceId === a.spaceId && t.entityId === a.entityId);
+                if (matches) executeCommand(new RemoveConstraintCommand(cid));
+            }
+            add(mkC("ArcRadius", [{ kind: "SketchEntity", spaceId: a.spaceId as any, entityId: a.entityId }], v));
+        }
+    };
+
     // Applicable constraint flags — edge-like counts (polygon edges + wall
     // axes) drive edge-type constraints so both kinds participate equally.
     const nEdges = edgeLikeSel.length;
@@ -612,10 +697,13 @@ export default function ConstraintPanel() {
         || (nCircles === 1 && nEdges === 1 && nPoints === 0);
     const canPointOnCircle = nCircles === 1 && nPoints >= 1 && nEdges === 0;
 
+    const canArcRadius = arcEntitySel.length >= 1;
+
     const anyApplicable =
         canHV || canLength || canParallel || canPerpendicular || canAngle || canCollinear || canEqualLength || canCoincident || canPointOnGrid ||
         canPerpDistance ||
-        canCircleRadius || canCircleDiameter || canConcentric || canEqualRadius || canTangent || canPointOnCircle;
+        canCircleRadius || canCircleDiameter || canConcentric || canEqualRadius || canTangent || canPointOnCircle ||
+        canArcRadius;
 
     return (
         <div className="space-y-2 text-xs max-h-[60vh] overflow-y-auto">
@@ -787,6 +875,21 @@ export default function ConstraintPanel() {
                             >直径 ⌀</button>
                         </div>
                     )}
+                    {canArcRadius && (
+                        <div className="flex items-center gap-1">
+                            <input
+                                className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
+                                type="number" step="0.1" placeholder="弧半径 m"
+                                value={arcRadiusValue}
+                                onChange={(e) => setArcRadiusValue(e.target.value)}
+                            />
+                            <button
+                                className={btn + " disabled:opacity-30 disabled:cursor-not-allowed"}
+                                disabled={!arcRadiusValue}
+                                onClick={addArcRadius}
+                            >弧半径 R</button>
+                        </div>
+                    )}
                     {canTangent && (
                         <button className={btnWide} onClick={addTangent}>接線 ⊙</button>
                     )}
@@ -813,6 +916,8 @@ export default function ConstraintPanel() {
                                 {c.value !== undefined && c.type === "Angle" && ` (${((c.value * 180) / Math.PI).toFixed(1)}°)`}
                                 {c.value !== undefined && c.type === "CircleRadius" && ` (R=${c.value.toFixed(2)} m)`}
                                 {c.value !== undefined && c.type === "CircleDiameter" && ` (⌀=${c.value.toFixed(2)} m)`}
+                                {c.value !== undefined && c.type === "ArcRadius" && ` (R=${c.value.toFixed(2)} m)`}
+                                {c.value !== undefined && c.type === "ArcDiameter" && ` (⌀=${c.value.toFixed(2)} m)`}
                                 {c.value !== undefined && c.type === "Length" && ` (${c.value.toFixed(2)} m)`}
                             </span>
                             <button className="text-red-400 hover:text-red-300" onClick={() => removeC(c.id)}>×</button>

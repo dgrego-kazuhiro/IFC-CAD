@@ -26,6 +26,12 @@ export interface WallGeometryData {
     axisStart?: Vec3;
     /** Wall 軸の終点 (baseY 補正済み)。 */
     axisEnd?: Vec3;
+    /**
+     * footprint の中に存在する穴 (= inner ring) の配列。各 hole は CW で
+     * 表現する。Circle 由来の壁が室内側をくり抜いた annulus フットプリントを
+     * 3D 化するときに使う。未設定なら穴なし。
+     */
+    holes?: Vec3[][];
 }
 
 export class WallGeometryBuilder {
@@ -131,10 +137,19 @@ export class WallGeometryBuilder {
             const footprint: Vec3[] = fp.map<Vec3>((p) =>
                 [p[0], baseY, p[1]] as Vec3,
             );
+            // wall.footprintHoles (= 円形 annulus などの内側ホール) があれば
+            // baseY 補正して 3D に持ち上げる。
+            let holes: Vec3[][] | undefined;
+            if (wall.footprintHoles && wall.footprintHoles.length > 0) {
+                holes = wall.footprintHoles.map((h) =>
+                    h.map<Vec3>((p) => [p[0], baseY, p[1]] as Vec3),
+                );
+            }
             return {
                 footprint,
                 height: wall.height + wall.topOffset,
                 isHexFootprint: true,
+                holes,
             };
         }
 

@@ -1,5 +1,6 @@
 import { Vec2 } from "../../geometry/math/Vec2";
 import { Vec3 } from "../../geometry/math/Vec3";
+import { offsetClosedPolygon } from "../../occt/OcctOffset";
 
 function outwardNormal(p1: Vec2, p2: Vec2, center: Vec2): [number, number] {
     const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
@@ -151,6 +152,40 @@ export function clipPolygonHalfPlane(
         }
     }
     return out;
+}
+
+/**
+ * OCCT BRepOffsetAPI_MakeOffset を使った内/外オフセット (async)。
+ *  - distance > 0: 外側 (CCW 入力)
+ *  - distance < 0: 内側
+ * 戻り値は閉ポリゴン (始点重複なし)。OCCT が失敗した場合は手書きの
+ * `computeMiteredCorners` にフォールバックする。
+ *
+ * 用途: 壁外枠 (`wallOutlineOf` polygon) の生成、内法オフセット計算など。
+ */
+export async function offsetClosedPolygonOCCT(
+    corners: Vec2[], offset: number,
+): Promise<Vec2[]> {
+    if (corners.length < 3 || offset === 0) return corners.slice();
+    // CCW を仮定して signed area を確認、CW なら反転して再度 CCW 化。
+    const isCcw = signedArea(corners) > 0;
+    const ccw = isCcw ? corners : corners.slice().reverse();
+    const result = await offsetClosedPolygon(ccw, offset);
+    if (result && result.length >= 3) return result;
+    // Fallback: 手書きの miter 計算 (全エッジ垂直オフセット → 交点)
+    let cx = 0, cy = 0;
+    for (const v of corners) { cx += v[0]; cy += v[1]; }
+    cx /= corners.length; cy /= corners.length;
+    return computeMiteredCorners(corners, [cx, cy], offset);
+}
+
+function signedArea(p: Vec2[]): number {
+    let a = 0;
+    for (let i = 0; i < p.length; i++) {
+        const j = (i + 1) % p.length;
+        a += p[i][0] * p[j][1] - p[j][0] * p[i][1];
+    }
+    return a / 2;
 }
 
 export function computeMiteredWallAxes(

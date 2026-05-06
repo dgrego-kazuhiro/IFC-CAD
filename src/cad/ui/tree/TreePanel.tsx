@@ -5,8 +5,6 @@ import { Plus } from "lucide-react";
 import { useAppState, AppState } from "../../application/AppState";
 import { buildTree, useTreeStore } from "../../state/tree/TreeStore";
 import TreeNodeComponent from "./TreeNodeComponent";
-import { CreateSpaceCommand } from "../../commands/create/CreateSpaceCommand";
-import { pickNewRoomName } from "../room/roomNaming";
 
 export default function TreePanel() {
     const elements = useAppState((s: AppState) => s.elements);
@@ -16,8 +14,8 @@ export default function TreePanel() {
     const addLevel = useAppState((s: AppState) => s.addLevel);
     const removeLevel = useAppState((s: AppState) => s.removeLevel);
     const setActiveLevel = useAppState((s: AppState) => s.setActiveLevel);
-    const executeCommand = useAppState((s: AppState) => s.executeCommand);
     const setActiveRoom = useAppState((s: AppState) => s.setActiveRoom);
+    const setPendingRoomLevel = useAppState((s: AppState) => s.setPendingRoomLevel);
     const grids = useAppState((s: AppState) => s.grids);
     const setSelectedGridIds = useAppState((s: AppState) => s.setSelectedGridIds);
 
@@ -54,18 +52,13 @@ export default function TreePanel() {
     };
 
     const handleAddRoom = (levelId: string) => {
-        const liveElements = useAppState.getState().elements;
-        const cmd = new CreateSpaceCommand(
-            pickNewRoomName(liveElements),
-            3.0,
-            undefined,
-            levelId,
-        );
-        executeCommand(cmd);
-        const newRoomId = cmd.getElementId();
+        // 部屋モードに入るが、実体の Space は最初の図形 (Rectangle / Polyline /
+        // Circle) を確定するまで作らない。空の "Room1" がツリーに先に出る挙動を
+        // 防ぐための pending 状態。実体生成は RoomSketchOverlay の commit 時。
         setActiveLevel(levelId);
-        setActiveRoom(newRoomId);
-        setSelection([newRoomId]);
+        setActiveRoom(null);
+        setPendingRoomLevel(levelId);
+        setSelection([]);
     };
 
     const handleAddLevel = () => {

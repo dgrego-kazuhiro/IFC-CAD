@@ -89,6 +89,13 @@ async function solveOnce(): Promise<void> {
     const polys = new Map<string, { spaceId: string; poly: RoomPolygon }>();
     const circles = new Map<string, { spaceId: string; poly: RoomPolygon }>();
     const walls = new Map<string, { wall: WallElement }>();
+    /** SketchEntity (Arc / Circle entity) を直接参照する拘束用。
+     *  key = `${spaceId}:${entityId}` */
+    const arcEntities = new Map<string, {
+        spaceId: string; entityId: string;
+        kind: "arc" | "circle";
+        center: [number, number]; radius: number;
+    }>();
     for (const c of constraints) {
         for (const t of c.targets) {
             if (t.kind === "SketchPoint" || t.kind === "SketchEdge" || t.kind === "SketchCircle") {
@@ -101,6 +108,22 @@ async function solveOnce(): Promise<void> {
                     if (!circles.has(key)) circles.set(key, { spaceId: t.spaceId as string, poly });
                 } else if (t.kind !== "SketchCircle") {
                     if (!polys.has(key)) polys.set(key, { spaceId: t.spaceId as string, poly });
+                }
+            } else if (t.kind === "SketchEntity") {
+                const key = `${t.spaceId}:${t.entityId}`;
+                if (arcEntities.has(key)) continue;
+                const space = state.elements[t.spaceId as string] as SpaceElement | undefined;
+                if (!space || space.type !== "Space") continue;
+                const ent = (space.entities ?? []).find((e) => e.id === t.entityId);
+                if (!ent) continue;
+                if (ent.kind === "arc" || ent.kind === "circle") {
+                    arcEntities.set(key, {
+                        spaceId: t.spaceId as string,
+                        entityId: t.entityId,
+                        kind: ent.kind,
+                        center: [ent.center[0], ent.center[1]],
+                        radius: ent.radius,
+                    });
                 }
             } else if (t.kind === "WallAxis" || t.kind === "WallAxisPoint") {
                 const wid = t.wallId as string;
@@ -130,7 +153,7 @@ async function solveOnce(): Promise<void> {
         }
     }
 
-    if (polys.size === 0 && circles.size === 0 && walls.size === 0) return;
+    if (polys.size === 0 && circles.size === 0 && walls.size === 0 && arcEntities.size === 0) return;
 
     // Build reverse index: wall.id → owning polygon (if any).
     // A wall is "owned" when it appears in some RoomPolygon.wallIds. For owned
@@ -338,6 +361,24 @@ async function solveOnce(): Promise<void> {
             circleIds.set(key, { centerPoint: centerId, circle: circleId });
         }
 
+        // ── Push arc / circle entities (= ArcRadius など SketchEntity 直接
+        //    参照拘束用)。circles map とは別系統で、entity 単位で center +
+        //    circle primitive を発行する。 ─────────────────────────────
+        const arcEntityIds = new Map<string, { centerPoint: OID; circle: OID }>();
+        for (const [key, entry] of arcEntities) {
+            const cp = idAlloc.next();
+            primitives.push({
+                type: "point", id: String(cp),
+                x: entry.center[0], y: entry.center[1], fixed: false,
+            });
+            const cId = idAlloc.next();
+            primitives.push({
+                type: "circle", id: String(cId),
+                c_id: String(cp), radius: entry.radius,
+            });
+            arcEntityIds.set(key, { centerPoint: cp, circle: cId });
+        }
+
         // ── Push wall axes as 2 points + 1 line ──
         // Owned walls (polygon.wallIds) use externally mitered coords with
         // fixed:true so the solver cannot break the thickness-offset invariant
@@ -383,7 +424,7 @@ async function solveOnce(): Promise<void> {
         };
         for (const c of constraints) {
             if (isLegacyOutlineLink(c)) continue;
-            const gcsPrimitives = translateConstraint(c, polyIds, circleIds, wallIds, idAlloc, state.grids, state.elements as any);
+            const gcsPrimitives = translateConstraint(c, polyIds, circleIds, wallIds, idAlloc, state.grids, state.elements as any, arcEntityIds);
             for (const p of gcsPrimitives) primitives.push(p);
         }
 
@@ -410,7 +451,7 @@ async function solveOnce(): Promise<void> {
         try {
             // Batch per-space updates so that multiple polygons / circles in the
             // same room don't clobber each other via stale-state overwrites.
-            const CIRCLE_TESS = 128;
+            const CIRCLE_TESS = 256;
             const perSpaceUpdates = new Map<string, Map<string, Partial<RoomPolygon>>>();
             const dirty = (spaceId: string, polyId: string, patch: Partial<RoomPolygon>) => {
                 let bucket = perSpaceUpdates.get(spaceId);
@@ -461,17 +502,178 @@ async function solveOnce(): Promise<void> {
                 });
             }
 
+            // ── Arc / Circle entity の半径・中心 writeback ─────────────
+            // SketchEntity 直接参照拘束 (ArcRadius / ArcDiameter) で更新された
+            // 値を、対応する SpaceElement.entities に書き戻す。
+            //
+            // Arc の場合: 半径を大きくしたら弧も大きく見える挙動を期待される
+            // ので、center / aStart / aEnd は据え置きで radius だけ更新する。
+            // すると chord 端点 (= recompute(aStart) / recompute(aEnd)) は半径
+            // にスケールして移動する。これに合わせて **同じ space 内の隣接
+            // polyline 端点** も新しい chord 端点位置へ移動させて連結を維持
+            // する。Circle は chord が無いので solver の center / radius を
+            // そのまま使う。
+            interface ArcChordUpdate {
+                spaceId: string;
+                oldP0: [number, number];
+                oldP1: [number, number];
+                newP0: [number, number];
+                newP1: [number, number];
+            }
+            const arcChordUpdates: ArcChordUpdate[] = [];
+            const entityPatches = new Map<string, Map<string, Partial<{ center: [number, number]; radius: number; aStart: number; aEnd: number }>>>();
+            for (const [key, entry] of arcEntities) {
+                const ids = arcEntityIds.get(key);
+                if (!ids) continue;
+                const cp = wrapper.sketch_index.get_primitive_or_fail(String(ids.centerPoint)) as any;
+                const circle = wrapper.sketch_index.get_primitive_or_fail(String(ids.circle)) as any;
+                const cx = cp.x as number, cy = cp.y as number, r = circle.radius as number;
+                const dCenter = Math.hypot(cx - entry.center[0], cy - entry.center[1]);
+                const dRadius = Math.abs(r - entry.radius);
+                if (dCenter < 1e-6 && dRadius < 1e-6) continue;
+
+                let patch: Partial<{ center: [number, number]; radius: number; aStart: number; aEnd: number }>;
+                if (entry.kind === "arc") {
+                    const sp = state.elements[entry.spaceId] as SpaceElement | undefined;
+                    const ent = sp?.entities?.find((e) => e.id === entry.entityId);
+                    if (!ent || ent.kind !== "arc") continue;
+                    const oldCx = entry.center[0], oldCy = entry.center[1];
+                    const oldR = entry.radius;
+                    const aS = ent.aStart, aE = ent.aEnd;
+                    // OLD chord 端点 (= 既存 polyline 端点位置)。
+                    const oldP0: [number, number] = [
+                        oldCx + oldR * Math.cos(aS),
+                        oldCy + oldR * Math.sin(aS),
+                    ];
+                    const oldP1: [number, number] = [
+                        oldCx + oldR * Math.cos(aE),
+                        oldCy + oldR * Math.sin(aE),
+                    ];
+                    // center は据え置き、radius だけ NEW へ。
+                    // NEW chord 端点 (= 新しい弧の端点位置)。
+                    const newP0: [number, number] = [
+                        oldCx + r * Math.cos(aS),
+                        oldCy + r * Math.sin(aS),
+                    ];
+                    const newP1: [number, number] = [
+                        oldCx + r * Math.cos(aE),
+                        oldCy + r * Math.sin(aE),
+                    ];
+                    patch = { radius: r };
+                    arcChordUpdates.push({
+                        spaceId: entry.spaceId,
+                        oldP0, oldP1, newP0, newP1,
+                    });
+                } else {
+                    patch = { center: [cx, cy], radius: r };
+                }
+                let bucket = entityPatches.get(entry.spaceId);
+                if (!bucket) { bucket = new Map(); entityPatches.set(entry.spaceId, bucket); }
+                bucket.set(entry.entityId, patch);
+            }
+
+            // arc 端点と一致する polyline / line 端点を NEW 位置へ追従させる。
+            // CHAIN_ENDPOINT_EPS と同じ許容で一致判定。
+            const SNAP_EPS = 1e-3;
+            const movePoint = (p: [number, number], oldA: [number, number], newA: [number, number],
+                               oldB: [number, number], newB: [number, number]): [number, number] | null => {
+                if (Math.hypot(p[0] - oldA[0], p[1] - oldA[1]) < SNAP_EPS) return [newA[0], newA[1]];
+                if (Math.hypot(p[0] - oldB[0], p[1] - oldB[1]) < SNAP_EPS) return [newB[0], newB[1]];
+                return null;
+            };
+
+            for (const [spaceId, patches] of entityPatches) {
+                useAppState.getState().setSpaceEntities(spaceId, (entities) => {
+                    return entities.map((e) => {
+                        const p = patches.get(e.id);
+                        let updated: any = e;
+                        if (p) {
+                            if (e.kind === "arc") {
+                                updated = {
+                                    ...e,
+                                    ...(p.center !== undefined ? { center: p.center } : {}),
+                                    ...(p.radius !== undefined ? { radius: p.radius } : {}),
+                                    ...(p.aStart !== undefined ? { aStart: p.aStart } : {}),
+                                    ...(p.aEnd !== undefined ? { aEnd: p.aEnd } : {}),
+                                };
+                            } else if (e.kind === "circle") {
+                                updated = {
+                                    ...e,
+                                    ...(p.center !== undefined ? { center: p.center } : {}),
+                                    ...(p.radius !== undefined ? { radius: p.radius } : {}),
+                                };
+                            }
+                        }
+                        // 隣接 polyline / line 端点を arc の新しい chord 位置に追従。
+                        const updatesForSpace = arcChordUpdates.filter((u) => u.spaceId === spaceId);
+                        for (const u of updatesForSpace) {
+                            if (updated.kind === "polyline") {
+                                let newPoints = updated.points;
+                                let dirty = false;
+                                const remap = (pt: [number, number]) =>
+                                    movePoint(pt as any, u.oldP0, u.newP0, u.oldP1, u.newP1);
+                                // 開ポリラインなら端点 (first / last) のみ、閉
+                                // ポリラインなら全頂点を対象に snap 判定。
+                                if (!updated.closed) {
+                                    const first = remap(newPoints[0]);
+                                    const last = remap(newPoints[newPoints.length - 1]);
+                                    if (first || last) {
+                                        newPoints = newPoints.slice();
+                                        if (first) { newPoints[0] = first; dirty = true; }
+                                        if (last)  { newPoints[newPoints.length - 1] = last; dirty = true; }
+                                    }
+                                } else {
+                                    const next = newPoints.map((pt: [number, number]) => {
+                                        const m = remap(pt);
+                                        if (m) { dirty = true; return m; }
+                                        return pt;
+                                    });
+                                    if (dirty) newPoints = next;
+                                }
+                                if (dirty) updated = { ...updated, points: newPoints };
+                            } else if (updated.kind === "line") {
+                                const np0 = movePoint(updated.p0, u.oldP0, u.newP0, u.oldP1, u.newP1);
+                                const np1 = movePoint(updated.p1, u.oldP0, u.newP0, u.oldP1, u.newP1);
+                                if (np0 || np1) {
+                                    updated = {
+                                        ...updated,
+                                        ...(np0 ? { p0: np0 } : {}),
+                                        ...(np1 ? { p1: np1 } : {}),
+                                    };
+                                }
+                            }
+                        }
+                        return updated;
+                    });
+                });
+            }
+
             // Apply batched updates — re-read space each time so we see prior
             // updates from this same batch. Each polygon that owns walls gets
             // its wall axes re-synced from the post-solve outer ring, so the
             // solver moving the inner ring (e.g. via PointOnGrid snapping)
             // cannot strand walls at stale offsets. Works for any vertex count.
+            //
+            // NOTE: 全壁生成 (regenerateAllWalls) はソルバ実行中にも非同期で
+            // ポリゴンの outer を分割 (頂点を増やす) ことがある。ソルバの解は
+            // 解開始時点の頂点数前提なので、長さが変わった polygon については
+            // 解のみを書き戻すと wallIds 等と長さがズレて壊れる。安全側で
+            // 長さ不一致のときは patch を捨て、最新ポリゴンをそのまま残す。
             for (const [spaceId, bucket] of perSpaceUpdates) {
                 const latest = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
                 if (!latest) continue;
                 let newPolys = latest.polygons.map((p) => {
                     const patch = bucket.get(p.id);
-                    return patch ? { ...p, ...patch } : p;
+                    if (!patch) return p;
+                    if (patch.outer && patch.outer.length !== p.outer.length) {
+                        // eslint-disable-next-line no-console
+                        console.warn(
+                            `[SketchSolver] outer length mismatch on poly ${p.id.slice(0, 6)} ` +
+                            `(solved=${patch.outer.length}, current=${p.outer.length}); skipping writeback`,
+                        );
+                        return p;
+                    }
+                    return { ...p, ...patch };
                 });
                 // Re-derive outline polygons from their (now-updated) inner
                 // so the outer outline tracks solver-driven inner motion.
@@ -554,6 +756,7 @@ function translateConstraint(
     idAlloc: IdAllocator,
     grids: GridLine[],
     elements: Record<string, any>,
+    arcEntityIds?: Map<string, { centerPoint: OID; circle: OID }>,
 ): any[] {
     const out: any[] = [];
 
@@ -570,6 +773,11 @@ function translateConstraint(
             return t.endIdx === 0 ? ids.p1 : ids.p2;
         }
         return null;
+    };
+    /** SketchEntity (Arc / Circle entity 直接参照) → solver circle ids。 */
+    const entityCircleFor = (t: ConstraintTarget): { centerPoint: OID; circle: OID } | null => {
+        if (t.kind !== "SketchEntity") return null;
+        return arcEntityIds?.get(`${t.spaceId}:${t.entityId}`) ?? null;
     };
     // SketchEdge and WallAxis both collapse to the same (line, p1, p2) bundle
     // since wall axes are pushed as a 2-vertex line primitive in solveOnce.
@@ -777,6 +985,33 @@ function translateConstraint(
             const ct = c.targets.find((t) => t.kind === "SketchCircle");
             if (!ct || ct.kind !== "SketchCircle" || c.value === undefined) return out;
             const ids = circleIdFor(ct);
+            if (!ids) return out;
+            out.push({
+                type: "circle_diameter",
+                id: String(idAlloc.next()),
+                c_id: String(ids.circle),
+                diameter: c.value,
+            });
+            break;
+        }
+        case "ArcRadius": {
+            // SketchEntity を直接ターゲットとする半径拘束 (= Arc / Circle entity)。
+            const ct = c.targets.find((t) => t.kind === "SketchEntity");
+            if (!ct || ct.kind !== "SketchEntity" || c.value === undefined) return out;
+            const ids = entityCircleFor(ct);
+            if (!ids) return out;
+            out.push({
+                type: "circle_radius",
+                id: String(idAlloc.next()),
+                c_id: String(ids.circle),
+                radius: c.value,
+            });
+            break;
+        }
+        case "ArcDiameter": {
+            const ct = c.targets.find((t) => t.kind === "SketchEntity");
+            if (!ct || ct.kind !== "SketchEntity" || c.value === undefined) return out;
+            const ids = entityCircleFor(ct);
             if (!ids) return out;
             out.push({
                 type: "circle_diameter",

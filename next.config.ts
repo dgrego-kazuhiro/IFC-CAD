@@ -33,6 +33,19 @@ const nextConfig: NextConfig = {
                     url: false,
                 },
             },
+            // opencascade.js v1.x の `.wasm` (Emscripten 出力) を asset/resource
+            // として吐き出す。webpack 5 の自動 asyncWebAssembly では中身を
+            // 静的解析しようとして失敗するため、ここでは生バイナリ扱いにする。
+            rules: [
+                ...(config.module?.rules ?? []),
+                {
+                    test: /opencascade\.wasm\.wasm$/,
+                    type: "asset/resource",
+                    generator: {
+                        filename: "static/wasm/[name][ext]",
+                    },
+                },
+            ],
         };
         config.experiments = {
             ...config.experiments,

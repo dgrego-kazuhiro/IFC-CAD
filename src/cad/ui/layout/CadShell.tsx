@@ -11,8 +11,6 @@ import GridPropertyPanel from "../grid/GridPropertyPanel";
 import { useAppState, AppState } from "../../application/AppState";
 import { SpaceElement } from "../../model/elements/SpaceElement";
 import { RemoveConstraintCommand } from "../../commands/create/AddConstraintCommand";
-import { CreateSpaceCommand } from "../../commands/create/CreateSpaceCommand";
-import { pickNewRoomName } from "../room/roomNaming";
 import { saveScene, loadScene, clearScene, hasSavedScene } from "../../application/Persistence";
 import { downloadIfc } from "../../io/ifc/IfcExporter";
 
@@ -22,7 +20,9 @@ export default function CadShell() {
     const elements = useAppState((state: AppState) => state.elements);
     const activeLevelId = useAppState((state: AppState) => state.activeLevelId);
     const activeRoomId = useAppState((state: AppState) => state.activeRoomId);
+    const pendingRoomLevelId = useAppState((state: AppState) => state.pendingRoomLevelId);
     const setActiveRoom = useAppState((state: AppState) => state.setActiveRoom);
+    const setPendingRoomLevel = useAppState((state: AppState) => state.setPendingRoomLevel);
     const selectedGridIds = useAppState((state: AppState) => state.selectedGridIds);
     const selection = useAppState((state: AppState) => state.selection);
     const removeElement = useAppState((state: AppState) => state.removeElement);
@@ -46,6 +46,10 @@ export default function CadShell() {
                     setSelectedConstraintId(null);
                 } else if (activeRoomId) {
                     setActiveRoom(null);
+                } else if (pendingRoomLevelId) {
+                    // 図形を一つも描かずに部屋モードを抜けるケース。
+                    // pending 状態を解除するだけでよい。
+                    setPendingRoomLevel(null);
                 } else {
                     setActiveTool("select");
                 }
@@ -88,19 +92,20 @@ export default function CadShell() {
     }, [
         setActiveTool, activeRoomId, setActiveRoom, selection, removeElement,
         setSelection, selectedConstraintId, setSelectedConstraintId, executeCommand,
+        pendingRoomLevelId, setPendingRoomLevel,
     ]);
 
     const handleAddRoom = () => {
         if (!activeLevelId) return;
-        // Read elements from the live store so two rapid clicks don't both
-        // see the pre-add snapshot and end up generating the same name.
-        const liveElements = useAppState.getState().elements;
-        const cmd = new CreateSpaceCommand(pickNewRoomName(liveElements), 3.0, undefined, activeLevelId);
-        executeCommand(cmd);
-        const newRoomId = cmd.getElementId();
-        setActiveRoom(newRoomId);
-        setSelection([newRoomId]);
+        // 部屋モードに入るが、Space 実体は最初の図形確定まで作らない。
+        // ツリーに空 Room1 が先行表示される問題を防ぐ。
+        setActiveRoom(null);
+        setPendingRoomLevel(activeLevelId);
+        setSelection([]);
     };
+
+    // 部屋モード判定 (実体ある Room を編集中、または最初の図形を待っている pending)。
+    const inRoomMode = !!activeRoomId || !!pendingRoomLevelId;
 
     return (
         <div className="w-full h-full flex flex-col bg-zinc-900 text-zinc-100 font-sans">
@@ -170,13 +175,18 @@ export default function CadShell() {
                         title={!activeLevelId ? "Select a level first" : "梁作成ツール (2点指定)"}
                     >Beam</button>
                     <button
-                        className={`px-3 py-1 rounded border ${!!activeRoomId ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                        className={`px-3 py-1 rounded border ${inRoomMode ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
                         onClick={() => {
                             if (!activeLevelId) return;
-                            if (activeRoomId) setActiveRoom(null);
-                            else handleAddRoom();
+                            if (activeRoomId) {
+                                setActiveRoom(null);
+                            } else if (pendingRoomLevelId) {
+                                setPendingRoomLevel(null);
+                            } else {
+                                handleAddRoom();
+                            }
                         }}
-                        title={!activeLevelId ? "Select a level first" : "部屋作成ツール (新規 Space を作成して編集モードへ)"}
+                        title={!activeLevelId ? "Select a level first" : "部屋作成ツール (図形を描いた時点で新規 Space を生成)"}
                     >Room</button>
                     <button
                         className={`px-3 py-1 rounded border ${activeTool === "slab" ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}

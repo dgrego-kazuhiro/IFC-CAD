@@ -392,6 +392,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
     const activeLevelId = useAppState((state: AppState) => state.activeLevelId);
     const levels = useAppState((state: AppState) => state.levels);
     const activeRoomId = useAppState((state: AppState) => state.activeRoomId);
+    const pendingRoomLevelId = useAppState((state: AppState) => state.pendingRoomLevelId);
     const grids = useAppState((state: AppState) => state.grids);
     const designMode = useAppState((state: AppState) => state.designMode);
     const gridlineDrafting = useAppState((state: AppState) => state.gridlineDrafting);
@@ -580,7 +581,8 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         activeTool === "slab" ||
         activeTool === "beam" ||
         activeTool === "column" ||
-        activeRoomId !== null;
+        activeRoomId !== null ||
+        pendingRoomLevelId !== null;
 
     // Entering wall "select" sub-mode aborts any in-flight wall drawing —
     // the user has signalled they want to pick, not place.
@@ -761,7 +763,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             scene.removeObject(o.id);
         }
 
-        const inRoomMode = activeRoomId !== null;
+        const inRoomMode = activeRoomId !== null || pendingRoomLevelId !== null;
 
         // Collect all walls for join resolution
         const allWalls: WallElement[] = [];
@@ -1890,7 +1892,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 }
             }
         }
-    }, [elements, selection, activeTool, wallStart, wallEnd, wallSnap, activeRoomId, grids, gridStart, gridHover, gridlineDrafting, gridDraftMode, gridDraftPoints, useOrtho, orthoZoom, selectedGridIds, gridSnap, gridAxisSnap, openingHover, slabSelectedSpaces, slabSketching, slabSketchPoints, slabSketchHover, beamStart, beamHover, beamSnap, beamWidthInput, beamDepthInput, beamTopOffsetInput, beamZJust, levels, columnHover, columnSnap, columnProfileKind, columnWidthInput, columnDepthInput, columnRadiusInput, columnRotationInput, columnBaseLevelId, columnTopLevelId, columnBaseOffsetInput, columnTopOffsetInput, sketchSelection, wallSubMode]);
+    }, [elements, selection, activeTool, wallStart, wallEnd, wallSnap, activeRoomId, pendingRoomLevelId, grids, gridStart, gridHover, gridlineDrafting, gridDraftMode, gridDraftPoints, useOrtho, orthoZoom, selectedGridIds, gridSnap, gridAxisSnap, openingHover, slabSelectedSpaces, slabSketching, slabSketchPoints, slabSketchHover, beamStart, beamHover, beamSnap, beamWidthInput, beamDepthInput, beamTopOffsetInput, beamZJust, levels, columnHover, columnSnap, columnProfileKind, columnWidthInput, columnDepthInput, columnRadiusInput, columnRotationInput, columnBaseLevelId, columnTopLevelId, columnBaseOffsetInput, columnTopOffsetInput, sketchSelection, wallSubMode]);
 
     // Pick the nearest sketch item (polygon vertex/edge) to a world-space
     // ground point. Shared by select + wall modes. Priority: vertex > edge.
@@ -2011,8 +2013,9 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         // In room mode, SVG overlay handles all interaction — except when
         // the wall tool is active: the overlay re-dispatches empty-area
         // clicks here so the user can draw walls while still picking room
-        // geometry for constraints.
-        if (activeRoomId && activeTool !== "wall") return;
+        // geometry for constraints. pending (Space 未生成) でも overlay 側で
+        // 図形ドラフトを処理させたいので同様に early return。
+        if ((activeRoomId || pendingRoomLevelId) && activeTool !== "wall") return;
 
         if (activeTool === "select") {
             const pt = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
@@ -2078,6 +2081,17 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
 
             if (closestId) {
                 setSelection([closestId]);
+                // 選択した element の ID と種別をコンソール出力 (= デバッグ確認用)。
+                const sel = elements[closestId];
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[select] id=${closestId} type=${sel?.type ?? "?"}` +
+                    (sel?.type === "Wall"
+                        ? ` axis=(${(sel as WallElement).axis[0][0].toFixed(2)},${(sel as WallElement).axis[0][2].toFixed(2)})→` +
+                          `(${(sel as WallElement).axis[1][0].toFixed(2)},${(sel as WallElement).axis[1][2].toFixed(2)})` +
+                          ` cat=${(sel as WallElement).wallCategory ?? "-"}`
+                        : ""),
+                );
                 // Clear sketch selection when picking an element to avoid
                 // stale sketch highlights from previous clicks.
                 if (sketchSelection.length > 0) clearSketchSelection();
@@ -2612,7 +2626,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 Navigation: Orbit (LMB), Pan (RMB/MMB), Zoom (Scroll)
                 {activeTool === "wall" && " | Wall mode: Click to place points. Right-click to cancel/finish."}
                 {wallStart && " | Placing wall..."}
-                {activeRoomId && " | Room edit mode (Esc to exit)"}
+                {(activeRoomId || pendingRoomLevelId) && " | Room edit mode (Esc to exit)"}
                 {activeTool === "column" && " | 柱作成(2D): クリックで配置 / 通芯交点・既存柱にスナップ (Esc で終了)"}
                 {activeTool === "beam" && !beamStart && " | 梁作成(2D): 始点をクリック / 柱中心・通芯にスナップ"}
                 {activeTool === "beam" && beamStart && " | 梁作成: 2点目をクリック / 右クリックでキャンセル / 連続配置中"}

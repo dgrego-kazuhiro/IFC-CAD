@@ -1,5 +1,7 @@
 import { useAppState } from "./AppState";
 import { DEFAULT_GRID_NAMING } from "../model/grid/GridLine";
+import { generateId } from "../utils/ids";
+import { entitiesFromLegacyPolygons } from "../model/sketch/PolygonDerive";
 
 const STORAGE_KEY = "ifc-cad.scene.v1";
 const SCHEMA_VERSION = 1;
@@ -79,8 +81,17 @@ export function loadScene(): boolean {
     const restored: Record<string, any> = {};
     for (const id in data.elements) {
         const el = data.elements[id];
+        let migrated = { ...el };
+        // Legacy data has no `entities` on Space — synthesize from polygons.
+        if (el?.type === "Space" && !Array.isArray(el.entities)) {
+            const { entities, polyIdByEntity } = entitiesFromLegacyPolygons(
+                Array.isArray(el.polygons) ? el.polygons : [],
+                generateId,
+            );
+            migrated = { ...migrated, entities, polyIdByEntity };
+        }
         restored[id] = {
-            ...el,
+            ...migrated,
             shape: null,
             dirtyFlags: new Set(["Geometry", "Mesh", "Render"]),
         };
@@ -94,6 +105,7 @@ export function loadScene(): boolean {
         gridNaming: data.gridNaming ?? DEFAULT_GRID_NAMING,
         constraints: data.constraints ?? {},
         activeRoomId: null,
+        pendingRoomLevelId: null,
         roomEditMode: "select",
         gridlineDrafting: false,
         selectedGridIds: [],
@@ -118,6 +130,7 @@ export function clearScene(): void {
         gridNaming: DEFAULT_GRID_NAMING,
         constraints: {},
         activeRoomId: null,
+        pendingRoomLevelId: null,
         activeLevelId: null,
         roomEditMode: "select",
         gridlineDrafting: false,

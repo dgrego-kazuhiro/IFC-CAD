@@ -18,6 +18,7 @@ import { WallElement } from "../model/elements/WallElement";
 import { BeamElement } from "../model/elements/BeamElement";
 import { ColumnElement } from "../model/elements/ColumnElement";
 import { SpaceElement, polygonEdges } from "../model/elements/SpaceElement";
+import { entityCenter, entityEndpoints, pickEntity } from "../model/sketch/SketchEntity";
 
 export type SnapKind =
     | "Column"
@@ -219,6 +220,85 @@ export function unifiedSnap(
             }
         }
         if (best) return { point: best.point, kind: "RoomEdge" };
+    }
+
+    // 5.5 Entity vertex / curve snap (covers Line / Arc / open Polyline that
+    //     don't appear in `polygons`). Closed polyline / Circle entities
+    //     already snap via pass 4/5 because their derived polygon contains
+    //     the same vertices.
+    if (!options.skipRoomPolygons) {
+        let bestVtx: { dist: number; point: Vec3 } | null = null;
+        let bestEdge: { dist: number; point: Vec3 } | null = null;
+        for (const id in elements) {
+            const el = elements[id];
+            if (!el || el.type !== "Space") continue;
+            for (const ent of (el as SpaceElement).entities ?? []) {
+                // Endpoints
+                const ends = entityEndpoints(ent);
+                for (const p of ends) {
+                    const d = Math.hypot(cursor[0] - p[0], cursor[2] - p[1]);
+                    if (d <= tolerance && (!bestVtx || d < bestVtx.dist)) {
+                        bestVtx = { dist: d, point: [p[0], cursor[1], p[1]] };
+                    }
+                }
+                // Center (circle / arc)
+                const c = entityCenter(ent);
+                if (c) {
+                    const d = Math.hypot(cursor[0] - c[0], cursor[2] - c[1]);
+                    if (d <= tolerance && (!bestVtx || d < bestVtx.dist)) {
+                        bestVtx = { dist: d, point: [c[0], cursor[1], c[1]] };
+                    }
+                }
+                // On-curve projection (skip line/closed polyline since they
+                // overlap with polygon edge pass; still useful for arc).
+                if (ent.kind === "arc" || ent.kind === "circle"
+                    || (ent.kind === "polyline" && !ent.closed)
+                    || ent.kind === "line"
+                ) {
+                    const hit = pickEntity(ent, [cursor[0], cursor[2]], tolerance);
+                    if (hit && (!bestEdge || hit.distance < bestEdge.dist)) {
+                        // Compute world-space contact point for the snap.
+                        // For arcs/circles: project cursor onto the curve.
+                        if (ent.kind === "circle" || ent.kind === "arc") {
+                            const dx = cursor[0] - ent.center[0];
+                            const dy = cursor[2] - ent.center[1];
+                            const r = ent.radius;
+                            const len = Math.hypot(dx, dy) || 1;
+                            const px = ent.center[0] + (dx / len) * r;
+                            const py = ent.center[1] + (dy / len) * r;
+                            bestEdge = { dist: hit.distance, point: [px, cursor[1], py] };
+                        } else {
+                            // line / open polyline: nearest point on the segments
+                            const segs = ent.kind === "line"
+                                ? [[ent.p0, ent.p1]] as [number, number][][]
+                                : (() => {
+                                    const out: [number, number][][] = [];
+                                    for (let i = 0; i < ent.points.length - 1; i++) {
+                                        out.push([ent.points[i] as [number, number], ent.points[i + 1] as [number, number]]);
+                                    }
+                                    return out;
+                                })();
+                            for (const [a, b] of segs) {
+                                const dx = b[0] - a[0];
+                                const dy = b[1] - a[1];
+                                const len2 = dx * dx + dy * dy;
+                                if (len2 < 1e-12) continue;
+                                let t = ((cursor[0] - a[0]) * dx + (cursor[2] - a[1]) * dy) / len2;
+                                t = Math.max(0, Math.min(1, t));
+                                const px = a[0] + t * dx;
+                                const py = a[1] + t * dy;
+                                const d = Math.hypot(cursor[0] - px, cursor[2] - py);
+                                if (d <= tolerance && (!bestEdge || d < bestEdge.dist)) {
+                                    bestEdge = { dist: d, point: [px, cursor[1], py] };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (bestVtx) return { point: bestVtx.point, kind: "RoomVertex" };
+        if (bestEdge) return { point: bestEdge.point, kind: "RoomEdge" };
     }
 
     // 6. Grid intersection via BVH (O(1)), falls back to snapToGrids below.

@@ -52,6 +52,12 @@ export interface WallElement extends BaseElement {
      */
     footprint?: Vec2[];
     /**
+     * footprint の中に存在する穴 (= inner ring) の配列。各 hole は CW で
+     * 表現する (= 外周 CCW に対する hole 規約)。Circle 由来の壁が室内側を
+     * くり抜いた annulus フットプリントを取るときに使う。未設定なら穴なし。
+     */
+    footprintHoles?: Vec2[][];
+    /**
      * 共線重なり区間で生成された仮想エッジ由来の壁かどうか。
      * 同一 axis に複数のポリゴン由来仮想エッジが乗っている場合 true。
      * 表示・選択・IFC 出力での区別に利用。

@@ -264,13 +264,33 @@ function classifyOverlap(a: RawEdge, b: RawEdge): OverlapInfo | null {
     const bdx = b.e[0] - b.s[0], bdy = b.e[1] - b.s[1];
     const bLen = Math.hypot(bdx, bdy);
     if (bLen < 1e-9) return null;
+    const aTag = `${a.polyId.slice(0, 6)}#${a.edgeIdx}`;
+    const bTag = `${b.polyId.slice(0, 6)}#${b.edgeIdx}`;
     // 平行性チェック
     const cross = adx * bdy - ady * bdx;
-    if (Math.abs(cross / (aLen * bLen)) > Math.sin(2 * Math.PI / 180)) return null;
+    const sinTh = Math.abs(cross / (aLen * bLen));
+    if (sinTh > Math.sin(2 * Math.PI / 180)) {
+        if (JUNCTION_GRAPH_DEBUG) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[overlap] ${aTag} vs ${bTag} REJECT parallel sin=${sinTh.toFixed(4)}`,
+            );
+        }
+        return null;
+    }
     // 垂直距離チェック
     const d1 = Math.abs((b.s[0] - a.s[0]) * nx + (b.s[1] - a.s[1]) * ny);
     const d2 = Math.abs((b.e[0] - a.s[0]) * nx + (b.e[1] - a.s[1]) * ny);
-    if (d1 > COLLINEAR_PERP_TOL || d2 > COLLINEAR_PERP_TOL) return null;
+    if (d1 > COLLINEAR_PERP_TOL || d2 > COLLINEAR_PERP_TOL) {
+        if (JUNCTION_GRAPH_DEBUG) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[overlap] ${aTag} vs ${bTag} REJECT perp d1=${d1.toFixed(4)} d2=${d2.toFixed(4)} ` +
+                `tol=${COLLINEAR_PERP_TOL.toFixed(4)}`,
+            );
+        }
+        return null;
+    }
     // a の axis 上での b の両端のパラメータ
     const t1 = ((b.s[0] - a.s[0]) * ux + (b.s[1] - a.s[1]) * uy) / aLen;
     const t2 = ((b.e[0] - a.s[0]) * ux + (b.e[1] - a.s[1]) * uy) / aLen;
@@ -278,7 +298,24 @@ function classifyOverlap(a: RawEdge, b: RawEdge): OverlapInfo | null {
     const bMax = Math.max(t1, t2);
     const oMin = Math.max(0, bMin);
     const oMax = Math.min(1, bMax);
-    if (oMax - oMin < VERTEX_TOL_M / aLen) return null;
+    if (oMax - oMin < VERTEX_TOL_M / aLen) {
+        if (JUNCTION_GRAPH_DEBUG) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[overlap] ${aTag} vs ${bTag} REJECT range b=[${bMin.toFixed(3)},${bMax.toFixed(3)}] ` +
+                `clipped=[${oMin.toFixed(3)},${oMax.toFixed(3)}] needLen≥${(VERTEX_TOL_M / aLen).toFixed(4)}`,
+            );
+        }
+        return null;
+    }
+    if (JUNCTION_GRAPH_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.log(
+            `[overlap] ${aTag} vs ${bTag} OK aRange=[${oMin.toFixed(3)},${oMax.toFixed(3)}] ` +
+            `start=${fmt([a.s[0] + adx * oMin, a.s[1] + ady * oMin])} ` +
+            `end=${fmt([a.s[0] + adx * oMax, a.s[1] + ady * oMax])}`,
+        );
+    }
     return {
         aStart: oMin,
         aEnd: oMax,
@@ -365,10 +402,19 @@ function detectOverlapsAndSplits(
                 const jStart = ensureJunction(startPos);
                 const jEnd = ensureJunction(endPos);
                 const list = splits.get(key)!;
-                // 既存 t 列に s0, s1 を挿入 (重複は捨てる)
+                // 既存 t 列に s0, s1 を挿入 (重複は捨てる)。
+                // 許容誤差は VERTEX_TOL_M (= 5mm) を re axis 長で正規化した
+                // 値。これより 1e-6 (= ~1μm) は厳しすぎて、共線重なり計算で
+                // 出る FP 誤差 (10^-7 オーダー) を端点重複と判定できず、t≈0
+                // / t≈1 付近に「ほぼ同じ位置」のスプリットを 2 重に積んで
+                // しまうケースがあった (= len=0 の degenerate VE が誕生)。
+                const reLen = Math.sqrt(lenSq);
+                const T_MERGE_TOL = reLen > 1e-9
+                    ? Math.max(1e-6, VERTEX_TOL_M / reLen)
+                    : 1e-6;
                 const tryInsert = (t: number, jid: string) => {
-                    if (t <= 1e-6 || t >= 1 - 1e-6) return;
-                    for (const e of list) if (Math.abs(e.t - t) < 1e-6) return;
+                    if (t <= T_MERGE_TOL || t >= 1 - T_MERGE_TOL) return;
+                    for (const e of list) if (Math.abs(e.t - t) < T_MERGE_TOL) return;
                     list.push({ t, junctionId: jid });
                 };
                 tryInsert(s0, jStart);
@@ -381,11 +427,61 @@ function detectOverlapsAndSplits(
         }
     }
 
+    // ── 明示的 T 字接合 (= polygon.joints): スナップ確定の接合情報を最優先で
+    //    splits Map に注入する。これがあれば後段の幾何検出 (5mm 距離判定) で
+    //    取りこぼしたケース (FP 誤差・斜め) でも確実に T 字 split が入る。
+    //
+    //    joints[i].vertexIdx の頂点が、target の polyEdge 内部にスナップして
+    //    いれば、ターゲット edge の splits に該当 t での split を挿入する。
+    //    polyVertex (= 角同士スナップ) は clusterVertices で既に同一 junction
+    //    に集約されているため、ここでは何もしなくて良い。
+    {
+        // edgeKey → rawEdge のルックアップ (geometric も使うので作っておく)。
+        const rawByKey = new Map<string, RawEdge>();
+        for (const re of rawEdges) rawByKey.set(`${re.polyId}:${re.edgeIdx}`, re);
+
+        for (const sourcePoly of polygons) {
+            const joints = sourcePoly.joints ?? [];
+            if (joints.length === 0) continue;
+            for (const j of joints) {
+                if (j.target.kind !== "polyEdge") continue;
+                const targetKey = `${j.target.polyId}:${j.target.targetEdgeIdx}`;
+                const targetEdge = rawByKey.get(targetKey);
+                if (!targetEdge) continue;
+                const targetList = splits.get(targetKey);
+                if (!targetList) continue;
+                const adx = targetEdge.e[0] - targetEdge.s[0];
+                const ady = targetEdge.e[1] - targetEdge.s[1];
+                const aLenSq = adx * adx + ady * ady;
+                const aLen = Math.sqrt(aLenSq);
+                if (aLen < 1e-9) continue;
+                // joint.target.t は edge の (start→end) 上での 0..1 比率。
+                // 端点付近 (5mm 換算) は端点 junction で吸収されるのでスキップ。
+                const tEpsilon = VERTEX_TOL_M / aLen;
+                let t = j.target.t;
+                if (t < tEpsilon || t > 1 - tEpsilon) continue;
+                // スナップ元の頂点クラスタ junction id を引く。
+                const sourceJid = vertexToJunctionId.get(
+                    `${sourcePoly.id}:${j.vertexIdx}`,
+                );
+                if (!sourceJid) continue;
+                // 重複チェック (= 既に近い t が入っていればスキップ)。
+                const tEps = 1e-6;
+                let dup = false;
+                for (const e of targetList) {
+                    if (Math.abs(e.t - t) < tEps) { dup = true; break; }
+                }
+                if (!dup) targetList.push({ t, junctionId: sourceJid });
+            }
+        }
+    }
+
     // T 字接合の検出: 別ポリゴンの頂点が a の内部 (端点でない 5mm 内) に
     // 乗っているなら、その頂点クラスタの junction id を a の split に挿入。
     // これにより perpendicular な 2 本の壁が T 字に出会うケースで、長い方が
     // junction で分割され、3-incident junction として resolveJunctions の
     // chain-pair / Clipper diff 経路で正しく解決される。
+    // (上の joints による明示注入のフォールバック; 重複は exists チェックで弾かれる)
     for (const a of rawEdges) {
         const aKey = `${a.polyId}:${a.edgeIdx}`;
         const aList = splits.get(aKey)!;
@@ -420,6 +516,36 @@ function detectOverlapsAndSplits(
     for (const list of splits.values()) {
         list.sort((a, b) => a.t - b.t);
     }
+
+    if (JUNCTION_GRAPH_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.group(`[detectOverlapsAndSplits] splits dump (${splits.size} edges)`);
+        // edgeKey でソートして出力 (見やすさのため polyId 単位にまとまる)。
+        const keys = [...splits.keys()].sort();
+        const reByKey = new Map<string, RawEdge>();
+        for (const re of rawEdges) reByKey.set(`${re.polyId}:${re.edgeIdx}`, re);
+        for (const key of keys) {
+            const list = splits.get(key)!;
+            const re = reByKey.get(key);
+            const range = sharedRanges.get(key);
+            const isShared = sharedEdgeKeys.has(key);
+            const tagged = list.map((e) =>
+                `t=${e.t.toFixed(3)}${e.junctionId ? `→${e.junctionId}` : ""}`,
+            ).join(", ");
+            const edgeStr = re ? `${fmt(re.s)}→${fmt(re.e)}` : "(?)";
+            const rangeStr = range
+                ? ` shared=[${range.map(([a, b]) => `${a.toFixed(3)}–${b.toFixed(3)}`).join(",")}]`
+                : "";
+            // eslint-disable-next-line no-console
+            console.log(
+                `${key.slice(0, 12)}${isShared ? " *SHARED*" : ""} ${edgeStr} ` +
+                `splits=[${tagged}]${rangeStr}`,
+            );
+        }
+        // eslint-disable-next-line no-console
+        console.groupEnd();
+    }
+
     return { splits, sharedEdgeKeys, sharedRanges };
 }
 
@@ -430,6 +556,7 @@ export function buildJunctionGraph(polygons: RoomPolygon[]): JunctionGraph {
     if (JUNCTION_GRAPH_DEBUG) {
         // eslint-disable-next-line no-console
         console.group(`[jgraph] build polygons=${polygons.length}`);
+        console.log("polygons", polygons)
     }
 
     // 1. 全 raw edge 列挙。`poly.edges` が明示されていればそれを尊重し
@@ -464,6 +591,13 @@ export function buildJunctionGraph(polygons: RoomPolygon[]): JunctionGraph {
         polygons,
     );
 
+        if (JUNCTION_GRAPH_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.log(`splits=${splits}`);
+        console.log("sharedRanges", sharedRanges)
+    }
+
+
     // 4. 仮想エッジ生成
     const virtualEdges = new Map<string, VirtualEdge>();
     const edgeToVes = new Map<string, string[]>();
@@ -477,6 +611,10 @@ export function buildJunctionGraph(polygons: RoomPolygon[]): JunctionGraph {
         for (let k = 0; k < list.length - 1; k++) {
             const a = list[k];
             const b = list[k + 1];
+            // 退化区間 (b.t - a.t がほぼ 0) はスキップ。detectOverlapsAndSplits
+            // 側で重複端点を吸収する許容誤差を緩めているので通常は発生しないが、
+            // 数値的に同じ位置で 2 つの split が積まれた場合の防御。
+            if (b.t - a.t < 1e-9) continue;
             const startPos: Vec2 = [re.s[0] + dx * a.t, re.s[1] + dy * a.t];
             const endPos:   Vec2 = [re.s[0] + dx * b.t, re.s[1] + dy * b.t];
             // shared 判定: 仮想エッジの (a.t, b.t) 区間が共線重なり範囲のいずれかに完全包含されるか
@@ -733,11 +871,42 @@ export function resolveJunctions(
                     // standard miter: inner ∩ inner, outer ∩ outer
                     const innerPt = intersectLines(a.offsets.inner, b.offsets.inner);
                     const outerPt = intersectLines(a.offsets.outer, b.offsets.outer);
-                    if (!innerPt || !outerPt) {
-                        // 平行 → perpendicular cap
+                    // miter limit: 鋭角で交点が junction から遠く伸びるとスパイク
+                    // (= ユーザー報告の "三角形" アーチファクト) になるので上限を
+                    // 設けて perp cap にフォールバック。SVG/CSS の miter-limit と
+                    // 同じ概念。
+                    //
+                    // 10×wallThickness: 弧 → 直線の浅い接合 (= 弧の sweep が
+                    // semicircle に近く、両端での折れ曲がりが 12° 前後の場合)
+                    // でも miter が適用される閾値。それ以下のほぼ平行な接合は
+                    // perp cap に落ちるが、視覚的には目立たない。元の 4× では
+                    // 接線連続に近い接合で perp cap になり段差が顕在化していた。
+                    const ta = veThickness(a.ve, polyById);
+                    const tb = veThickness(b.ve, polyById);
+                    const tMax = Math.max(ta.outer, ta.inner, tb.outer, tb.inner);
+                    const MITER_LIMIT_FACTOR = 10;
+                    const miterLimit = MITER_LIMIT_FACTOR * tMax;
+                    const innerDist = innerPt
+                        ? distance(innerPt, junction.pos) : Infinity;
+                    const outerDist = outerPt
+                        ? distance(outerPt, junction.pos) : Infinity;
+                    const miterTooFar =
+                        innerDist > miterLimit || outerDist > miterLimit;
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `[junction/miter] j=(${junction.pos[0].toFixed(3)},${junction.pos[1].toFixed(3)}) ` +
+                        `pair ${a.ve.id.slice(0,4)}+${b.ve.id.slice(0,4)} ` +
+                        `tMax=${tMax.toFixed(3)} limit=${miterLimit.toFixed(3)} ` +
+                        `innerDist=${innerDist === Infinity ? "∞" : innerDist.toFixed(3)} ` +
+                        `outerDist=${outerDist === Infinity ? "∞" : outerDist.toFixed(3)} ` +
+                        `decision=${(!innerPt || !outerPt) ? "parallel→cap" : (miterTooFar ? "tooFar→cap" : "miter")}`,
+                    );
+                    if (!innerPt || !outerPt || miterTooFar) {
+                        // 平行 or 鋭角で miter 過剰 → perpendicular cap で打ち切り。
                         for (const inc of [a, b]) {
                             const cap = perpCap(inc);
-                            setCorners(inc, cap.outer, cap.inner, "[cap-parallel]");
+                            setCorners(inc, cap.outer, cap.inner,
+                                miterTooFar ? "[cap-miterLimit]" : "[cap-parallel]");
                         }
                     } else {
                         setCorners(a, outerPt, innerPt, "[miter]");
@@ -757,64 +926,93 @@ export function resolveJunctions(
 
         for (const inc of incidents) {
             if (processed.has(inc.ve.id)) continue;
-            const subj: Ring[] = [rectFromEdge(inc.offsets).map<Pair>((v) => [v[0], v[1]])];
+
+            // ── Sibling preempt: 同一物理壁の処理済み ve があれば、Clipper を
+            //    回さずに sibling の corners を直接コピーする。
+            //
+            //    高密度交差 (例: 4 部屋 + 字、n=8) で、同一物理壁を 2 視点で
+            //    persist する場合、Clipper diff では subj rect が accumulated
+            //    にほぼ完全包含され、結果として「FP 誤差由来の極小スリバー」
+            //    だけが残ることがある。そのスリバーは壁の遠端側に偏ること
+            //    が多く、`dToJ` 最小選択が遠端の頂点を拾い上げて corners が
+            //    junction から遠く外れてしまう (= 退化フットプリントで壁が
+            //    描画されず "壁が消える" 症状)。
+            //
+            //    sibling が既に処理済みなら corners は確定しているので、
+            //    そのまま流用するのが最も安全で正確。
             let bestOuter: Vec2 | null = null;
-            let bestOuterD = Infinity;
             let bestInner: Vec2 | null = null;
-            let bestInnerD = Infinity;
-            let diffPieces = 0;
-            let diffVerts = 0;
-            try {
-                const result = accumulatedClips.length === 0
-                    ? [subj]
-                    : polygonClipping.difference(subj, ...accumulatedClips);
-                diffPieces = result.length;
-                for (const piece of result) {
-                    if (!piece || piece.length === 0) continue;
-                    const ring = piece[0];
-                    if (!ring || ring.length < 4) continue;
-                    const nRing = ring.length - 1; // last == first
-                    diffVerts += nRing;
-                    for (let m = 0; m < nRing; m++) {
-                        const p: Vec2 = [ring[m][0], ring[m][1]];
-                        const dToJ = distance(p, junction.pos);
-                        if (pointLineDist(p, inc.offsets.outer) <= ON_LINE_TOL && dToJ < bestOuterD) {
-                            bestOuterD = dToJ; bestOuter = p;
-                        }
-                        if (pointLineDist(p, inc.offsets.inner) <= ON_LINE_TOL && dToJ < bestInnerD) {
-                            bestInnerD = dToJ; bestInner = p;
-                        }
-                    }
-                }
-            } catch (err) {
-                // Clipper 失敗 → 後段の sibling copy / cap fallback
-                if (debugThis) {
-                    // eslint-disable-next-line no-console
-                    console.log(`  (c) ${inc.ve.id} CLIPPER ERR ${String(err)}`);
-                }
+            let sibTag = "";
+            for (const sib of incidents) {
+                if (sib.ve.id === inc.ve.id) continue;
+                if (!processed.has(sib.ve.id)) continue;
+                if (!isSameWall(sib.ve, inc.ve)) continue;
+                const sibCorners = sib.endIdx === 0
+                    ? sib.ve.startCorners
+                    : sib.ve.endCorners;
+                if (!sibCorners) continue;
+                // 同一壁の ve は方向が反対なので outer / inner を swap して採用。
+                bestOuter = [sibCorners.inner[0], sibCorners.inner[1]];
+                bestInner = [sibCorners.outer[0], sibCorners.outer[1]];
+                sibTag = ` sib=${sib.ve.id} (preempt)`;
+                break;
             }
 
-            // Sibling fallback: diff が empty で corners 抽出できなかった場合
-            // (= rect が accumulated に完全包含)、同一物理壁の処理済み ve から
-            // corners をコピーする。VE_g (Room 4 視点) のように非 canonical で
-            // 後発処理される ve が、canonical の clip 結果を継承するための経路。
-            // 同一壁の ve は antiparallel 方向 (ve_a.dir = -ve_b.dir) なので
-            // outer / inner は swap して採用する。
-            let sibTag = "";
+            let diffPieces = 0;
+            let diffVerts = 0;
+            // sibling preempt が成立した場合は Clipper をスキップしても
+            // 正しい corners が得られるので、accumulatedClips への自分の
+            // rect 追加だけ確実にやれば良い (= setCorners 内で実施される)。
             if (!bestOuter || !bestInner) {
-                for (const sib of incidents) {
-                    if (sib.ve.id === inc.ve.id) continue;
-                    if (!processed.has(sib.ve.id)) continue;
-                    if (!isSameWall(sib.ve, inc.ve)) continue;
-                    const sibCorners = sib.endIdx === 0
-                        ? sib.ve.startCorners
-                        : sib.ve.endCorners;
-                    if (!sibCorners) continue;
-                    // 同一壁の ve は ve.dir が反対 → outer/inner を swap
-                    if (!bestOuter) bestOuter = [sibCorners.inner[0], sibCorners.inner[1]];
-                    if (!bestInner) bestInner = [sibCorners.outer[0], sibCorners.outer[1]];
-                    sibTag = ` sib=${sib.ve.id}`;
-                    break;
+                const subj: Ring[] = [rectFromEdge(inc.offsets).map<Pair>((v) => [v[0], v[1]])];
+                let bestOuterD = Infinity;
+                let bestInnerD = Infinity;
+                try {
+                    const result = accumulatedClips.length === 0
+                        ? [subj]
+                        : polygonClipping.difference(subj, ...accumulatedClips);
+                    diffPieces = result.length;
+                    for (const piece of result) {
+                        if (!piece || piece.length === 0) continue;
+                        const ring = piece[0];
+                        if (!ring || ring.length < 4) continue;
+                        const nRing = ring.length - 1; // last == first
+                        diffVerts += nRing;
+                        for (let m = 0; m < nRing; m++) {
+                            const p: Vec2 = [ring[m][0], ring[m][1]];
+                            const dToJ = distance(p, junction.pos);
+                            if (pointLineDist(p, inc.offsets.outer) <= ON_LINE_TOL && dToJ < bestOuterD) {
+                                bestOuterD = dToJ; bestOuter = p;
+                            }
+                            if (pointLineDist(p, inc.offsets.inner) <= ON_LINE_TOL && dToJ < bestInnerD) {
+                                bestInnerD = dToJ; bestInner = p;
+                            }
+                        }
+                    }
+                } catch (err) {
+                    // Clipper 失敗 → 後段の sibling copy / cap fallback
+                    if (debugThis) {
+                        // eslint-disable-next-line no-console
+                        console.log(`  (c) ${inc.ve.id} CLIPPER ERR ${String(err)}`);
+                    }
+                }
+
+                // Clipper 失敗時の sibling fallback (preempt とは別経路: ここでは
+                // sibling が後から処理されるケース)。
+                if (!bestOuter || !bestInner) {
+                    for (const sib of incidents) {
+                        if (sib.ve.id === inc.ve.id) continue;
+                        if (!processed.has(sib.ve.id)) continue;
+                        if (!isSameWall(sib.ve, inc.ve)) continue;
+                        const sibCorners = sib.endIdx === 0
+                            ? sib.ve.startCorners
+                            : sib.ve.endCorners;
+                        if (!sibCorners) continue;
+                        if (!bestOuter) bestOuter = [sibCorners.inner[0], sibCorners.inner[1]];
+                        if (!bestInner) bestInner = [sibCorners.outer[0], sibCorners.outer[1]];
+                        sibTag = ` sib=${sib.ve.id}`;
+                        break;
+                    }
                 }
             }
 
