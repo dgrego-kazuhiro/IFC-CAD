@@ -126,6 +126,11 @@ function makeRoomPolygon(
         vertexConnections: prev?.vertexConnections,
         wallOutlineOf: prev?.wallOutlineOf,
         edgeOwners: prev?.edgeOwners,
+        // joints: WallPath で確定した T 字接合ヒント。entity 駆動の re-derive
+        // (= setSpaceEntities → derivePolygonsFromEntities) でも保持しないと、
+        // 隣接 setSpaceEntities が走った瞬間に joints が消えて WallPath の
+        // 接合情報が失われる。
+        joints: prev?.joints,
         ...overrides,
     };
 }

@@ -52,6 +52,8 @@ interface TreeNodeProps {
     onSelectGrid?: (gridId: string) => void;
     onLevelAction?: (action: string, levelId: string) => void;
     onAddRoom?: (levelId: string) => void;
+    /** "Levels" コンテナノード (id="levels") の右クリックで階追加。 */
+    onAddLevel?: () => void;
     activeLevelId?: ElementId | null;
 }
 
@@ -62,6 +64,7 @@ export default function TreeNodeComponent({
     onSelectGrid,
     onLevelAction,
     onAddRoom,
+    onAddLevel,
     activeLevelId,
 }: TreeNodeProps) {
     const { selectedIds, expandedIds, hiddenIds, toggleSelected, toggleExpanded, toggleVisible } =
@@ -109,7 +112,9 @@ export default function TreeNodeComponent({
     };
 
     const handleContextMenu = (e: React.MouseEvent) => {
-        if (node.type === "Level" && node.levelId) {
+        // Level ノード or "Levels" コンテナで context menu を出す。
+        if ((node.type === "Level" && node.levelId)
+            || (node.type === "Category" && node.id === "levels")) {
             e.preventDefault();
             e.stopPropagation();
             setContextMenu({ x: e.clientX, y: e.clientY });
@@ -219,6 +224,28 @@ export default function TreeNodeComponent({
                 </>
             )}
 
+            {/* Levels container context menu */}
+            {contextMenu && node.type === "Category" && node.id === "levels" && (
+                <>
+                    <div className="fixed inset-0 z-40" onClick={closeContextMenu} />
+                    <div
+                        className="fixed z-50 bg-zinc-800 border border-zinc-600 rounded shadow-lg py-1 min-w-[140px]"
+                        style={{ left: contextMenu.x, top: contextMenu.y }}
+                    >
+                        <button
+                            className="w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-700 flex items-center gap-2"
+                            onClick={() => {
+                                onAddLevel?.();
+                                closeContextMenu();
+                            }}
+                        >
+                            <Layers size={12} />
+                            Add Level
+                        </button>
+                    </div>
+                </>
+            )}
+
             {/* Children */}
             {hasChildren && isExpanded && (
                 <div>
@@ -231,6 +258,7 @@ export default function TreeNodeComponent({
                             onSelectGrid={onSelectGrid}
                             onLevelAction={onLevelAction}
                             onAddRoom={onAddRoom}
+                            onAddLevel={onAddLevel}
                             activeLevelId={activeLevelId}
                         />
                     ))}

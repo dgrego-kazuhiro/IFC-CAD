@@ -24,6 +24,26 @@
 import polygonClipping, { type Pair, type Ring } from "polygon-clipping";
 import { Vec2 } from "../../geometry/math/Vec2";
 import { RoomPolygon, resolveWallThicknesses, polygonEdges } from "../../model/elements/SpaceElement";
+
+// ─── Per-edge thickness map ────────────────────────────────────────────────
+//
+// Phase 2: ポリゴン共通の wallThickness ではなく **エッジ単位** の inner/outer
+// 厚さを JunctionGraph に流し込むためのマップ。`wallRegenerate` が既存壁の
+// `thickness` / `innerThickness` / `outerThickness` から組み立てる。
+//
+// veThickness / veOffsetLines は、まずこのマップを引いて見つかったらそれを
+// 採用、無ければ従来通り `resolveWallThicknesses(poly)` (= ポリゴン共通) に
+// フォールバックする。これでユーザが ChangeElementTypeCommand で 1 本だけ
+// 厚さを変えた壁が、隣接壁とは違う厚さで接合される。Clipper diff (step c)
+// は ve ごとの rect で動くため、異厚さの突き合わせも自然に吸収する。
+//
+// key: `${polyId}:${edgeIdx}` (= 元 polygon edge 単位)。
+export type EdgeThicknessMap = Map<string, { inner: number; outer: number }>;
+const edgeThicknessKey = (polyId: string, edgeIdx: number): string =>
+    `${polyId}:${edgeIdx}`;
+export function makeEdgeThicknessKey(polyId: string, edgeIdx: number): string {
+    return edgeThicknessKey(polyId, edgeIdx);
+}
 import {
     edgeOffsetLines,
     intersectLines,
@@ -135,6 +155,49 @@ const rectFromEdge = (el: EdgeOffsetLines): Vec2[] => {
     ];
 };
 
+/** Junction-extended rect: junction で終端する側を「phantom」に延長した壁矩形。
+ *  step (c) Clipper diff の accumulatedClips にこれを積むことで、ある ve が
+ *  junction で終わっていても、相手側 ve から見ると **「壁が junction を超えて
+ *  反対側にも続いている」** ように clip される。これで非対称 L コーナー
+ *  (= 太壁が junction で終わり、細壁が直交して終わる) で細壁の終端が
+ *  「太壁のあった側 / 無かった側」で違う位置で切られて斜面になる現象を防ぐ。
+ *
+ *  endIdxAtJunction = 0: ve.start が junction にある (= ve は junction から
+ *      離れる方向に伸びる) → start を逆方向に延長
+ *  endIdxAtJunction = 1: ve.end が junction にある (= ve は junction で
+ *      終わる) → end を順方向に延長
+ *
+ *  延長距離は壁長 + 任意定数 (= 1000m) で「遠方まで」伸ばす。chain pair の
+ *  ように両方向の ve が積まれる場合は元々両側カバーされるので、延長分が
+ *  オーバーラップするだけで結果は同じ。 */
+const PHANTOM_EXT = 1000;
+const extendedRectFromEdge = (
+    el: EdgeOffsetLines, endIdxAtJunction: 0 | 1,
+): Vec2[] => {
+    const tIn  = (el.inner.px - el.axis.px) * el.nIn[0]
+               + (el.inner.py - el.axis.py) * el.nIn[1];
+    const tOut = (el.outer.px - el.axis.px) * el.nOut[0]
+               + (el.outer.py - el.axis.py) * el.nOut[1];
+    let sx = el.axis.px, sy = el.axis.py;
+    let ex = sx + el.dir[0] * el.length;
+    let ey = sy + el.dir[1] * el.length;
+    if (endIdxAtJunction === 0) {
+        // ve は junction を起点に伸びる → start を後方 (= junction の反対側) へ延長
+        sx -= el.dir[0] * PHANTOM_EXT;
+        sy -= el.dir[1] * PHANTOM_EXT;
+    } else {
+        // ve は junction で終わる → end を前方 (= junction の反対側) へ延長
+        ex += el.dir[0] * PHANTOM_EXT;
+        ey += el.dir[1] * PHANTOM_EXT;
+    }
+    return [
+        [sx + el.nIn[0]  * tIn,  sy + el.nIn[1]  * tIn],
+        [sx + el.nOut[0] * tOut, sy + el.nOut[1] * tOut],
+        [ex + el.nOut[0] * tOut, ey + el.nOut[1] * tOut],
+        [ex + el.nIn[0]  * tIn,  ey + el.nIn[1]  * tIn],
+    ];
+};
+
 /** 仮想エッジの方向ベクトル (始点 → 終点)。 */
 const veDir = (ve: VirtualEdge): Vec2 => {
     const dx = ve.end[0] - ve.start[0];
@@ -143,21 +206,31 @@ const veDir = (ve: VirtualEdge): Vec2 => {
     return [dx / len, dy / len];
 };
 
-/** 元エッジの内側 (CCW で +90°) 法線厚さ / 外側厚さ。 */
+/** 元エッジの内側 (CCW で +90°) 法線厚さ / 外側厚さ。
+ *  Phase 2: edgeThicknessMap が指定されていれば **per-edge** の厚さを優先する。
+ *  無ければ従来通りポリゴン共通の `resolveWallThicknesses` を使う。 */
 const veThickness = (
     ve: VirtualEdge,
     polyById: Map<string, RoomPolygon>,
+    edgeThicknessMap?: EdgeThicknessMap,
 ): { inner: number; outer: number } => {
+    if (edgeThicknessMap) {
+        const t = edgeThicknessMap.get(edgeThicknessKey(ve.sourcePolyId, ve.sourceEdgeIdx));
+        if (t) return t;
+    }
     const poly = polyById.get(ve.sourcePolyId);
     if (!poly) return { inner: 0, outer: 0 };
     return resolveWallThicknesses(poly);
 };
 
 /** 仮想エッジから offset lines を作る (元 edge の幾何のうち、ve の axis に
- *  揃えた線として再構築)。元 polygon の +90° / -90° 法線方向を踏襲する。 */
+ *  揃えた線として再構築)。元 polygon の +90° / -90° 法線方向を踏襲する。
+ *  Phase 2: edgeThicknessMap が渡されていれば per-edge の厚さで offset を作る
+ *  (= 隣接エッジが違う Type / 厚さでも独立に offset 線が引ける)。 */
 const veOffsetLines = (
     ve: VirtualEdge,
     polyById: Map<string, RoomPolygon>,
+    edgeThicknessMap?: EdgeThicknessMap,
 ): EdgeOffsetLines | null => {
     const poly = polyById.get(ve.sourcePolyId);
     if (!poly) return null;
@@ -168,7 +241,14 @@ const veOffsetLines = (
     const ux = dx / len, uy = dy / len;
     const nInX = -uy, nInY = ux;
     const nOutX = uy, nOutY = -ux;
-    const { inner: tIn, outer: tOut } = resolveWallThicknesses(poly);
+    let tIn: number; let tOut: number;
+    const perEdge = edgeThicknessMap?.get(edgeThicknessKey(ve.sourcePolyId, ve.sourceEdgeIdx));
+    if (perEdge) {
+        tIn = perEdge.inner; tOut = perEdge.outer;
+    } else {
+        const r = resolveWallThicknesses(poly);
+        tIn = r.inner; tOut = r.outer;
+    }
     const mx = (ve.start[0] + ve.end[0]) / 2;
     const my = (ve.start[1] + ve.end[1]) / 2;
     return {
@@ -716,6 +796,7 @@ export function resolveJunctions(
     graph: JunctionGraph,
     polygons: RoomPolygon[],
     columnFootprints: ColumnFootprint[] = [],
+    edgeThicknessMap?: EdgeThicknessMap,
 ): void {
     const polyById = new Map(polygons.map((p) => [p.id, p]));
 
@@ -736,7 +817,7 @@ export function resolveJunctions(
         for (const inc of junction.incidents) {
             const ve = graph.virtualEdges.get(inc.veId);
             if (!ve) continue;
-            const offsets = veOffsetLines(ve, polyById);
+            const offsets = veOffsetLines(ve, polyById, edgeThicknessMap);
             if (!offsets) continue;
             const dirAway: Vec2 = inc.endIdx === 0
                 ? [offsets.dir[0], offsets.dir[1]]
@@ -787,8 +868,12 @@ export function resolveJunctions(
             if (inc.endIdx === 0) inc.ve.startCorners = corners;
             else inc.ve.endCorners = corners;
             processed.add(inc.ve.id);
-            // 累積マージに自分の rect を追加
-            const rect = rectFromEdge(inc.offsets);
+            // 累積マージに自分の **junction-extended rect** を追加。junction を
+            // 越えて反対側 (= phantom 領域) まで rect を伸ばすことで、後続の
+            // 異厚さ ve が片側だけでなく両側で clip されるようにする。
+            // これを行わないと「太壁が junction で終わる L コーナー」で細壁の
+            // 終端面が斜めになる (= 三角形のスリバー)。
+            const rect = extendedRectFromEdge(inc.offsets, inc.endIdx);
             accumulatedClips.push([rect.map<Pair>((v) => [v[0], v[1]])]);
             if (debugThis) {
                 // eslint-disable-next-line no-console
@@ -801,7 +886,7 @@ export function resolveJunctions(
 
         /** 端点における垂直オフセット (= 共線時のフォールバック)。 */
         const perpCap = (inc: IncidentVE): { outer: Vec2; inner: Vec2 } => {
-            const t = veThickness(inc.ve, polyById);
+            const t = veThickness(inc.ve, polyById, edgeThicknessMap);
             return {
                 outer: [
                     junction.pos[0] + inc.offsets.nOut[0] * t.outer,
@@ -819,8 +904,25 @@ export function resolveJunctions(
         // して扱い、もう片方や stem はすべて step (c) の Clipper 経路に
         // 流す。これで主チェーンが中央正方形を貫通し、副チェーン / stem は
         // チェーン面で butt-cut される。3 本の T 字交差と同じロジック。
+        // 異厚さ判定ヘルパ。junction 上に厚さの違う ves が混在しているか。
+        // 混在していれば (a)/(b) の対称厚さ前提アルゴリズムは破綻するため、
+        // step (c) Clipper diff に処理を委ねる (= 厚い壁から累積 clip すれば
+        // 細い壁が厚い壁の外面で正しく cut される)。
+        const incThicknessSum = (inc: IncidentVE): number => {
+            const t = veThickness(inc.ve, polyById, edgeThicknessMap);
+            return t.inner + t.outer;
+        };
+        const hasAsymmetricThickness = (() => {
+            if (incidents.length < 2) return false;
+            const t0 = incThicknessSum(incidents[0]);
+            for (let i = 1; i < incidents.length; i++) {
+                if (Math.abs(incThicknessSum(incidents[i]) - t0) > 1e-6) return true;
+            }
+            return false;
+        })();
+
         let chainFound = false;
-        if (!forceColumnClip) {
+        if (!forceColumnClip && !hasAsymmetricThickness) {
             outerA: for (let i = 0; i < incidents.length; i++) {
                 for (let k = i + 1; k < incidents.length; k++) {
                     const a = incidents[i], b = incidents[k];
@@ -864,6 +966,29 @@ export function resolveJunctions(
                     const samePoly = incidents[i].ve.sourcePolyId === incidents[k].ve.sourcePolyId;
                     if (!samePoly && incidents.length !== 2) continue;
                     const a = incidents[i], b = incidents[k];
+                    // 厚さが食い違うペアの扱い:
+                    //  - 異 polygon (= 共有壁): step (c) Clipper diff に委ねる。
+                    //    inner/outer 交点が junction から大きく外れて壁外領域
+                    //    ("no-man's land") に飛ぶことがあり、wall fp 頂点に
+                    //    採用すると三角形スリバーが出るため。
+                    //  - 同 polygon (= L 字 corner): miter を **行う**。基準線
+                    //    違い (Center / Interior / Exterior 混在) でも、
+                    //    inner-inner / outer-outer 交点は L 字の正しい角を
+                    //    与える (= 各壁の内/外側面が連続する 1 点で出会う)。
+                    //    ここで skip すると、各壁が rect cap になり角に隙間や
+                    //    段差が出る。
+                    const taPre = veThickness(a.ve, polyById, edgeThicknessMap);
+                    const tbPre = veThickness(b.ve, polyById, edgeThicknessMap);
+                    const asymmetricPair =
+                        Math.abs(taPre.inner - tbPre.inner) > 1e-6 ||
+                        Math.abs(taPre.outer - tbPre.outer) > 1e-6;
+                    if (asymmetricPair && !samePoly) {
+                        if (debugThis) {
+                            // eslint-disable-next-line no-console
+                            console.log(`  (b) skipped — cross-poly asymmetric ${a.ve.id} + ${b.ve.id}`);
+                        }
+                        continue;
+                    }
                     if (debugThis) {
                         // eslint-disable-next-line no-console
                         console.log(`  (b) same-poly pair ${a.ve.id} + ${b.ve.id}`);
@@ -881,8 +1006,8 @@ export function resolveJunctions(
                     // でも miter が適用される閾値。それ以下のほぼ平行な接合は
                     // perp cap に落ちるが、視覚的には目立たない。元の 4× では
                     // 接線連続に近い接合で perp cap になり段差が顕在化していた。
-                    const ta = veThickness(a.ve, polyById);
-                    const tb = veThickness(b.ve, polyById);
+                    const ta = taPre;
+                    const tb = tbPre;
                     const tMax = Math.max(ta.outer, ta.inner, tb.outer, tb.inner);
                     const MITER_LIMIT_FACTOR = 10;
                     const miterLimit = MITER_LIMIT_FACTOR * tMax;
@@ -924,7 +1049,18 @@ export function resolveJunctions(
             return distance(a.start, b.end) < tol && distance(a.end, b.start) < tol;
         };
 
-        for (const inc of incidents) {
+        // 異厚さ junction では **厚い ve から先に処理** する。各 ve の rect は
+        // setCorners 内で accumulatedClips に追記されるので、先に処理した方が
+        // 「先勝ち」で残りやすい。ユーザは「太い壁が表面を保ち、細い壁は太い
+        // 壁の外面で切り落とされる」挙動を期待するので、厚い順 = 先処理が正解。
+        // 厚さ同点の場合は incidents.sort 由来の角度順が維持されるよう
+        // stable sort 相当に書く (= 元 index を tie-breaker に)。
+        const cOrder = incidents
+            .map((inc, idx) => ({ inc, idx, t: incThicknessSum(inc) }))
+            .sort((a, b) => (b.t - a.t) || (a.idx - b.idx))
+            .map((x) => x.inc);
+
+        for (const inc of cOrder) {
             if (processed.has(inc.ve.id)) continue;
 
             // ── Sibling preempt: 同一物理壁の処理済み ve があれば、Clipper を
@@ -976,7 +1112,20 @@ export function resolveJunctions(
                         if (!piece || piece.length === 0) continue;
                         const ring = piece[0];
                         if (!ring || ring.length < 4) continue;
-                        const nRing = ring.length - 1; // last == first
+                        // polygon-clipping の出力は **最終頂点が始点と重複** した
+                        // closed ring (= ring[0] === ring[len-1])。一方
+                        // accumulatedClips が空で subj を直接流したパスは
+                        // rectFromEdge 由来の重複無し 4 頂点。両者を区別して
+                        // nRing を決めないと、無 clip パスで最後の頂点 (= 多くの
+                        // 場合「もう一方の端の inner cap」) がスキップされ、
+                        // 結果として ve の endCorners がもう一方の端の値に
+                        // 摩り替わって wall が一端で taper する。
+                        const last = ring[ring.length - 1];
+                        const first = ring[0];
+                        const closedDup =
+                            Math.abs(first[0] - last[0]) < 1e-9 &&
+                            Math.abs(first[1] - last[1]) < 1e-9;
+                        const nRing = closedDup ? ring.length - 1 : ring.length;
                         diffVerts += nRing;
                         for (let m = 0; m < nRing; m++) {
                             const p: Vec2 = [ring[m][0], ring[m][1]];
@@ -1039,12 +1188,13 @@ export function resolveJunctions(
 export function applyCaps(
     graph: JunctionGraph,
     polygons: RoomPolygon[],
+    edgeThicknessMap?: EdgeThicknessMap,
 ): void {
     const polyById = new Map(polygons.map((p) => [p.id, p]));
     for (const ve of graph.virtualEdges.values()) {
-        const offsets = veOffsetLines(ve, polyById);
+        const offsets = veOffsetLines(ve, polyById, edgeThicknessMap);
         if (!offsets) continue;
-        const t = veThickness(ve, polyById);
+        const t = veThickness(ve, polyById, edgeThicknessMap);
         if (!ve.startCorners) {
             ve.startCorners = {
                 outer: [

@@ -3,6 +3,7 @@ import { mat4 } from 'gl-matrix';
 import { BaseElement } from '../model/base/BaseElement';
 import { ElementId } from '../model/base/ElementId';
 import { Command } from '../commands/base/Command';
+import { CommandHistory } from '../commands/base/CommandHistory';
 import { generateId } from '../utils/ids';
 import { Vec3 } from '../geometry/math/Vec3';
 import {
@@ -17,6 +18,12 @@ import { Constraint } from '../model/constraint/Constraint';
 import type { SketchEntity, SketchEntityId } from '../model/sketch/SketchEntity';
 import type { SpaceElement } from '../model/elements/SpaceElement';
 import { derivePolygonsFromEntities } from '../model/sketch/PolygonDerive';
+import {
+    ElementTypeDef,
+    seedStandardTypes,
+    DEFAULT_TYPE_BY_CATEGORY,
+    CategoryId,
+} from '../model/catalog';
 
 // スケッチ内の頂点 / 辺の選択。ConstraintPanel が参照する。
 //   - edge / point / circle : 部屋ポリゴンに紐づく sketch 要素 (polygon 経路)
@@ -34,7 +41,14 @@ export type SketchSelectionItem =
     | { kind: "entityEdge"; spaceId: ElementId; entityId: SketchEntityId; edgeIdx?: number }
     | { kind: "entity"; spaceId: ElementId; entityId: SketchEntityId }
     | { kind: "wallAxis"; wallId: ElementId }
-    | { kind: "wallPoint"; wallId: ElementId; endIdx: 0 | 1 };
+    | { kind: "wallPoint"; wallId: ElementId; endIdx: 0 | 1 }
+    // 部屋外の "ポイント候補": Length などの拘束で 2 点間の距離をかける時、
+    // 部屋頂点だけでなく柱中心 / 通芯端点 / 原点なども選べるようにする。
+    | { kind: "column"; columnId: ElementId }
+    | { kind: "gridPoint"; gridId: string; vertexIdx: number }
+    | { kind: "origin" }
+    // 通芯線そのもの (= 柱-通芯の垂直距離拘束に使う edge ライク選択)。
+    | { kind: "gridLine"; gridId: string };
 
 export function sketchSelectionKey(s: SketchSelectionItem): string {
     if (s.kind === "edge") return `e:${s.spaceId}:${s.polyId}:${s.edgeIdx}`;
@@ -48,7 +62,11 @@ export function sketchSelectionKey(s: SketchSelectionItem): string {
     if (s.kind === "entityEdge") return `ee:${s.spaceId}:${s.entityId}:${s.edgeIdx ?? 0}`;
     if (s.kind === "entity") return `en:${s.spaceId}:${s.entityId}`;
     if (s.kind === "wallAxis") return `w:${s.wallId}`;
-    return `wp:${s.wallId}:${s.endIdx}`;
+    if (s.kind === "wallPoint") return `wp:${s.wallId}:${s.endIdx}`;
+    if (s.kind === "column") return `col:${s.columnId}`;
+    if (s.kind === "gridPoint") return `gp:${s.gridId}:${s.vertexIdx}`;
+    if (s.kind === "gridLine") return `gl:${s.gridId}`;
+    return `o`;
 }
 
 /** 拘束ソルバへのドラッグヒント。SketchSolver がこの頂点を fixed として push する。 */
@@ -79,6 +97,8 @@ export type RoomEditMode =
 
 /** Wall-tool sub-mode: "add" draws new walls, "select" picks sketch lines. */
 export type WallSubMode = "add" | "select";
+export type BeamSubMode = "add" | "edit";
+export type ColumnSubMode = "add" | "edit";
 
 /** Top-level design mode (per docs/specification/new.md §8). */
 export type DesignMode = "freeZoning" | "jpResidentialGrid";
@@ -109,6 +129,10 @@ export interface AppState {
 
     // Wall tool sub-mode (add / select)
     wallSubMode: WallSubMode;
+    // Beam tool sub-mode (add / edit)
+    beamSubMode: BeamSubMode;
+    // Column tool sub-mode (add / edit)
+    columnSubMode: ColumnSubMode;
 
     /**
      * Top-level design mode (per docs/specification/new.md §8).
@@ -132,6 +156,16 @@ export interface AppState {
      * 文字列で持つのは入力中の "200mm" 等を直接束縛するため。
      */
     wallThicknessMm: string;
+    /**
+     * スケッチ線 (= polygon outer) を壁のどこに置くかの既定モード。
+     *  - "Center"   壁芯。outer はちょうど壁の真ん中 → inner=outer=T/2
+     *  - "Interior" 内法線。outer は室内側仕上げ面 → inner=0, outer=T
+     *  - "Exterior" 外法線。outer は屋外側仕上げ面 → inner=T, outer=0
+     * wallRegenerate に流れて polygon.wallReference として保存され、
+     * JunctionGraph の per-edge offset 計算と wall element の locationLine
+     * フィールドに反映される。
+     */
+    wallReferenceMode: "Center" | "Interior" | "Exterior";
     /** 円ポリゴンの壁分割角 (deg)。同じくリアルタイム生成と共有する。 */
     circleWallAngleDeg: string;
     /**
@@ -141,6 +175,16 @@ export interface AppState {
      *  - false: 「全壁生成」ボタンを押した時のみ生成する従来挙動。
      */
     realtimeWallGen: boolean;
+
+    // ── Type / Family / Category システム ───────────────────────
+    //
+    // Type は要素の「データ定義」(per ifc_webcad_core_architecture_spec §6)。
+    // 起動時に標準 Type が seed され、ユーザは複製してユーザ Type を作れる。
+    // 各カテゴリの「現在アクティブな Type」を保持し、ツール起動時に自動で
+    // その Type を新規要素へ割り当てる。
+    types: Record<string, ElementTypeDef>;
+    /** Category id → 現在アクティブな Type id (= 新規作成のデフォルト型)。 */
+    activeTypeIdByCategory: Partial<Record<CategoryId, string>>;
 
     // 2D 幾何拘束 (docs/specification/2d_constraint_system_spec.md)
     constraints: Record<string, Constraint>;
@@ -178,11 +222,14 @@ export interface AppState {
     setRoomEditMode: (mode: RoomEditMode) => void;
     setPendingRoomLevel: (levelId: ElementId | null) => void;
     setWallThicknessMm: (mm: string) => void;
+    setWallReferenceMode: (mode: "Center" | "Interior" | "Exterior") => void;
     setCircleWallAngleDeg: (deg: string) => void;
     setRealtimeWallGen: (on: boolean) => void;
 
     // Wall tool sub-mode action
     setWallSubMode: (mode: WallSubMode) => void;
+    setBeamSubMode: (mode: BeamSubMode) => void;
+    setColumnSubMode: (mode: ColumnSubMode) => void;
 
     // Design mode action
     setDesignMode: (mode: DesignMode) => void;
@@ -231,9 +278,30 @@ export interface AppState {
     removeLevel: (id: ElementId) => void;
     setActiveLevel: (id: ElementId | null) => void;
 
+    // Type system actions
+    /** Type を AppState.types に追加 (= ユーザ複製・読み込み)。 */
+    addType: (t: ElementTypeDef) => void;
+    /** Type の partial update。標準 Type には触らない (= UI で弾く)。 */
+    updateType: (id: string, partial: Partial<ElementTypeDef>) => void;
+    /** Type 削除。標準 Type は削除不可 (= UI で弾く)。 */
+    removeType: (id: string) => void;
+    /** カテゴリのアクティブ Type 切替 (= ツールバーで現在型を選んだ時)。 */
+    setActiveTypeId: (categoryId: CategoryId, typeId: string) => void;
+
     // Commands
     executeCommand: (command: Command) => void;
+    undo: () => void;
+    redo: () => void;
 }
+
+/**
+ * Undo / Redo 用の Command 履歴。zustand state には乗せず module-level に置く:
+ *   - 内部 (undoStack / redoStack) の更新は React 再描画とは独立してよい
+ *   - command.execute() / undo() 自体が `useAppState.getState()` 経由で
+ *     state を変えるので、それで UI が更新される
+ *   - HMR で複数 instance になるのを防ぐため module top に singleton を 1 つ
+ */
+export const commandHistory = new CommandHistory();
 
 export const useAppState = create<AppState>((set, get) => ({
     elements: {},
@@ -247,9 +315,12 @@ export const useAppState = create<AppState>((set, get) => ({
     roomEditMode: "select",
     pendingRoomLevelId: null,
     wallThicknessMm: "200",
+    wallReferenceMode: "Center",
     circleWallAngleDeg: "15",
     realtimeWallGen: true,
     wallSubMode: "add",
+    beamSubMode: "add",
+    columnSubMode: "add",
     designMode: "freeZoning",
     grids: [],
     gridNaming: DEFAULT_GRID_NAMING,
@@ -260,6 +331,8 @@ export const useAppState = create<AppState>((set, get) => ({
     sketchSelection: [],
     selectedConstraintId: null,
     solverDragHint: null,
+    types: seedStandardTypes(),
+    activeTypeIdByCategory: { ...DEFAULT_TYPE_BY_CATEGORY },
 
     addElement: (element) => set((state) => ({
         elements: { ...state.elements, [element.id]: element }
@@ -292,7 +365,24 @@ export const useAppState = create<AppState>((set, get) => ({
         return { elements: rest };
     }),
     setSelection: (ids) => set({ selection: ids }),
-    setActiveTool: (tool) => set({ activeTool: tool }),
+    setActiveTool: (tool) => set((state) => {
+        // 2D 描画モードの相互排他: 部屋モードと両立しないツール (gridline /
+        // column / beam / slab / door / window) を選んだ場合は、部屋モードを
+        // 抜ける。"select" と "wall" は部屋モード中でも使える (= 共存)。
+        const incompatibleWithRoom = new Set([
+            "gridline", "column", "beam", "slab", "door", "window",
+        ]);
+        if (incompatibleWithRoom.has(tool)
+            && (state.activeRoomId !== null || state.pendingRoomLevelId !== null)) {
+            return {
+                activeTool: tool,
+                activeRoomId: null,
+                pendingRoomLevelId: null,
+                roomEditMode: "select",
+            };
+        }
+        return { activeTool: tool };
+    }),
 
     setSpaceEntities: (spaceId, updater) => {
         set((state) => {
@@ -325,22 +415,40 @@ export const useAppState = create<AppState>((set, get) => ({
         mod.runSketchSolver();
     },
     setActiveRoom: (id) =>
-        set({
-            activeRoomId: id,
-            roomEditMode: "select",
-            // 実体ある Space をアクティブにした時点で「pending」状態は終わり。
-            // 部屋モード解除 (id=null) でも pending を残さないようクリアする。
-            pendingRoomLevelId: null,
+        set((state) => {
+            // 部屋モードに入る時、両立しない activeTool ("gridline", "door",
+            // "window", "column", "beam", "slab") は "select" にリセット。
+            // "wall" は部屋モード中でも有効なのでそのまま。
+            const incompatibleWithRoom = new Set([
+                "gridline", "column", "beam", "slab", "door", "window",
+            ]);
+            const resetTool = id !== null && incompatibleWithRoom.has(state.activeTool);
+            return {
+                activeRoomId: id,
+                roomEditMode: "select",
+                // 実体ある Space をアクティブにした時点で「pending」状態は終わり。
+                // 部屋モード解除 (id=null) でも pending を残さないようクリアする。
+                pendingRoomLevelId: null,
+                ...(resetTool ? { activeTool: "select" } : {}),
+            };
         }),
     setRoomEditMode: (mode) => set({ roomEditMode: mode }),
     setPendingRoomLevel: (levelId) =>
-        set({
-            pendingRoomLevelId: levelId,
-            // pending に入る時は activeRoomId を握ったままだと
-            // 古い部屋に追記してしまうので、合わせてクリアする。
-            ...(levelId ? { activeRoomId: null, roomEditMode: "select" } : {}),
+        set((state) => {
+            const incompatibleWithRoom = new Set([
+                "gridline", "column", "beam", "slab", "door", "window",
+            ]);
+            const resetTool = levelId !== null && incompatibleWithRoom.has(state.activeTool);
+            return {
+                pendingRoomLevelId: levelId,
+                // pending に入る時は activeRoomId を握ったままだと
+                // 古い部屋に追記してしまうので、合わせてクリアする。
+                ...(levelId ? { activeRoomId: null, roomEditMode: "select" } : {}),
+                ...(resetTool ? { activeTool: "select" } : {}),
+            };
         }),
     setWallThicknessMm: (mm) => set({ wallThicknessMm: mm }),
+    setWallReferenceMode: (mode) => set({ wallReferenceMode: mode }),
     setCircleWallAngleDeg: (deg) => set({ circleWallAngleDeg: deg }),
     setRealtimeWallGen: (on) => set({ realtimeWallGen: on }),
     setWallSubMode: (mode) => set((state) => ({
@@ -349,6 +457,8 @@ export const useAppState = create<AppState>((set, get) => ({
         // user starts fresh when they toggle.
         sketchSelection: mode === state.wallSubMode ? state.sketchSelection : [],
     })),
+    setBeamSubMode: (mode) => set({ beamSubMode: mode }),
+    setColumnSubMode: (mode) => set({ columnSubMode: mode }),
 
     setDesignMode: (mode) => set({ designMode: mode }),
 
@@ -553,12 +663,47 @@ export const useAppState = create<AppState>((set, get) => ({
     }),
     setActiveLevel: (id) => set({ activeLevelId: id }),
 
+    // ── Type system actions ─────────────────────────────────────
+    addType: (t) => set((state) => ({
+        types: { ...state.types, [t.id]: t },
+    })),
+    updateType: (id, partial) => set((state) => {
+        const cur = state.types[id];
+        if (!cur) return state;
+        if (cur.isStandard) {
+            // 標準 Type は read-only。UI で弾く想定だが防御的にも拒否。
+            return state;
+        }
+        return { types: { ...state.types, [id]: { ...cur, ...partial } as ElementTypeDef } };
+    }),
+    removeType: (id) => set((state) => {
+        const cur = state.types[id];
+        if (!cur || cur.isStandard) return state;
+        const { [id]: _, ...rest } = state.types;
+        return { types: rest };
+    }),
+    setActiveTypeId: (categoryId, typeId) => set((state) => ({
+        activeTypeIdByCategory: { ...state.activeTypeIdByCategory, [categoryId]: typeId },
+    })),
+
     executeCommand: (command) => {
-        const result = command.execute();
-        if (result.success) {
-            // Add to history (to evaluate in the future)
-        } else {
+        const result = commandHistory.execute(command);
+        if (!result.success) {
             console.warn("Command failed:", result.message);
         }
-    }
+    },
+    undo: () => {
+        const result = commandHistory.undo();
+        if (!result.success) {
+            // eslint-disable-next-line no-console
+            console.log("[undo]", result.message);
+        }
+    },
+    redo: () => {
+        const result = commandHistory.redo();
+        if (!result.success) {
+            // eslint-disable-next-line no-console
+            console.log("[redo]", result.message);
+        }
+    },
 }));

@@ -389,26 +389,27 @@ export class WallMeshBuilder {
         const normals: number[] = [];
         const indices: number[] = [];
         const edges: number[] = [];
-        let indexOffset = 0;
 
+        // **重要**: indices には `positions.length / 3` 由来の絶対 index を
+        // 使う。連番カウンタを使うと、`processRing` 内で edge silhouette を
+        // `addEdgePoint` で push した分の position 増加がカウンタに反映され
+        // ないため、top/bottom 三角形が edge points を参照してしまい描画が
+        // 破綻する (= 「上面が描画されない」現象)。
         const addTri = (p0: Vec3, p1: Vec3, p2: Vec3) => {
+            const idx0 = positions.length / 3;
             positions.push(...p0, ...p1, ...p2);
             const v1 = vec3.subtract(vec3.create(), p1, p0);
             const v2 = vec3.subtract(vec3.create(), p2, p0);
             const nrm = vec3.cross(vec3.create(), v1, v2);
             vec3.normalize(nrm, nrm);
             for (let i = 0; i < 3; i++) normals.push(...nrm);
-            indices.push(indexOffset, indexOffset + 1, indexOffset + 2);
-            indexOffset += 3;
+            indices.push(idx0, idx0 + 1, idx0 + 2);
         };
 
-        // 円周分割の既定 (circleWallAngleDeg) はちょうど 15° なので、それ以下
-        // を smooth とすると 24 分割 circle が判定漏れする。25° まで許容して
-        // 円側面を滑らかに、弧端の直線とのコーナー (通常 30° 以上) は描画。
+        // 円周分割の既定 (circleWallAngleDeg) は 3° (= 120 分割)。それでも
+        // 弧↔直線のコーナー (典型 30°+) と区別したいので閾値は 25° に置く。
         // 円側面 (= holes 付き annulus) は無条件で smooth、それ以外は折れ
-        // 曲がりが 25° 未満を smooth と判定。
-        // 25°: 既定 circleWallAngleDeg=15° (24 分割) 由来の 15° turns を許容
-        // しつつ、弧↔直線のコーナー (典型 30°+) は visible に残す。
+        // 曲がりが 25° 未満なら smooth と判定。
         const ARC_INTERIOR_TURN_RAD = (25 * Math.PI) / 180;
         const isAnnular = holesIn.length > 0;
         const addEdgePoint = (p: Vec3): number => {
@@ -429,9 +430,11 @@ export class WallMeshBuilder {
          *   hole  CW : ホール内側向き (= 室内側)
          * となるため法線符号反転は不要。
          */
-        const processRing = (ring: Vec3[]) => {
+        const processRing = (ring: Vec3[], internalMask?: boolean[]) => {
             const m = ring.length;
             if (m < 3) return;
+            const isInternal = (i: number): boolean =>
+                !!internalMask && internalMask[i] === true;
             const baseAt = (i: number): Vec3 => [ring[i][0], yBase, ring[i][2]];
             const topAt  = (i: number): Vec3 => [ring[i][0], yTop,  ring[i][2]];
             const turnAt = (i: number): number => {
@@ -463,6 +466,26 @@ export class WallMeshBuilder {
                 const len = Math.hypot(nx, nz) || 1;
                 faceNormalsXZ.push([nx / len, nz / len]);
             }
+            // Debug: ブラウザコンソールで `window.__wallNormalDebug = true` を設定
+            // してから壁を再生成すると、各 chord の face 法線をダンプする。
+            // 隣接面の値が連続的に変化していれば、面法線の生成自体は正しい。
+            if (typeof window !== "undefined" && (window as any).__wallNormalDebug) {
+                // eslint-disable-next-line no-console
+                console.log(`[WallMesh/processRing] m=${m} signedArea=${signedAreaXZ(ring).toFixed(4)} (CCW>0, CW<0)`);
+                for (let i = 0; i < m; i++) {
+                    const fn = faceNormalsXZ[i];
+                    const a = baseAt(i);
+                    const b = baseAt((i + 1) % m);
+                    const mx = (a[0] + b[0]) / 2;
+                    const mz = (a[2] + b[2]) / 2;
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `  face ${i}: midXZ=(${mx.toFixed(3)},${mz.toFixed(3)}) ` +
+                        `normal=(${fn[0].toFixed(3)},${fn[1].toFixed(3)}) ` +
+                        `len=${Math.hypot(fn[0], fn[1]).toFixed(4)}`,
+                    );
+                }
+            }
             const vertexNormalAt = (vIdx: number, faceIdx: number): [number, number] => {
                 if (!isSmoothAt(vIdx)) return faceNormalsXZ[faceIdx];
                 const prev = (vIdx - 1 + m) % m;
@@ -473,86 +496,174 @@ export class WallMeshBuilder {
                 return [x / len, z / len];
             };
             // Side face quad: 統一 winding (a, at, bt, b)。
+            //
+            // **フラットシェーディング**: 同じ chord に属する 2 三角形は同一の
+            // face 法線を使う。outer ring (CCW) は外向き、inner ring (CW=hole)
+            // は中心向き。これにより、Phong 補間で対角線に折れ目が出る問題や、
+            // 法線ベクトルの線形補間で生じる微妙な輝度ジッタを回避できる。
+            // 各 chord セグメントは均一な明るさで描画される (= 多角形プリズム
+            // の面として見える)。`vertexNormalAt` は smooth 用なのでここでは
+            // 使わず、faceNormalsXZ[i] を 4 頂点すべてに適用する。
+            void vertexNormalAt; // 互換性 (smooth は corner / arc 端点用)
+            const debugNormals = typeof window !== "undefined" && (window as any).__wallNormalDebug;
             for (let i = 0; i < m; i++) {
+                // 隣接壁と完全一致する内部 edge は side face を生成しない
+                // (= 見えない壁同士の接合面を消す)。
+                if (isInternal(i)) continue;
                 const a = baseAt(i);
                 const b = baseAt((i + 1) % m);
                 const at = topAt(i);
                 const bt = topAt((i + 1) % m);
-                const na = vertexNormalAt(i, i);
-                const nb = vertexNormalAt((i + 1) % m, i);
+                const fn = faceNormalsXZ[i]; // 同一面の 2 三角形は同じ法線。
                 const idx0 = positions.length / 3;
+                // 4 頂点すべてに同じ face 法線を流し込む (= フラットシェーディング)。
+                const nx = fn[0], nz = fn[1];
                 positions.push(a[0], a[1], a[2]);
-                normals.push(na[0], 0, na[1]);
+                normals.push(nx, 0, nz);
                 positions.push(at[0], at[1], at[2]);
-                normals.push(na[0], 0, na[1]);
+                normals.push(nx, 0, nz);
                 positions.push(bt[0], bt[1], bt[2]);
-                normals.push(nb[0], 0, nb[1]);
+                normals.push(nx, 0, nz);
                 positions.push(b[0], b[1], b[2]);
-                normals.push(nb[0], 0, nb[1]);
+                normals.push(nx, 0, nz);
+                if (debugNormals) {
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `  quad ${i}: idx0=${idx0} ` +
+                        `vertNormals=[(${nx.toFixed(3)},0,${nz.toFixed(3)}) x4] ` +
+                        `T1=(${idx0},${idx0+1},${idx0+2}) T2=(${idx0},${idx0+2},${idx0+3})`,
+                    );
+                }
                 indices.push(
                     idx0,     idx0 + 1, idx0 + 2,
                     idx0,     idx0 + 2, idx0 + 3,
                 );
-                indexOffset = idx0 + 4;
             }
-            // Edge silhouettes: top / bottom は常に描画 (= 壁シルエット)。
-            // vertical は smooth 頂点で抑制。
+            // Edge silhouettes:
+            //  - top / bottom 水平: face i 自体が internal なら不要 (= 内部
+            //    接合面の上下端は外から見えない)。
+            //  - vertical (頂点 i): face i-1 と face i の **両方が internal**
+            //    のときだけ抑制。片方が外向きなら、その外向き面のシルエット
+            //    端として残す。
             for (let i = 0; i < m; i++) {
+                const internal = isInternal(i);
                 const a = baseAt(i);
                 const b = baseAt((i + 1) % m);
                 const at = topAt(i);
                 const bt = topAt((i + 1) % m);
-                addEdge(a, b);
-                addEdge(at, bt);
-                if (!isSmoothAt(i)) addEdge(a, at);
+                if (!internal) {
+                    addEdge(a, b);
+                    addEdge(at, bt);
+                }
+                if (isSmoothAt(i)) continue;
+                const prevInternal = isInternal((i - 1 + m) % m);
+                if (internal && prevInternal) continue;
+                addEdge(a, at);
             }
         };
 
         // ── Side faces + edge silhouettes ────────────────────────────────
-        processRing(fp);
+        // outer ring の internalEdges は wall.footprint の頂点並びに対応する。
+        // signedAreaXZ で CCW に揃える際に reverse した場合は mask も反転する。
+        let outerMask = data.internalEdges;
+        if (outerMask && !inputCCW) {
+            // reversed[i] = oldMask[(n-2-i+n) % n] (= edge n-1-i の反転対応)
+            const n = outerMask.length;
+            const reversed = new Array<boolean>(n);
+            for (let i = 0; i < n; i++) {
+                reversed[i] = outerMask[(n - 2 - i + n) % n];
+            }
+            outerMask = reversed;
+        }
+        processRing(fp, outerMask);
         for (const h of holesIn) processRing(h);
 
-        // ── Top + bottom (triangulated via earcut, holes 対応) ──────────
-        // earcut は入力の signedArea を見て **常に内部 CCW に正規化** する。
-        const flat: number[] = [];
-        for (const p of fp) flat.push(p[0], p[2]);
-        const holeIndices: number[] = [];
-        for (const h of holesIn) {
-            holeIndices.push(flat.length / 2);
-            for (const p of h) flat.push(p[0], p[2]);
-        }
-        const tris = earcut(
-            flat,
-            holeIndices.length > 0 ? holeIndices : undefined,
-            2,
-        );
-        // 3D 復元: vertex idx → ring + local idx → Vec3。
-        // earcut の入力は flat = [outer..., hole0..., hole1...] で連結されて
-        // いるので ringStarts[r] = ring r の global 開始 index。
-        const ringsList: Vec3[][] = [fp, ...holesIn];
-        const ringStarts: number[] = [0];
-        for (let r = 0; r < ringsList.length - 1; r++) {
-            ringStarts.push(ringStarts[r] + ringsList[r].length);
-        }
-        const vertAt = (yPlane: number, gIdx: number): Vec3 => {
-            for (let r = ringsList.length - 1; r >= 0; r--) {
-                if (gIdx >= ringStarts[r]) {
-                    const local = gIdx - ringStarts[r];
-                    const rv = ringsList[r][local];
-                    return [rv[0], yPlane, rv[2]];
-                }
+        // ── Top + bottom 三角化 ────────────────────────────────────────
+        // 円形 annulus (= outer.length === inner.length の閉ループ) の場合、
+        // earcut は ear-clipping で **不均一な扇形** を生成しやすく、上から
+        // 見たとき不自然な放射状の白いウェッジが見える ("円の3D壁ですが、
+        // 白い、不自然な部分があります" の原因)。両 ring が一致した tess
+        // 数を持つ場合は wedge ごとに均一に 2 三角化して、見た目を整える。
+        const isUniformAnnulus =
+            isAnnular &&
+            holesIn.length === 1 &&
+            holesIn[0].length === fp.length &&
+            fp.length >= 3;
+        if (isUniformAnnulus) {
+            // wallRegenerate 側で inner ring を CW に揃えてあるため、ここでは
+            // 一旦 CCW に戻し outer[i] と inner[i] を同じ角度位置で揃える。
+            const outerCCW = fp; // 既に CCW (signedArea 補正済)
+            const innerCCW = [...holesIn[0]].reverse();
+            const N = outerCCW.length;
+            const at = (ring: Vec3[], i: number, y: number): Vec3 =>
+                [ring[i][0], y, ring[i][2]];
+            // 上から見たとき、(outer[i] → inner[i] → inner[i+1] → outer[i+1])
+            // の四角形は **CW** (= +Y 法線) になる。三角化して天井 (+Y) に。
+            for (let i = 0; i < N; i++) {
+                const j = (i + 1) % N;
+                addTri(
+                    at(outerCCW, i, yTop),
+                    at(innerCCW, i, yTop),
+                    at(innerCCW, j, yTop),
+                );
+                addTri(
+                    at(outerCCW, i, yTop),
+                    at(innerCCW, j, yTop),
+                    at(outerCCW, j, yTop),
+                );
             }
-            return [0, yPlane, 0];
-        };
-        // Top face (+Y normal): reverse earcut output (CCW → CW math).
-        for (let i = 0; i < tris.length; i += 3) {
-            const a = tris[i], b = tris[i + 1], c = tris[i + 2];
-            addTri(vertAt(yTop, c), vertAt(yTop, b), vertAt(yTop, a));
-        }
-        // Bottom face (-Y normal): keep earcut output as-is (CCW math).
-        for (let i = 0; i < tris.length; i += 3) {
-            const a = tris[i], b = tris[i + 1], c = tris[i + 2];
-            addTri(vertAt(yBase, a), vertAt(yBase, b), vertAt(yBase, c));
+            // 床 (-Y 法線) は反対巻き。
+            for (let i = 0; i < N; i++) {
+                const j = (i + 1) % N;
+                addTri(
+                    at(outerCCW, i, yBase),
+                    at(innerCCW, j, yBase),
+                    at(innerCCW, i, yBase),
+                );
+                addTri(
+                    at(outerCCW, i, yBase),
+                    at(outerCCW, j, yBase),
+                    at(innerCCW, j, yBase),
+                );
+            }
+        } else {
+            // 一般形は earcut にフォールバック。
+            // earcut は入力の signedArea を見て **常に内部 CCW に正規化** する。
+            const flat: number[] = [];
+            for (const p of fp) flat.push(p[0], p[2]);
+            const holeIndices: number[] = [];
+            for (const h of holesIn) {
+                holeIndices.push(flat.length / 2);
+                for (const p of h) flat.push(p[0], p[2]);
+            }
+            const tris = earcut(
+                flat,
+                holeIndices.length > 0 ? holeIndices : undefined,
+                2,
+            );
+            const ringsList: Vec3[][] = [fp, ...holesIn];
+            const ringStarts: number[] = [0];
+            for (let r = 0; r < ringsList.length - 1; r++) {
+                ringStarts.push(ringStarts[r] + ringsList[r].length);
+            }
+            const vertAt = (yPlane: number, gIdx: number): Vec3 => {
+                for (let r = ringsList.length - 1; r >= 0; r--) {
+                    if (gIdx >= ringStarts[r]) {
+                        const local = gIdx - ringStarts[r];
+                        const rv = ringsList[r][local];
+                        return [rv[0], yPlane, rv[2]];
+                    }
+                }
+                return [0, yPlane, 0];
+            };
+            for (let i = 0; i < tris.length; i += 3) {
+                const a = tris[i], b = tris[i + 1], c = tris[i + 2];
+                addTri(vertAt(yTop, c), vertAt(yTop, b), vertAt(yTop, a));
+            }
+            for (let i = 0; i < tris.length; i += 3) {
+                const a = tris[i], b = tris[i + 1], c = tris[i + 2];
+                addTri(vertAt(yBase, a), vertAt(yBase, b), vertAt(yBase, c));
+            }
         }
 
         // ── Bounds ───────────────────────────────────────────────────────

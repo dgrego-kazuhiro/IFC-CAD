@@ -8,11 +8,16 @@ import RoomSketchOverlay from "../room/RoomSketchOverlay";
 import RoomPropertyPanel from "../room/RoomPropertyPanel";
 import WallEditPanel from "../wall/WallEditPanel";
 import GridPropertyPanel from "../grid/GridPropertyPanel";
+import SlabPropertyPanel from "../slab/SlabPropertyPanel";
+import ConstraintPanel from "../constraint/ConstraintPanel";
+import ElementTypePanel from "../catalog/ElementTypePanel";
+import EdgeWallTypePanel from "../catalog/EdgeWallTypePanel";
 import { useAppState, AppState } from "../../application/AppState";
 import { SpaceElement } from "../../model/elements/SpaceElement";
 import { RemoveConstraintCommand } from "../../commands/create/AddConstraintCommand";
 import { saveScene, loadScene, clearScene, hasSavedScene } from "../../application/Persistence";
 import { downloadIfc } from "../../io/ifc/IfcExporter";
+import { triggerWallRegenIfEnabled } from "../room/wallRegenerate";
 
 export default function CadShell() {
     const activeTool = useAppState((state: AppState) => state.activeTool);
@@ -25,11 +30,14 @@ export default function CadShell() {
     const setPendingRoomLevel = useAppState((state: AppState) => state.setPendingRoomLevel);
     const selectedGridIds = useAppState((state: AppState) => state.selectedGridIds);
     const selection = useAppState((state: AppState) => state.selection);
+    const sketchSelection = useAppState((state: AppState) => state.sketchSelection);
     const removeElement = useAppState((state: AppState) => state.removeElement);
     const setSelection = useAppState((state: AppState) => state.setSelection);
     const selectedConstraintId = useAppState((state: AppState) => state.selectedConstraintId);
     const setSelectedConstraintId = useAppState((state: AppState) => state.setSelectedConstraintId);
     const executeCommand = useAppState((state: AppState) => state.executeCommand);
+    const undo = useAppState((state: AppState) => state.undo);
+    const redo = useAppState((state: AppState) => state.redo);
 
     const viewportRef = useRef<ViewportHandle>(null);
 
@@ -39,6 +47,22 @@ export default function CadShell() {
             const t = e.target as HTMLElement | null;
             if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
                 return;
+            }
+
+            // Undo / Redo (Ctrl+Z / Cmd+Z, Ctrl+Shift+Z / Cmd+Shift+Z, Ctrl+Y)
+            const mod = e.ctrlKey || e.metaKey;
+            if (mod && !e.altKey) {
+                if (e.key === "z" || e.key === "Z") {
+                    e.preventDefault();
+                    if (e.shiftKey) redo();
+                    else undo();
+                    return;
+                }
+                if (e.key === "y" || e.key === "Y") {
+                    e.preventDefault();
+                    redo();
+                    return;
+                }
             }
 
             if (e.key === "Escape") {
@@ -63,16 +87,15 @@ export default function CadShell() {
                     e.preventDefault();
                     return;
                 }
-                // Delete selected Space (room) elements — also clean up their walls
                 const { elements } = useAppState.getState();
-                const toDelete = selection.filter((id) => {
+                // Delete selected Space (room) elements — also clean up their walls
+                const spacesToDelete = selection.filter((id) => {
                     const el = elements[id];
                     return el && el.type === "Space";
                 });
-                if (toDelete.length > 0) {
-                    for (const id of toDelete) {
+                if (spacesToDelete.length > 0) {
+                    for (const id of spacesToDelete) {
                         const room = elements[id] as SpaceElement;
-                        // Remove walls linked to polygons
                         const wallIds = new Set<string>();
                         for (const p of room.polygons ?? []) {
                             for (const wid of p.wallIds ?? []) if (wid) wallIds.add(wid);
@@ -85,6 +108,32 @@ export default function CadShell() {
                     e.preventDefault();
                     return;
                 }
+                // Delete other element kinds (Column / Beam / Wall / Slab / Door / Window)。
+                // 柱・梁・壁の削除は壁の最終フットプリントに影響するので realtime
+                // 壁再生成をトリガする。
+                const otherToDelete = selection.filter((id) => {
+                    const el = elements[id];
+                    if (!el) return false;
+                    return el.type === "Column" || el.type === "Beam"
+                        || el.type === "Wall" || el.type === "Slab"
+                        || el.type === "Door" || el.type === "Window";
+                });
+                if (otherToDelete.length > 0) {
+                    let anyAffectsWalls = false;
+                    for (const id of otherToDelete) {
+                        const el = elements[id];
+                        if (el && (el.type === "Column" || el.type === "Wall")) {
+                            anyAffectsWalls = true;
+                        }
+                        removeElement(id);
+                    }
+                    setSelection([]);
+                    if (anyAffectsWalls) {
+                        triggerWallRegenIfEnabled("delete-element");
+                    }
+                    e.preventDefault();
+                    return;
+                }
             }
         };
         window.addEventListener("keydown", handleKeyDown);
@@ -92,7 +141,7 @@ export default function CadShell() {
     }, [
         setActiveTool, activeRoomId, setActiveRoom, selection, removeElement,
         setSelection, selectedConstraintId, setSelectedConstraintId, executeCommand,
-        pendingRoomLevelId, setPendingRoomLevel,
+        pendingRoomLevelId, setPendingRoomLevel, undo, redo,
     ]);
 
     const handleAddRoom = () => {
@@ -150,14 +199,6 @@ export default function CadShell() {
                         className={`px-3 py-1 rounded border ${activeTool === "select" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
                         onClick={() => setActiveTool("select")}
                     >Select</button>
-                    <button
-                        className={`px-3 py-1 rounded border ${activeTool === "wall" ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
-                        onClick={() => {
-                            if (!activeLevelId) return;
-                            activeTool === "wall" ? setActiveTool("select") : setActiveTool("wall");
-                        }}
-                        title={!activeLevelId ? "Select a level first (double-click or right-click a level in the tree)" : "Wall tool"}
-                    >Wall</button>
                     <button
                         className={`px-3 py-1 rounded border ${activeTool === "column" ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
                         onClick={() => {
@@ -225,9 +266,23 @@ export default function CadShell() {
                 </div>
                 <div className="w-72 border-l border-zinc-800 p-4 shrink-0 overflow-y-auto">
                     <h2 className="text-xs text-zinc-400 font-bold uppercase mb-2">Properties</h2>
+                    {/* Type 切替パネル — 単独選択された Wall/Column/Beam/Slab に対して
+                        Type 変更ドロップダウンを出す。形状は Type+overrides から再投影。 */}
+                    <ElementTypePanel />
+                    {/* 部屋モードでエッジを 1 本選んだ時の per-edge 壁 Type 変更。
+                        sketchSelection 経由で edge → wall element をルックアップして
+                        ChangeElementTypeCommand を流す。 */}
+                    <EdgeWallTypePanel />
                     {selectedGridIds.length > 0 ? (
                         <GridPropertyPanel />
                     ) : (() => {
+                        // Slab を 1 つだけ選択している時は SlabPropertyPanel。
+                        const slabId = selection.length === 1
+                            && elements[selection[0]]?.type === "Slab"
+                            ? selection[0] : null;
+                        if (slabId) {
+                            return <SlabPropertyPanel key={slabId} slabId={slabId as any} />;
+                        }
                         // Show RoomPropertyPanel for either the actively-edited
                         // room OR a singly-selected Space. This way the user
                         // sees properties as soon as they pick a room, without
@@ -235,12 +290,19 @@ export default function CadShell() {
                         const targetId = activeRoomId
                             ?? selection.find((id) => elements[id]?.type === "Space")
                             ?? null;
-                        return targetId && elements[targetId]
+                        if (targetId && elements[targetId]) {
                             // key forces a fresh component instance per room so
                             // the draft useState reseeds from the new room and
                             // the user never sees stale name/usage values.
-                            ? <RoomPropertyPanel key={targetId} activeRoomId={targetId} />
-                            : <div className="text-sm">No selection</div>;
+                            return <RoomPropertyPanel key={targetId} activeRoomId={targetId} />;
+                        }
+                        // 部屋選択も無いが sketchSelection (= 柱中心 / 通芯端点 /
+                        // 原点 / 壁端点 等) が積まれている時は ConstraintPanel
+                        // を出して 2 点距離拘束等を行えるようにする。
+                        if (sketchSelection.length > 0) {
+                            return <ConstraintPanel />;
+                        }
+                        return <div className="text-sm">No selection</div>;
                     })()}
                 </div>
             </div>

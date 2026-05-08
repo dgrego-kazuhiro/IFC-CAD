@@ -45,7 +45,12 @@ export type ConstraintTarget =
     | { kind: "WallAxis"; wallId: ElementId }
     | { kind: "WallAxisPoint"; wallId: ElementId; endIdx: 0 | 1 }
     | { kind: "Grid"; gridId: string }
-    | { kind: "Column"; columnId: ElementId };
+    | { kind: "Column"; columnId: ElementId }
+    /** 通芯の端点を 1 つの "ポイント候補" として参照。Length 拘束で柱-通芯
+     *  端点 距離などに使う。 */
+    | { kind: "GridPoint"; gridId: string; vertexIdx: number }
+    /** 原点 (0,0)。固定 fixed point として GCS に push される。 */
+    | { kind: "Origin" };
 
 export interface Constraint {
     id: string;

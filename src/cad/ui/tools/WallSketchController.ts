@@ -138,6 +138,11 @@ export class WallSketchController {
     private commitSegments() {
         const appState = useAppState.getState();
         const transaction = new TransactionCommand("Create Wall Sketch");
+        const wallTypeId = appState.activeTypeIdByCategory.Wall;
+        if (!wallTypeId) {
+            console.warn("[WallSketchController] no active WallType");
+            return;
+        }
 
         for (const seg of this.state.segments) {
             // Simplified conversion from SketchPlane 2D to 3D for MVP (XY plane)
@@ -146,9 +151,11 @@ export class WallSketchController {
 
             const cmd = new CreateWallCommand(
                 [p1, p2],
-                this.state.options.defaultThickness,
+                wallTypeId as any,
                 this.state.options.defaultHeight,
-                Math.random().toString(36).substring(2, 11) as ElementId
+                Math.random().toString(36).substring(2, 11) as ElementId,
+                undefined,
+                { thickness: this.state.options.defaultThickness },
             );
             transaction.add(cmd);
         }

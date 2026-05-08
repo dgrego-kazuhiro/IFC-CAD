@@ -71,6 +71,8 @@ export class Renderer {
       struct ObjectUniforms {
         modelMatrix: mat4x4f,
         color: vec4f,
+        // flags.x = isCylinder flag (>0.5: position-derived radial normal を使う)
+        // flags.yzw = cylinder の中心座標 (XYZ、Y は無視)
         flags: vec4f,
       };
 
@@ -104,11 +106,14 @@ export class Renderer {
 
       @fragment
       fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-        // Soft overhead key light + high ambient so surfaces facing away
-        // from the light still read clearly in plan / perspective views.
+        // Blender 風の flat shading: 各 chord (= triangle pair) は同一面法線
+        // を持つので、フラグメントシェーダでもそれをそのまま使う。位置由来の
+        // radial 法線オーバーライドは per-pixel ノイズの原因になるため不採用。
+        // 円柱は tessellation 細分化 (circleWallAngleDeg=3°) で滑らかに見せる。
+        let n = normalize(in.normal);
         let lightDir = normalize(vec3f(0.4, 1.0, 0.3));
         let ambient = 0.65;
-        let diff = max(0.0, dot(in.normal, lightDir));
+        let diff = max(0.0, dot(n, lightDir));
         let lighting = ambient + (1.0 - ambient) * diff;
         let finalColor = in.color.xyz * lighting;
         return vec4f(finalColor, in.color.a);
@@ -266,7 +271,7 @@ export class Renderer {
             vertex: { module: objectModule, entryPoint: "vs_main", buffers: vertexBuffers },
             fragment: { module: objectModule, entryPoint: "fs_main", targets: [{ format: this.gpu.format }] },
             primitive: { topology: "triangle-list", cullMode: "back" },
-            depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+            depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth32float" },
             multisample: msaa,
         });
 
@@ -275,7 +280,7 @@ export class Renderer {
             vertex: { module: objectModule, entryPoint: "vs_main", buffers: vertexBuffers },
             fragment: { module: objectModule, entryPoint: "fs_main", targets: [{ format: this.gpu.format }] },
             primitive: { topology: "triangle-list", cullMode: "none" },
-            depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+            depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth32float" },
             multisample: msaa,
         });
 
@@ -294,7 +299,7 @@ export class Renderer {
                 }],
             },
             primitive: { topology: "triangle-list", cullMode: "none" },
-            depthStencil: { depthWriteEnabled: false, depthCompare: "always", format: "depth24plus" },
+            depthStencil: { depthWriteEnabled: false, depthCompare: "always", format: "depth32float" },
             multisample: msaa,
         });
 
@@ -303,7 +308,7 @@ export class Renderer {
             vertex: { module: objectModule, entryPoint: "vs_main", buffers: vertexBuffers },
             fragment: { module: objectModule, entryPoint: "fs_main", targets: [{ format: this.gpu.format }] },
             primitive: { topology: "line-list", cullMode: "none" },
-            depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+            depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth32float" },
             multisample: msaa,
         });
 
@@ -312,7 +317,7 @@ export class Renderer {
             vertex: { module: edgeModule, entryPoint: "vs_edge", buffers: vertexBuffers },
             fragment: { module: edgeModule, entryPoint: "fs_edge", targets: [{ format: this.gpu.format }] },
             primitive: { topology: "line-list", cullMode: "none" },
-            depthStencil: { depthWriteEnabled: true, depthCompare: "less-equal", format: "depth24plus" },
+            depthStencil: { depthWriteEnabled: true, depthCompare: "less-equal", format: "depth32float" },
             multisample: msaa,
         });
 
@@ -338,7 +343,7 @@ export class Renderer {
                 }],
             },
             primitive: { topology: "triangle-list", cullMode: "none" },
-            depthStencil: { depthWriteEnabled: false, depthCompare: "less-equal", format: "depth24plus" },
+            depthStencil: { depthWriteEnabled: false, depthCompare: "less-equal", format: "depth32float" },
             multisample: msaa,
         });
 
@@ -364,7 +369,7 @@ export class Renderer {
         this.depthTexture?.destroy();
         this.depthTexture = this.gpu.device.createTexture({
             size: [width, height],
-            format: "depth24plus",
+            format: "depth32float",
             sampleCount: MSAA_COUNT,
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
         });
@@ -404,7 +409,10 @@ export class Renderer {
                     view: this.msaaView,         // MSAA render target
                     resolveTarget: resolveTarget, // Resolve to swap chain
                     loadOp: "clear",
-                    clearValue: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                    // 純白だと壁の上面 (= +Y 法線でほぼ最大照度) が背景と
+                    // 同色になって「上面が描画されない」ように見える。off-white
+                    // にして上面・slab・他の水平面を背景から区別可能にする。
+                    clearValue: { r: 0.93, g: 0.94, b: 0.96, a: 1.0 },
                     storeOp: "store",
                 },
             ],
@@ -449,7 +457,18 @@ export class Renderer {
             const data = new Float32Array(24);
             data.set(obj.transform, 0);
             data.set(obj.color, 16);
-            data[20] = 0.0;
+            // flags: x=isCylinder, y=center.x, z=center.y, w=center.z
+            if (obj.cylinderCenter) {
+                data[20] = 1.0;
+                data[21] = obj.cylinderCenter[0];
+                data[22] = obj.cylinderCenter[1];
+                data[23] = obj.cylinderCenter[2];
+            } else {
+                data[20] = 0.0;
+                data[21] = 0.0;
+                data[22] = 0.0;
+                data[23] = 0.0;
+            }
 
             device.queue.writeBuffer(objBuf.buffer, 0, data);
             return { meshBuf, bindGroup: objBuf.bindGroup };

@@ -13,13 +13,46 @@
 import { useAppState } from "../application/AppState";
 import { SpaceElement, RoomPolygon, polygonEdges } from "../model/elements/SpaceElement";
 import { Constraint, ConstraintTarget } from "../model/constraint/Constraint";
-import { GridLine } from "../model/grid/GridLine";
+import { GridLine, gridVertices } from "../model/grid/GridLine";
 import { ColumnElement } from "../model/elements/ColumnElement";
 import { WallElement } from "../model/elements/WallElement";
 import { Vec2 } from "../geometry/math/Vec2";
 import { Vec3 } from "../geometry/math/Vec3";
 import { computeMiteredCorners, computeMiteredWallAxes, syncWallsToPolygonOuter } from "../ui/room/wallSync";
 import { GcsBackend } from "./GcsBackend";
+import { triggerWallRegenIfEnabled } from "../ui/room/wallRegenerate";
+import type { SketchEntity, ArcEntity, PolylineEntity, LineEntity } from "../model/sketch/SketchEntity";
+
+/**
+ * 弧 / 円エンティティの「途中点」(= 弧をテッセレートして生まれた polygon
+ * 頂点) を判定する。ユーザがポリゴンに拘束を入れたとき、ソルバが弧の
+ * tessellation 頂点を勝手に動かして弧の形状を壊さないよう、そういう頂点は
+ * `fixed: true` で押し込み、解きほぐしの自由度から外す必要がある。
+ *
+ * 隣接する 2 本のエッジの owner が同じ ArcEntity / CircleEntity なら interior。
+ */
+function isArcInteriorVertex(
+    poly: RoomPolygon,
+    vIdx: number,
+    entities: SketchEntity[],
+): boolean {
+    if (!poly.edgeOwners) return false;
+    const polyEdgeList = polygonEdges(poly);
+    let owner: string | undefined;
+    let count = 0;
+    for (let ei = 0; ei < polyEdgeList.length; ei++) {
+        const [va, vb] = polyEdgeList[ei];
+        if (va !== vIdx && vb !== vIdx) continue;
+        const o = poly.edgeOwners[ei];
+        if (!o) return false;
+        if (owner === undefined) owner = o;
+        else if (owner !== o) return false;
+        count++;
+    }
+    if (count < 2 || !owner) return false;
+    const ent = entities.find((e) => e.id === owner);
+    return !!ent && (ent.kind === "arc" || ent.kind === "circle");
+}
 
 type OID = number;
 
@@ -46,6 +79,11 @@ let solvingDepth = 0;
 // ----- solve runner -----
 let running = false;
 let pendingResolveRequested = false;
+/** 弧含み polygon の再派生が走った直後に立てる。runSketchSolver の while
+ *  ループで pendingResolveRequested と合流させ、再派生後の polygon outer に
+ *  対してもう一度解く (= 拘束が再派生で破られていれば収束させる)。 */
+let arcRederiveRequested = false;
+const MAX_SOLVE_ITERATIONS = 5;
 
 /**
  * Run the constraint solver against the current AppState and write back the
@@ -65,9 +103,12 @@ export function runSketchSolver(): void {
     void (async () => {
         try {
             await solveOnce();
-            while (pendingResolveRequested) {
+            let iter = 1;
+            while ((pendingResolveRequested || arcRederiveRequested) && iter < MAX_SOLVE_ITERATIONS) {
                 pendingResolveRequested = false;
+                arcRederiveRequested = false;
                 await solveOnce();
+                iter++;
             }
         } catch (e) {
             // eslint-disable-next-line no-console
@@ -153,7 +194,17 @@ async function solveOnce(): Promise<void> {
         }
     }
 
-    if (polys.size === 0 && circles.size === 0 && walls.size === 0 && arcEntities.size === 0) return;
+    // 部屋/壁を参照しない拘束 (= 柱-柱 / 柱-通芯 / 柱-原点 など) があれば
+    // solver は走らせる必要がある。Column / Grid / GridPoint / Origin の
+    // 何れかを参照する拘束があるかをチェック。
+    const hasNonRoomTarget = constraints.some((c) =>
+        c.targets.some((t) =>
+            t.kind === "Column" || t.kind === "Grid"
+            || t.kind === "GridPoint" || t.kind === "Origin"));
+    if (
+        polys.size === 0 && circles.size === 0 && walls.size === 0
+        && arcEntities.size === 0 && !hasNonRoomTarget
+    ) return;
 
     // Build reverse index: wall.id → owning polygon (if any).
     // A wall is "owned" when it appears in some RoomPolygon.wallIds. For owned
@@ -220,8 +271,18 @@ async function solveOnce(): Promise<void> {
         // than a fixed pin. The solver then snaps the point onto the curve.
         const dragVertexHasCurveConstraint = (() => {
             if (!dragHint) return false;
+            // 「ドラッグ点を fixed pin にしてしまうと拘束と矛盾する」種類の
+            // 拘束があれば、ドラッグ点を free にしてカーソルは初期推定値として
+            // 使う (= 解の近傍を案内するだけ)。これを行わないと例えば PerpDistance
+            // 拘束がかかった頂点を線越しにドラッグした時、距離拘束と pin 位置の
+            // 両方を満たそうとして solver が暴れて矩形がペシャンコに崩れる。
+            const conflictKinds = new Set([
+                "PointOnCircle", "PointOnGrid",
+                "PerpDistance", "Length", "CircleRadius", "CircleDiameter",
+                "ArcRadius", "ArcDiameter",
+            ]);
             for (const c of constraints) {
-                if (c.type !== "PointOnCircle" && c.type !== "PointOnGrid") continue;
+                if (!conflictKinds.has(c.type)) continue;
                 for (const t of c.targets) {
                     if (t.kind === "SketchPoint"
                         && t.spaceId === dragHint.spaceId
@@ -263,6 +324,8 @@ async function solveOnce(): Promise<void> {
                 ? (deriveOutlineOuter(entry.spaceId, entry.poly) ?? entry.poly.outer)
                 : entry.poly.outer;
             const n = outer.length;
+            const sp = state.elements[entry.spaceId] as SpaceElement | undefined;
+            const spEntities = sp?.entities ?? [];
             const pIds: OID[] = [];
             for (let i = 0; i < n; i++) {
                 const pid = idAlloc.next();
@@ -277,6 +340,14 @@ async function solveOnce(): Promise<void> {
                     });
                     continue;
                 }
+                // 弧 / 円 entity 由来の tessellation interior 頂点は **固定** で
+                // push する。これらをフリー変数として残すと、外部拘束 (= 矩形の
+                // 上辺 Horizontal 等) が弧の途中の点を勝手に動かして弧の形状を
+                // 壊してしまう。`fixed: true` にしておけば解後も弧の見た目が
+                // 保たれる (弧自体は ArcEntity の center / radius / aStart / aEnd
+                // でパラメトリックに表現され、setSpaceEntities 経由で再テッセレ
+                // ートされるのが本来の真実)。
+                const isArcInterior = isArcInteriorVertex(entry.poly, i, spEntities);
                 const isDragMatch =
                     dragHint != null &&
                     dragHint.spaceId === entry.spaceId &&
@@ -288,7 +359,7 @@ async function solveOnce(): Promise<void> {
                     id: String(pid),
                     x: isDragMatch ? dragHint.x : outer[i][0],
                     y: isDragMatch ? dragHint.y : outer[i][1],
-                    fixed: isDragPin,
+                    fixed: isArcInterior || isDragPin,
                 });
             }
             const lIds: OID[] = [];
@@ -407,6 +478,48 @@ async function solveOnce(): Promise<void> {
             wallIds.set(wid, { p1, p2, line });
         }
 
+        // ── 拘束で参照される Column / GridPoint / Origin を GCS に push ──
+        // Column basePoint は **自由 (= 拘束で動く)**。
+        // GridPoint / Origin は **fixed** (= 動かない参照点)。
+        // pointIdFor 経由で Length 等の点拘束に使う。
+        const columnPointIds = new Map<string, OID>();
+        const gridPointIds = new Map<string, OID>();
+        let originPointId: OID | null = null;
+        for (const c of constraints) {
+            for (const t of c.targets) {
+                if (t.kind === "Column") {
+                    if (columnPointIds.has(t.columnId as string)) continue;
+                    const col = state.elements[t.columnId as string] as ColumnElement | undefined;
+                    if (!col || !col.basePoint) continue;
+                    const pid = idAlloc.next();
+                    primitives.push({
+                        type: "point",
+                        id: String(pid),
+                        x: col.basePoint[0],
+                        y: col.basePoint[2],
+                        fixed: false,
+                    });
+                    columnPointIds.set(t.columnId as string, pid);
+                } else if (t.kind === "GridPoint") {
+                    const key = `${t.gridId}:${t.vertexIdx}`;
+                    if (gridPointIds.has(key)) continue;
+                    const grid = state.grids.find((g) => g.id === t.gridId);
+                    if (!grid) continue;
+                    const verts = gridVertices(grid.curve);
+                    if (t.vertexIdx < 0 || t.vertexIdx >= verts.length) continue;
+                    const v = verts[t.vertexIdx];
+                    const pid = idAlloc.next();
+                    primitives.push({ type: "point", id: String(pid), x: v[0], y: v[2], fixed: true });
+                    gridPointIds.set(key, pid);
+                } else if (t.kind === "Origin") {
+                    if (originPointId == null) {
+                        originPointId = idAlloc.next();
+                        primitives.push({ type: "point", id: String(originPointId), x: 0, y: 0, fixed: true });
+                    }
+                }
+            }
+        }
+
         // ── Translate and push user constraints ──
         // Outline polygons are derived + fixed. Only the legacy rect-wall
         // auto-added links (Parallel / PerpDistance between an outline and
@@ -416,6 +529,17 @@ async function solveOnce(): Promise<void> {
         // primitives, they act as anchors that other polygons snap to.
         const isLegacyOutlineLink = (c: Constraint): boolean => {
             if (c.type !== "Parallel" && c.type !== "PerpDistance") return false;
+            // 内壁 (= inner) と外壁 (= outline) を結ぶレガシー自動拘束は **両方の
+            // ターゲットが部屋ポリゴン (SketchEdge / SketchPoint)** で作られる
+            // (RoomEditPanel の outline 再構築で投入)。これらは固定 outline と
+            // 競合するので skip する。一方、ユーザが外壁頂点 + 通芯 (Grid) や
+            // 外壁頂点 + 壁軸 (WallAxis) で追加した PerpDistance は **少なくとも
+            // 1 つが非ポリゴン target** になるので skip しない (= ユーザ意図を
+            // 尊重して solver に流す)。
+            const polyTargetCount = c.targets.filter(
+                (t) => t.kind === "SketchEdge" || t.kind === "SketchPoint",
+            ).length;
+            if (polyTargetCount < 2) return false;
             return c.targets.some((t) => {
                 const tt = t as any;
                 if (t.kind !== "SketchEdge" && t.kind !== "SketchPoint") return false;
@@ -424,7 +548,10 @@ async function solveOnce(): Promise<void> {
         };
         for (const c of constraints) {
             if (isLegacyOutlineLink(c)) continue;
-            const gcsPrimitives = translateConstraint(c, polyIds, circleIds, wallIds, idAlloc, state.grids, state.elements as any, arcEntityIds);
+            const gcsPrimitives = translateConstraint(
+                c, polyIds, circleIds, wallIds, idAlloc, state.grids, state.elements as any,
+                arcEntityIds, columnPointIds, gridPointIds, originPointId,
+            );
             for (const p of gcsPrimitives) primitives.push(p);
         }
 
@@ -439,6 +566,29 @@ async function solveOnce(): Promise<void> {
             // eslint-disable-next-line no-console
             console.warn(`[SketchSolver] solve status=${status} (failed) — skipping writeback`);
             return;
+        }
+
+        // ── DOF / 矛盾 / 冗長 拘束の警告 ─────────────────────────────
+        // planegcs に問い合わせて over/under-constrained や矛盾している拘束を
+        // 検出し、コンソールに通知する。これだけで暴走は止まらないが、
+        // ユーザは「最後に追加した拘束のせいでおかしい」と気付ける。
+        try {
+            const dof = wrapper.gcs.dof();
+            const hasConflicting = wrapper.has_gcs_conflicting_constraints();
+            const hasRedundant = wrapper.has_gcs_redundant_constraints();
+            if (hasConflicting || hasRedundant || dof < 0) {
+                const conflicting = hasConflicting ? wrapper.get_gcs_conflicting_constraints() : [];
+                const redundant = hasRedundant ? wrapper.get_gcs_redundant_constraints() : [];
+                // eslint-disable-next-line no-console
+                console.warn(
+                    `[SketchSolver] constraint health: dof=${dof}` +
+                    (conflicting.length ? ` conflicting=[${conflicting.join(",")}]` : "") +
+                    (redundant.length ? ` redundant=[${redundant.join(",")}]` : ""),
+                );
+            }
+        } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn("[SketchSolver] DOF/conflict query failed:", e);
         }
 
         wrapper.apply_solution();
@@ -460,6 +610,29 @@ async function solveOnce(): Promise<void> {
                 bucket.set(polyId, { ...cur, ...patch });
             };
 
+            // ヘルパ: 頂点列の AABB と最大絶対座標 (= 暴走検知用)。
+            const aabbOf = (pts: Vec2[]): { w: number; h: number; absMax: number } => {
+                let mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity;
+                let absMax = 0;
+                for (const p of pts) {
+                    if (!Number.isFinite(p[0]) || !Number.isFinite(p[1])) {
+                        return { w: Infinity, h: Infinity, absMax: Infinity };
+                    }
+                    if (p[0] < mnX) mnX = p[0]; if (p[0] > mxX) mxX = p[0];
+                    if (p[1] < mnY) mnY = p[1]; if (p[1] > mxY) mxY = p[1];
+                    const a = Math.max(Math.abs(p[0]), Math.abs(p[1]));
+                    if (a > absMax) absMax = a;
+                }
+                return { w: mxX - mnX, h: mxY - mnY, absMax };
+            };
+            // 暴走判定の閾値:
+            //   - NaN / Inf       → 即 reject
+            //   - 元 polygon の幅・高さの 5 倍を超える膨張は reject
+            //   - 全頂点の絶対座標が 1000m を超えるのは reject (= 室内寸法で
+            //     ありえない位置)
+            const RUNAWAY_RATIO = 5.0;
+            const RUNAWAY_ABS_M = 1000;
+
             for (const [key, entry] of polys) {
                 const ids = polyIds.get(key);
                 if (!ids) continue;
@@ -478,9 +651,39 @@ async function solveOnce(): Promise<void> {
                     }
                 }
                 if (!changed) continue;
+                // 暴走検知: 解が NaN/Inf を含む、元の AABB の RUNAWAY_RATIO 倍を
+                // 超えて膨張、絶対座標が RUNAWAY_ABS_M を超える場合は writeback
+                // を skip して元の polygon を温存する (= 矛盾 / 過剰拘束による
+                // 暴走から保護)。
+                const oldAabb = aabbOf(entry.poly.outer);
+                const newAabb = aabbOf(solved);
+                const oldExtent = Math.max(oldAabb.w, oldAabb.h, 0.1);
+                const newExtent = Math.max(newAabb.w, newAabb.h);
+                const runaway =
+                    !Number.isFinite(newExtent) ||
+                    !Number.isFinite(newAabb.absMax) ||
+                    newAabb.absMax > RUNAWAY_ABS_M ||
+                    newExtent > oldExtent * RUNAWAY_RATIO;
+                if (runaway) {
+                    // eslint-disable-next-line no-console
+                    console.warn(
+                        `[SketchSolver] runaway solution rejected for poly ` +
+                        `${entry.poly.id.slice(0, 6)}: ` +
+                        `oldExtent=${oldExtent.toFixed(2)} → newExtent=${newExtent.toFixed(2)} ` +
+                        `absMax=${newAabb.absMax.toFixed(2)}m. ` +
+                        `直近で追加した拘束が過剰 / 矛盾している可能性があります。`,
+                    );
+                    continue;
+                }
                 dirty(entry.spaceId, entry.poly.id, { outer: solved });
             }
 
+            // Sketch-circle 経由で動いた円は、polygon.shape を書き戻すだけでは
+            // **対応する CircleEntity が陳腐化** する (= 中心マーカが古い位置に
+            // 留まる / 次の setSpaceEntities 再派生で polygon が古い位置に snap
+            // back するなどのドリフト原因)。spaceId 単位で circle entity の
+            // center/radius も同期する。
+            const circleEntitySyncBySpace = new Map<string, Map<string, { center: [number, number]; radius: number }>>();
             for (const [key, entry] of circles) {
                 const ids = circleIds.get(key);
                 const shape = entry.poly.shape;
@@ -500,6 +703,31 @@ async function solveOnce(): Promise<void> {
                     outer: newOuter,
                     shape: { type: "circle", center: [cx, cy] as Vec2, radius: r },
                 });
+                // 対応する CircleEntity を polyId 逆引きで特定し、entity 同期。
+                const sp = state.elements[entry.spaceId] as SpaceElement | undefined;
+                const map = sp?.polyIdByEntity ?? {};
+                let circleEntId: string | null = null;
+                for (const eid in map) {
+                    if (map[eid] === entry.poly.id) { circleEntId = eid; break; }
+                }
+                if (circleEntId) {
+                    let bucket = circleEntitySyncBySpace.get(entry.spaceId);
+                    if (!bucket) { bucket = new Map(); circleEntitySyncBySpace.set(entry.spaceId, bucket); }
+                    bucket.set(circleEntId, { center: [cx, cy], radius: r });
+                }
+            }
+            // Apply circle entity sync via setSpaceEntities (consistent path).
+            // arcRederiveRequested を立てて、再派生後の polygon に対しても拘束が
+            // 満たされているか再確認する (= constraints 経由で円が動かされた場合
+            // に他の polygon と整合させるため)。
+            for (const [spaceId, bucket] of circleEntitySyncBySpace) {
+                if (bucket.size === 0) continue;
+                arcRederiveRequested = true;
+                useAppState.getState().setSpaceEntities(spaceId, (entities) => entities.map((e) => {
+                    const patch = bucket.get(e.id);
+                    if (!patch || e.kind !== "circle") return e;
+                    return { ...e, center: patch.center, radius: patch.radius };
+                }));
             }
 
             // ── Arc / Circle entity の半径・中心 writeback ─────────────
@@ -582,6 +810,11 @@ async function solveOnce(): Promise<void> {
                 return null;
             };
 
+            // ArcRadius / ArcDiameter 由来で arc 半径/中心が変わると、隣接
+            // polyline 端点が新 chord に追従して polygon が再派生する。これは
+            // 外部拘束 (Horizontal 等) が破られる可能性があるので、再派生後に
+            // もう一度 solveOnce を回して収束させる。
+            if (entityPatches.size > 0) arcRederiveRequested = true;
             for (const [spaceId, patches] of entityPatches) {
                 useAppState.getState().setSpaceEntities(spaceId, (entities) => {
                     return entities.map((e) => {
@@ -648,6 +881,282 @@ async function solveOnce(): Promise<void> {
                 });
             }
 
+            // ── 弧を含む polygon 用の解書き戻しパス ────────────────────────
+            // 弧 / 円エンティティが含まれる polygon は、ソルバ解 (= polygon.outer
+            // の各頂点位置) を **エンティティ側** に伝播 → 続く setSpaceEntities
+            // で polygon を再派生する。これにより:
+            //   - 弧 interior 頂点は entity.center / radius / aStart / aEnd から
+            //     クリーンに再テッセレートされ、ソルバが残しがちなドリフトが消える
+            //     (= 「弧が分割されたまま位置だけずれる」現象を防ぐ)
+            //   - chord 端点 (= polyline / line と弧の接続点) は polyline.points /
+            //     line.p0/p1 と弧 entity の chord をともに更新するので chain 検出が
+            //     必ず再接続する
+            // 含まない polygon は従来どおりの直接書き戻し。
+            const arcAffectedSpaces = new Set<string>();
+            for (const [spaceId, bucket] of perSpaceUpdates) {
+                const latest = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+                if (!latest) continue;
+                const ents = latest.entities ?? [];
+                for (const polyId of bucket.keys()) {
+                    const poly = latest.polygons.find((p) => p.id === polyId);
+                    if (!poly?.edgeOwners) continue;
+                    if (poly.edgeOwners.some((o) => {
+                        const e = ents.find((x) => x.id === o);
+                        return e && e.kind === "arc";
+                    })) {
+                        arcAffectedSpaces.add(spaceId);
+                        break;
+                    }
+                }
+            }
+
+            for (const spaceId of arcAffectedSpaces) {
+                const bucket = perSpaceUpdates.get(spaceId);
+                const latest = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+                if (!bucket || !latest) continue;
+
+                type EntityPatch =
+                    | { kind: "polyline"; points: Vec2[] }
+                    | { kind: "line"; p0?: Vec2; p1?: Vec2 }
+                    | { kind: "arc"; center?: Vec2; radius?: number; aStart?: number; aEnd?: number };
+                const entityPatches = new Map<string, EntityPatch>();
+                const ents = latest.entities ?? [];
+
+                const findPolylinePoint = (pl: PolylineEntity, target: Vec2): number => {
+                    let best = -1, bestD = 1e-3;
+                    for (let i = 0; i < pl.points.length; i++) {
+                        const d = Math.hypot(pl.points[i][0] - target[0], pl.points[i][1] - target[1]);
+                        if (d < bestD) { bestD = d; best = i; }
+                    }
+                    return best;
+                };
+                const findLinePoint = (ln: LineEntity, target: Vec2): 0 | 1 | -1 => {
+                    const d0 = Math.hypot(ln.p0[0] - target[0], ln.p0[1] - target[1]);
+                    const d1 = Math.hypot(ln.p1[0] - target[0], ln.p1[1] - target[1]);
+                    if (d0 < 1e-3 && d0 <= d1) return 0;
+                    if (d1 < 1e-3) return 1;
+                    return -1;
+                };
+                const ensurePolylinePatch = (pl: PolylineEntity): { kind: "polyline"; points: Vec2[] } => {
+                    let p = entityPatches.get(pl.id) as { kind: "polyline"; points: Vec2[] } | undefined;
+                    if (!p) {
+                        p = { kind: "polyline", points: pl.points.map((q) => [q[0], q[1]] as Vec2) };
+                        entityPatches.set(pl.id, p);
+                    }
+                    return p;
+                };
+                const ensureLinePatch = (ln: LineEntity): { kind: "line"; p0?: Vec2; p1?: Vec2 } => {
+                    let p = entityPatches.get(ln.id) as { kind: "line"; p0?: Vec2; p1?: Vec2 } | undefined;
+                    if (!p) { p = { kind: "line" }; entityPatches.set(ln.id, p); }
+                    return p;
+                };
+
+                for (const [polyId, patch] of bucket) {
+                    if (!patch.outer) continue;
+                    const poly = latest.polygons.find((p) => p.id === polyId);
+                    if (!poly?.edgeOwners) continue;
+                    if (patch.outer.length !== poly.outer.length) continue;
+                    const newOuter = patch.outer;
+                    const polyEdgeList = polygonEdges(poly);
+
+                    // Per-vertex propagation: 弧 interior は entity 更新せず、
+                    // それ以外は対応する polyline / line の point を新位置で更新。
+                    for (let vi = 0; vi < poly.outer.length; vi++) {
+                        const newPos = newOuter[vi];
+                        const oldPos = poly.outer[vi];
+                        if (Math.hypot(newPos[0] - oldPos[0], newPos[1] - oldPos[1]) < 1e-9) continue;
+                        const incEdges: number[] = [];
+                        for (let ei = 0; ei < polyEdgeList.length; ei++) {
+                            const [va, vb] = polyEdgeList[ei];
+                            if (va === vi || vb === vi) incEdges.push(ei);
+                        }
+                        const incOwners = Array.from(new Set(
+                            incEdges.map((ei) => poly.edgeOwners![ei]).filter(Boolean) as string[],
+                        ));
+                        let isArcInterior = false;
+                        for (const ow of incOwners) {
+                            const e = ents.find((x) => x.id === ow);
+                            if (e && (e.kind === "arc" || e.kind === "circle")
+                                && incOwners.length === 1) {
+                                isArcInterior = true;
+                                break;
+                            }
+                        }
+                        if (isArcInterior) continue;
+                        for (const ow of incOwners) {
+                            const e = ents.find((x) => x.id === ow);
+                            if (!e) continue;
+                            if (e.kind === "polyline") {
+                                const idx = findPolylinePoint(e, oldPos);
+                                if (idx >= 0) {
+                                    const p = ensurePolylinePatch(e);
+                                    p.points[idx] = [newPos[0], newPos[1]];
+                                }
+                            } else if (e.kind === "line") {
+                                const idx = findLinePoint(e, oldPos);
+                                if (idx >= 0) {
+                                    const p = ensureLinePatch(e);
+                                    if (idx === 0) p.p0 = [newPos[0], newPos[1]];
+                                    else p.p1 = [newPos[0], newPos[1]];
+                                }
+                            }
+                        }
+                    }
+
+                    // 弧自体の center / radius / aStart / aEnd を新 chord 位置に
+                    // 合わせて再計算 (strategy A: 旧 radius を保つ、収まらなけれ
+                    // ば最小限の拡大。bulge 方向は旧 arc 側を継承)。
+                    const arcOwners = Array.from(new Set(
+                        (poly.edgeOwners ?? []).filter(Boolean) as string[],
+                    )).filter((id) => {
+                        const e = ents.find((x) => x.id === id);
+                        return e && e.kind === "arc";
+                    });
+                    for (const arcId of arcOwners) {
+                        const arc = ents.find((x) => x.id === arcId) as ArcEntity | undefined;
+                        if (!arc) continue;
+                        // この arc の chord 端点 (= polygon 上の vertex) を 2 つ取得。
+                        const chordVerts: number[] = [];
+                        const vertEdges = new Map<number, number[]>();
+                        for (let ei = 0; ei < polyEdgeList.length; ei++) {
+                            const [va, vb] = polyEdgeList[ei];
+                            for (const v of [va, vb]) {
+                                const arr = vertEdges.get(v) ?? [];
+                                arr.push(ei);
+                                vertEdges.set(v, arr);
+                            }
+                        }
+                        for (const [vi, edges] of vertEdges) {
+                            if (edges.length !== 2) continue;
+                            const o0 = poly.edgeOwners![edges[0]];
+                            const o1 = poly.edgeOwners![edges[1]];
+                            const arcSide = (o0 === arcId) !== (o1 === arcId);
+                            if (arcSide) chordVerts.push(vi);
+                        }
+                        if (chordVerts.length !== 2) continue;
+                        // 旧 arc の chord 端点世界座標。どちらの polygon 頂点が
+                        // aStart 側 / aEnd 側かを近接判定で対応付ける。
+                        const oldStart: Vec2 = [
+                            arc.center[0] + arc.radius * Math.cos(arc.aStart),
+                            arc.center[1] + arc.radius * Math.sin(arc.aStart),
+                        ];
+                        const oldEnd: Vec2 = [
+                            arc.center[0] + arc.radius * Math.cos(arc.aEnd),
+                            arc.center[1] + arc.radius * Math.sin(arc.aEnd),
+                        ];
+                        const v0 = chordVerts[0], v1 = chordVerts[1];
+                        const oldP0 = poly.outer[v0], oldP1 = poly.outer[v1];
+                        const d0_oldStart = Math.hypot(oldP0[0] - oldStart[0], oldP0[1] - oldStart[1]);
+                        const d0_oldEnd = Math.hypot(oldP0[0] - oldEnd[0], oldP0[1] - oldEnd[1]);
+                        const startVi = d0_oldStart <= d0_oldEnd ? v0 : v1;
+                        const endVi = startVi === v0 ? v1 : v0;
+                        const newStart = newOuter[startVi];
+                        const newEnd = newOuter[endVi];
+                        // chord が動いていないなら更新不要。
+                        const movedStart = Math.hypot(newStart[0] - oldStart[0], newStart[1] - oldStart[1]);
+                        const movedEnd = Math.hypot(newEnd[0] - oldEnd[0], newEnd[1] - oldEnd[1]);
+                        if (movedStart < 1e-9 && movedEnd < 1e-9) continue;
+                        // strategy A: 旧 radius を保ち、新 chord に合わせて center を再計算。
+                        const dx = newEnd[0] - newStart[0];
+                        const dy = newEnd[1] - newStart[1];
+                        const chordLen = Math.hypot(dx, dy);
+                        if (chordLen < 1e-9) continue;
+                        let R = arc.radius;
+                        const half = chordLen / 2;
+                        if (R < half) R = half; // chord 長が大きすぎる場合は最小限拡大
+                        const Mx = (newStart[0] + newEnd[0]) / 2;
+                        const My = (newStart[1] + newEnd[1]) / 2;
+                        const ux = dx / chordLen, uy = dy / chordLen;
+                        const nx = -uy, ny = ux;
+                        // 旧 arc center の chord 法線方向の符号を保つ。
+                        const oldDx = oldEnd[0] - oldStart[0];
+                        const oldDy = oldEnd[1] - oldStart[1];
+                        const oldChordLen = Math.hypot(oldDx, oldDy) || 1;
+                        const oldNx = -oldDy / oldChordLen, oldNy = oldDx / oldChordLen;
+                        const oldMx = (oldStart[0] + oldEnd[0]) / 2;
+                        const oldMy = (oldStart[1] + oldEnd[1]) / 2;
+                        const oldSide = (arc.center[0] - oldMx) * oldNx + (arc.center[1] - oldMy) * oldNy;
+                        const sign = oldSide >= 0 ? 1 : -1;
+                        const d = Math.sqrt(Math.max(0, R * R - half * half));
+                        const newCx = Mx + sign * d * nx;
+                        const newCy = My + sign * d * ny;
+                        const newAStart = Math.atan2(newStart[1] - newCy, newStart[0] - newCx);
+                        const newAEnd = Math.atan2(newEnd[1] - newCy, newEnd[0] - newCx);
+                        entityPatches.set(arc.id, {
+                            kind: "arc",
+                            center: [newCx, newCy] as Vec2,
+                            radius: R,
+                            aStart: newAStart,
+                            aEnd: newAEnd,
+                        });
+                    }
+                }
+
+                // Apply entity updates → setSpaceEntities が polygon を再派生する。
+                // 再派生後は polygon outer が変わっているので、外部拘束 (= 矩形の
+                // Horizontal 等) が再派生で破られていないかを確認するため、
+                // ラッパループでもう一度 solveOnce を回す。`arcRederiveRequested`
+                // を立てて pendingResolveRequested と合流させる。
+                if (entityPatches.size > 0) {
+                    arcRederiveRequested = true;
+                    useAppState.getState().setSpaceEntities(spaceId, (entities) => entities.map((e) => {
+                        const p = entityPatches.get(e.id);
+                        if (!p) return e;
+                        if (p.kind === "polyline" && e.kind === "polyline") {
+                            return { ...e, points: p.points };
+                        }
+                        if (p.kind === "line" && e.kind === "line") {
+                            return {
+                                ...e,
+                                ...(p.p0 ? { p0: p.p0 } : {}),
+                                ...(p.p1 ? { p1: p.p1 } : {}),
+                            };
+                        }
+                        if (p.kind === "arc" && e.kind === "arc") {
+                            return {
+                                ...e,
+                                ...(p.center ? { center: p.center } : {}),
+                                ...(p.radius !== undefined ? { radius: p.radius } : {}),
+                                ...(p.aStart !== undefined ? { aStart: p.aStart } : {}),
+                                ...(p.aEnd !== undefined ? { aEnd: p.aEnd } : {}),
+                            };
+                        }
+                        return e;
+                    }));
+                    // 再派生後の polygon outer に既存壁の axis を追従させる。
+                    // (非弧 space と同じ wall sync を行わないと、ソルバ前の axis
+                    //  位置に壁が取り残されてしまう。)
+                    const post = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+                    if (post) {
+                        for (const polyId of bucket.keys()) {
+                            const updated = post.polygons.find((p) => p.id === polyId);
+                            if (!updated || !updated.wallIds || updated.wallThickness == null) continue;
+                            syncWallsToPolygonOuter(
+                                updated.outer,
+                                updated.wallIds,
+                                updated.wallThickness,
+                                (wallId, axis) => {
+                                    const w = useAppState.getState().elements[wallId] as WallElement | undefined;
+                                    if (!w || w.type !== "Wall") return;
+                                    const next: [Vec3, Vec3] = [
+                                        [axis[0][0], w.axis[0][1], axis[0][2]],
+                                        [axis[1][0], w.axis[1][1], axis[1][2]],
+                                    ];
+                                    const drift =
+                                        Math.abs(next[0][0] - w.axis[0][0]) + Math.abs(next[0][2] - w.axis[0][2]) +
+                                        Math.abs(next[1][0] - w.axis[1][0]) + Math.abs(next[1][2] - w.axis[1][2]);
+                                    if (drift < 1e-6) return;
+                                    useAppState.getState().updateElement(wallId, {
+                                        axis: next,
+                                        dirtyFlags: new Set([...(w.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                                    } as any);
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
             // Apply batched updates — re-read space each time so we see prior
             // updates from this same batch. Each polygon that owns walls gets
             // its wall axes re-synced from the post-solve outer ring, so the
@@ -660,6 +1169,8 @@ async function solveOnce(): Promise<void> {
             // 解のみを書き戻すと wallIds 等と長さがズレて壊れる。安全側で
             // 長さ不一致のときは patch を捨て、最新ポリゴンをそのまま残す。
             for (const [spaceId, bucket] of perSpaceUpdates) {
+                // 弧含み space は上で setSpaceEntities 経由で再派生済み。
+                if (arcAffectedSpaces.has(spaceId)) continue;
                 const latest = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
                 if (!latest) continue;
                 let newPolys = latest.polygons.map((p) => {
@@ -720,6 +1231,33 @@ async function solveOnce(): Promise<void> {
                 }
             }
 
+            // Column basePoint write-back: 自由 SketchPoint として登録した柱は
+            // ソルバが動かす可能性があるので、解の x/y を読み戻して basePoint
+            // を更新する。Y は元の値を維持。暴走検知 (= 大幅移動) は省略
+            // (拘束は通常 m オーダーで距離指定するので暴走しにくい想定)。
+            let anyColumnMoved = false;
+            for (const [columnId, pid] of columnPointIds) {
+                const latest = useAppState.getState().elements[columnId] as ColumnElement | undefined;
+                if (!latest || latest.type !== "Column") continue;
+                const prim = wrapper.sketch_index.get_primitive_or_fail(String(pid)) as any;
+                const newX = prim.x as number;
+                const newZ = prim.y as number;
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[SketchSolver/columnWriteback] col=${columnId.slice(0,6)} ` +
+                    `old=(${latest.basePoint[0].toFixed(3)},${latest.basePoint[2].toFixed(3)}) ` +
+                    `new=(${Number.isFinite(newX) ? newX.toFixed(3) : newX},${Number.isFinite(newZ) ? newZ.toFixed(3) : newZ})`,
+                );
+                if (!Number.isFinite(newX) || !Number.isFinite(newZ)) continue;
+                const drift = Math.abs(newX - latest.basePoint[0]) + Math.abs(newZ - latest.basePoint[2]);
+                if (drift < 1e-6) continue;
+                useAppState.getState().updateElement(columnId, {
+                    basePoint: [newX, latest.basePoint[1], newZ],
+                    dirtyFlags: new Set([...(latest.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                } as any);
+                anyColumnMoved = true;
+            }
+
             // Wall-axis write-back — standalone walls only. Owned walls were
             // pushed as fixed and are re-synced from their polygon above.
             for (const [wid, ids] of wallIds) {
@@ -737,6 +1275,23 @@ async function solveOnce(): Promise<void> {
                     axis: [ax, bx],
                     dirtyFlags: new Set([...(latest.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
                 } as any);
+            }
+
+            // 拘束追加で polygon outer が変わった場合、syncWallsToPolygonOuter
+            // で wall.axis は更新されるが **wall.footprint (= JunctionGraph の
+            // ミター済み fp)** は古いままで、レンダリング上 wall が古い位置に
+            // 取り残される。影響を受けた polygon を seed にして wallRegenerate
+            // をトリガし、ミター fp と柱クリップを再計算する。
+            const seedPolyIds: string[] = [];
+            for (const [, bucket] of perSpaceUpdates) {
+                for (const polyId of bucket.keys()) seedPolyIds.push(polyId);
+            }
+            if (seedPolyIds.length > 0 || anyColumnMoved) {
+                // 柱が動いた場合は seed 不要 (= 全部屋スコープで再計算)。
+                triggerWallRegenIfEnabled(
+                    "solver-writeback",
+                    seedPolyIds.length > 0 ? seedPolyIds : undefined,
+                );
             }
         } finally {
             solvingDepth--;
@@ -757,20 +1312,64 @@ function translateConstraint(
     grids: GridLine[],
     elements: Record<string, any>,
     arcEntityIds?: Map<string, { centerPoint: OID; circle: OID }>,
+    columnPointIds?: Map<string, OID>,
+    gridPointIds?: Map<string, OID>,
+    originPointId?: OID | null,
 ): any[] {
     const out: any[] = [];
 
+    // 外壁 outline polygon → 対応する inner polygon の id 解決ヘルパ。
+    // Outline は派生形状で solver 内で fixed: true として push されるため、
+    // ユーザが outline の頂点 / 辺をピックして拘束を付けても、その固定点は
+    // 動かせず制約が満たせない (= 矩形が暴れる)。inner にリダイレクトすれば
+    // solver が拘束対象として動かせるようになる。inner 側は wallSync を介して
+    // outline を再生成するので、結果として outline も同期して動く。
+    const innerPolyIdForOutline = (
+        spaceId: string, polyId: string,
+    ): string | null => {
+        const sp = elements[spaceId];
+        if (!sp || sp.type !== "Space" || !sp.polygons) return null;
+        const poly = sp.polygons.find((p: RoomPolygon) => p.id === polyId);
+        if (!poly || !poly.wallOutlineOf) return null;
+        return poly.wallOutlineOf as string;
+    };
+    const redirectSketchPolyId = (
+        spaceId: string, polyId: string, vertexIdx: number,
+    ): { polyId: string; vertexIdx: number } => {
+        const innerId = innerPolyIdForOutline(spaceId, polyId);
+        if (!innerId) return { polyId, vertexIdx };
+        // outline と inner は (現状) 同じ vertex 数で順序対応するので index は
+        // そのまま流用できる。万が一サイズが違う時は安全側で元の index を返す。
+        const sp = elements[spaceId];
+        const inner = sp?.polygons?.find((p: RoomPolygon) => p.id === innerId);
+        if (!inner) return { polyId, vertexIdx };
+        if (vertexIdx < 0 || vertexIdx >= inner.outer.length) {
+            return { polyId, vertexIdx };
+        }
+        return { polyId: innerId, vertexIdx };
+    };
+
     const pointIdFor = (t: ConstraintTarget): number | null => {
         if (t.kind === "SketchPoint") {
-            const ids = polyIds.get(`${t.spaceId}:${t.polyId}`);
+            const r = redirectSketchPolyId(t.spaceId as string, t.polyId, t.vertexIdx);
+            const ids = polyIds.get(`${t.spaceId}:${r.polyId}`);
             if (!ids) return null;
-            if (t.vertexIdx < 0 || t.vertexIdx >= ids.points.length) return null;
-            return ids.points[t.vertexIdx];
+            if (r.vertexIdx < 0 || r.vertexIdx >= ids.points.length) return null;
+            return ids.points[r.vertexIdx];
         }
         if (t.kind === "WallAxisPoint") {
             const ids = wallIds.get(t.wallId as string);
             if (!ids) return null;
             return t.endIdx === 0 ? ids.p1 : ids.p2;
+        }
+        if (t.kind === "Column") {
+            return columnPointIds?.get(t.columnId as string) ?? null;
+        }
+        if (t.kind === "GridPoint") {
+            return gridPointIds?.get(`${t.gridId}:${t.vertexIdx}`) ?? null;
+        }
+        if (t.kind === "Origin") {
+            return originPointId ?? null;
         }
         return null;
     };
@@ -783,7 +1382,10 @@ function translateConstraint(
     // since wall axes are pushed as a 2-vertex line primitive in solveOnce.
     const edgeIdsFor = (t: ConstraintTarget): { line: number; p1: number; p2: number } | null => {
         if (t.kind === "SketchEdge") {
-            const ids = polyIds.get(`${t.spaceId}:${t.polyId}`);
+            // outline edge → inner edge へリダイレクト (= pointIdFor と同じ理由)。
+            const innerId = innerPolyIdForOutline(t.spaceId as string, t.polyId);
+            const polyKey = innerId ? `${t.spaceId}:${innerId}` : `${t.spaceId}:${t.polyId}`;
+            const ids = polyIds.get(polyKey);
             if (!ids) return null;
             if (t.edgeIdx < 0 || t.edgeIdx >= ids.lines.length) return null;
             const [va, vb] = ids.edgeVerts[t.edgeIdx];
@@ -805,6 +1407,10 @@ function translateConstraint(
         return circleIds.get(`${t.spaceId}:${t.polyId}`) ?? null;
     };
 
+    // eslint-disable-next-line no-console
+    console.log("[translateConstraint]", c.type,
+        "targets=", c.targets.map((t) => t.kind),
+        "value=", c.value);
     switch (c.type) {
         case "Horizontal": {
             const edge = c.targets[0];
@@ -821,16 +1427,35 @@ function translateConstraint(
             break;
         }
         case "Length": {
+            if (c.value === undefined) return out;
+            // パターン1: targets[0] が edge → 既存の長さ拘束。
             const edge = c.targets[0];
-            const ids = edgeIdsFor(edge);
-            if (!ids || c.value === undefined) return out;
-            out.push({
-                type: "p2p_distance",
-                id: String(idAlloc.next()),
-                p1_id: String(ids.p1),
-                p2_id: String(ids.p2),
-                distance: c.value,
-            });
+            const eIds = edgeIdsFor(edge);
+            if (eIds) {
+                out.push({
+                    type: "p2p_distance",
+                    id: String(idAlloc.next()),
+                    p1_id: String(eIds.p1),
+                    p2_id: String(eIds.p2),
+                    distance: c.value,
+                });
+                break;
+            }
+            // パターン2: targets[0]/[1] が点ライク (SketchPoint / WallAxisPoint /
+            // Column / GridPoint / Origin) → 2 点間距離。
+            if (c.targets.length >= 2) {
+                const p1 = pointIdFor(c.targets[0]);
+                const p2 = pointIdFor(c.targets[1]);
+                if (p1 != null && p2 != null) {
+                    out.push({
+                        type: "p2p_distance",
+                        id: String(idAlloc.next()),
+                        p1_id: String(p1),
+                        p2_id: String(p2),
+                        distance: c.value,
+                    });
+                }
+            }
             break;
         }
         case "Parallel": {
@@ -890,19 +1515,153 @@ function translateConstraint(
             break;
         }
         case "PerpDistance": {
-            // Perpendicular distance from a point to an edge's infinite line.
+            // Perpendicular distance from a point to a line (= edge / wall axis /
+            // 通芯線)。点側は SketchPoint / WallAxisPoint / Column / GridPoint /
+            // Origin、線側は SketchEdge / WallAxis / Grid を受け付ける。
             if (c.targets.length < 2 || c.value === undefined) return out;
-            const pt = c.targets.find((t) => t.kind === "SketchPoint");
-            const edge = c.targets.find((t) => t.kind === "SketchEdge");
-            if (!pt || !edge || pt.kind !== "SketchPoint" || edge.kind !== "SketchEdge") return out;
+            const pointKinds = new Set([
+                "SketchPoint", "WallAxisPoint", "Column", "GridPoint", "Origin",
+            ]);
+            const lineKinds = new Set(["SketchEdge", "WallAxis", "Grid"]);
+            const pt = c.targets.find((t) => pointKinds.has(t.kind));
+            const ln = c.targets.find((t) => lineKinds.has(t.kind));
+            // 点側の現ワールド座標 (xz 平面) — 線の向き決定に使う。
+            const pointWorldXZ = (
+                target: ConstraintTarget,
+            ): [number, number] | null => {
+                if (target.kind === "SketchPoint") {
+                    const sp = elements[target.spaceId as string];
+                    if (!sp || sp.type !== "Space") return null;
+                    const r = redirectSketchPolyId(
+                        target.spaceId as string, target.polyId, target.vertexIdx,
+                    );
+                    const poly = (sp.polygons ?? []).find((p: RoomPolygon) => p.id === r.polyId);
+                    const v = poly?.outer?.[r.vertexIdx];
+                    return v ? [v[0], v[1]] : null;
+                }
+                if (target.kind === "WallAxisPoint") {
+                    const w = elements[target.wallId as string] as WallElement | undefined;
+                    if (!w || w.type !== "Wall") return null;
+                    const a = w.axis[target.endIdx];
+                    return [a[0], a[2]];
+                }
+                if (target.kind === "Column") {
+                    const col = elements[target.columnId as string] as ColumnElement | undefined;
+                    if (!col || !col.basePoint) return null;
+                    return [col.basePoint[0], col.basePoint[2]];
+                }
+                if (target.kind === "GridPoint") {
+                    const g = grids.find((gg) => gg.id === target.gridId);
+                    if (!g) return null;
+                    const verts = gridVertices(g.curve);
+                    const v = verts[target.vertexIdx];
+                    return v ? [v[0], v[2]] : null;
+                }
+                if (target.kind === "Origin") return [0, 0];
+                return null;
+            };
+            // eslint-disable-next-line no-console
+            console.log("[SketchSolver/PerpDistance]",
+                "targets=", c.targets.map((t) => t.kind),
+                "pt=", pt?.kind, "ln=", ln?.kind, "value=", c.value);
+            if (!pt || !ln) return out;
             const pid = pointIdFor(pt);
-            const eids = edgeIdsFor(edge);
-            if (pid == null || !eids) return out;
+            // eslint-disable-next-line no-console
+            console.log("  pid=", pid,
+                "columnPointIds.size=", columnPointIds?.size ?? "undef",
+                "ln.kind=", ln.kind);
+            if (pid == null) return out;
+            // 線 ID の解決:
+            //   SketchEdge / WallAxis → 既存 edgeIdsFor (.line) を使う
+            //   Grid                → grid.start/end を fixed point として push
+            //                          + line を即席で作る
+            let lineId: number | null = null;
+            if (ln.kind === "SketchEdge" || ln.kind === "WallAxis") {
+                const eids = edgeIdsFor(ln);
+                lineId = eids?.line ?? null;
+            } else if (ln.kind === "Grid") {
+                const grid = grids.find((g) => g.id === ln.gridId);
+                const verts = grid ? gridVertices(grid.curve) : [];
+                // eslint-disable-next-line no-console
+                console.log("  Grid lookup gridId=", ln.gridId,
+                    "grid=", grid ? grid.curve.type : "null",
+                    "verts.length=", verts.length);
+                if (verts.length >= 2) {
+                    const a = verts[0];
+                    const b = verts[verts.length - 1];
+                    const ex = b[0] - a[0];
+                    const ez = b[2] - a[2];
+                    // 軸平行判定は **相対** トレランスで行う。マウス作図は浮動小数で
+                    // 微小な傾きが入るので 1e-6 m の絶対判定は厳しすぎ、ほぼ水平な
+                    // 通芯が「斜め」扱いされて p2l_distance フォールバックに落ちる。
+                    // 相対比 0.1% 未満なら axis-aligned と見なす。
+                    const lineLen = Math.hypot(ex, ez);
+                    const axisRel = lineLen > 1e-9 ? 1e-3 : 0;
+                    const isVertical = Math.abs(ex) <= axisRel * lineLen;     // 縦線 (= X 一定)
+                    const isHorizontal = Math.abs(ez) <= axisRel * lineLen;   // 横線 (= Z 一定)
+                    const pw = pointWorldXZ(pt);
+                    // 軸平行な通芯では p2l_distance (= 符号無し) の左右両解曖昧性
+                    // を避けるため、coordinate_x / coordinate_y で点座標を直接
+                    // 固定する。値の符号は点の現在側に合わせて決める (= 線越しに
+                    // 反転しないので矩形が潰れない)。
+                    if (isVertical && pw) {
+                        // 縦の通芯: 点の x を G ± D に固定
+                        const G = a[0];
+                        const sign = pw[0] >= G ? +1 : -1;
+                        out.push({
+                            type: "coordinate_x",
+                            id: String(idAlloc.next()),
+                            p_id: String(pid),
+                            x: G + sign * c.value,
+                        });
+                        // eslint-disable-next-line no-console
+                        console.log("  → coordinate_x p_id=", pid,
+                            "x=", G + sign * c.value, "side=", sign);
+                        break;
+                    }
+                    if (isHorizontal && pw) {
+                        // 横の通芯: 点の z (GCS の y) を G ± D に固定
+                        const G = a[2];
+                        const sign = pw[1] >= G ? +1 : -1;
+                        out.push({
+                            type: "coordinate_y",
+                            id: String(idAlloc.next()),
+                            p_id: String(pid),
+                            y: G + sign * c.value,
+                        });
+                        // eslint-disable-next-line no-console
+                        console.log("  → coordinate_y p_id=", pid,
+                            "y=", G + sign * c.value, "side=", sign);
+                        break;
+                    }
+                    // 斜めの通芯: p2l_distance フォールバック (= 符号無し距離)。
+                    // 点の現在側に応じて線端点 a↔b の向きを反転し、
+                    // p2l_distance が符号付きで実装されている場合に矩形が
+                    // 反対側へ反転して潰れるのを防ぐ。
+                    let aa = a, bb = b;
+                    if (pw) {
+                        const dx = pw[0] - a[0], dz = pw[1] - a[2];
+                        // 符号付き距離分子: dx*ez - dz*ex
+                        const signed = dx * ez - dz * ex;
+                        if (signed < 0) { aa = b; bb = a; }
+                    }
+                    const ga = idAlloc.next();
+                    const gb = idAlloc.next();
+                    const gl = idAlloc.next();
+                    out.push({ type: "point", id: String(ga), x: aa[0], y: aa[2], fixed: true });
+                    out.push({ type: "point", id: String(gb), x: bb[0], y: bb[2], fixed: true });
+                    out.push({ type: "line",  id: String(gl), p1_id: String(ga), p2_id: String(gb) });
+                    lineId = gl;
+                }
+            }
+            // eslint-disable-next-line no-console
+            console.log("  lineId=", lineId);
+            if (lineId == null) return out;
             out.push({
                 type: "p2l_distance",
                 id: String(idAlloc.next()),
                 p_id: String(pid),
-                l_id: String(eids.line),
+                l_id: String(lineId),
                 distance: c.value,
             });
             break;

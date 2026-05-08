@@ -1,7 +1,6 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
-import { Plus } from "lucide-react";
+import React, { useMemo } from "react";
 import { useAppState, AppState } from "../../application/AppState";
 import { buildTree, useTreeStore } from "../../state/tree/TreeStore";
 import TreeNodeComponent from "./TreeNodeComponent";
@@ -18,10 +17,6 @@ export default function TreePanel() {
     const setPendingRoomLevel = useAppState((s: AppState) => s.setPendingRoomLevel);
     const grids = useAppState((s: AppState) => s.grids);
     const setSelectedGridIds = useAppState((s: AppState) => s.setSelectedGridIds);
-
-    const [showAddLevel, setShowAddLevel] = useState(false);
-    const [newLevelName, setNewLevelName] = useState("");
-    const [newLevelElevation, setNewLevelElevation] = useState("");
 
     const tree = useMemo(
         () => buildTree(levels, elements, activeLevelId, grids),
@@ -62,64 +57,21 @@ export default function TreePanel() {
     };
 
     const handleAddLevel = () => {
-        const name = newLevelName.trim() || `Level ${levels.length + 1}`;
-        // User enters the elevation in millimeters (per placeholder) but the
-        // rest of the scene uses meters for Y — convert here so higher-level
-        // code can stay unit-consistent with walls, beams, slabs, etc.
-        const elevationMm = parseFloat(newLevelElevation) || 0;
-        addLevel(name, elevationMm / 1000);
-        setNewLevelName("");
-        setNewLevelElevation("");
-        setShowAddLevel(false);
+        // 既存レベルの最大標高 + 3000mm を新レベルの標高にする (= 直下階の
+        // 上に階高 3m で積み上げ)。既存レベルが無ければ 0m から開始。
+        const maxElevation = levels.length > 0
+            ? Math.max(...levels.map((l) => l.elevation))
+            : -3.0;
+        const newElevation = maxElevation + 3.0;
+        const name = `Level ${levels.length + 1}`;
+        addLevel(name, newElevation);
     };
 
     return (
         <div className="flex flex-col h-full">
             <div className="flex items-center justify-between px-2 pt-2 pb-1 shrink-0">
                 <h2 className="text-xs text-zinc-400 font-bold uppercase">Project Tree</h2>
-                <button
-                    className="w-5 h-5 flex items-center justify-center rounded hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200"
-                    onClick={() => setShowAddLevel(!showAddLevel)}
-                    title="Add Level"
-                >
-                    <Plus size={14} />
-                </button>
             </div>
-
-            {showAddLevel && (
-                <div className="mx-2 mb-2 p-2 bg-zinc-800 rounded border border-zinc-700 space-y-1.5">
-                    <input
-                        className="w-full bg-zinc-900 border border-zinc-600 rounded px-2 py-1 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-blue-500"
-                        placeholder="Level name"
-                        value={newLevelName}
-                        onChange={(e) => setNewLevelName(e.target.value)}
-                        onKeyDown={(e) => e.key === "Enter" && handleAddLevel()}
-                        autoFocus
-                    />
-                    <input
-                        className="w-full bg-zinc-900 border border-zinc-600 rounded px-2 py-1 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-blue-500"
-                        placeholder="Elevation (mm)"
-                        type="number"
-                        value={newLevelElevation}
-                        onChange={(e) => setNewLevelElevation(e.target.value)}
-                        onKeyDown={(e) => e.key === "Enter" && handleAddLevel()}
-                    />
-                    <div className="flex gap-1">
-                        <button
-                            className="flex-1 bg-blue-600 hover:bg-blue-500 text-white text-xs py-1 rounded"
-                            onClick={handleAddLevel}
-                        >
-                            Add
-                        </button>
-                        <button
-                            className="flex-1 bg-zinc-700 hover:bg-zinc-600 text-zinc-300 text-xs py-1 rounded"
-                            onClick={() => setShowAddLevel(false)}
-                        >
-                            Cancel
-                        </button>
-                    </div>
-                </div>
-            )}
 
             {activeLevelId && (
                 <div className="mx-2 mb-1 px-2 py-1 bg-blue-600/20 border border-blue-500/30 rounded text-xs text-blue-300">
@@ -135,6 +87,7 @@ export default function TreePanel() {
                     onSelectGrid={handleSelectGrid}
                     onLevelAction={handleLevelAction}
                     onAddRoom={handleAddRoom}
+                    onAddLevel={handleAddLevel}
                     activeLevelId={activeLevelId}
                 />
             </div>

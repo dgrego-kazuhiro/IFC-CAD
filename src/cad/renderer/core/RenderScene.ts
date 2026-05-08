@@ -23,6 +23,17 @@ export interface RenderObject {
      * is back-facing for the current camera angle.
      */
     noCull?: boolean;
+    /**
+     * 円筒 (= 円形 polygon の壁) の見た目を完全に滑らかに保つためのヒント。
+     * これが指定されていると、フラグメントシェーダは補間された頂点法線を
+     * 使わず、`(worldPos - cylinderCenter)` から **位置ベースの放射方向**
+     * を計算して法線として使う。これにより 24-segment ポリゴンプリズムでも
+     * 「真円柱の Lambertian 陰影」のように滑らかな輝度勾配で描画される
+     * (chord ファセットや対角補間アーティファクトが完全に消える)。
+     * 内側面 (中心向き) と外側面 (外向き) の判別は元の頂点法線との dot 符号で
+     * 自動判定する。
+     */
+    cylinderCenter?: [number, number, number];
 }
 
 export class RenderScene {

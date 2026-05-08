@@ -4,6 +4,8 @@ import { useAppState } from '../../application/AppState';
 import { WallElement } from '../../model/elements/WallElement';
 import { ElementId } from '../../model/base/ElementId';
 import { Vec3 } from '../../geometry/math/Vec3';
+import { WallTypeOverride } from '../../model/catalog/ElementTypeDef';
+import { effectiveWallType } from '../../model/catalog/TypeResolver';
 import { mat4 } from 'gl-matrix';
 
 export class CreateWallCommand implements Command {
@@ -11,11 +13,12 @@ export class CreateWallCommand implements Command {
 
     constructor(
         public axis: [Vec3, Vec3],
-        public thickness: number = 0.2, // 200mm default
-        public height: number = 3.0,    // 3m height default
+        /** WallType の id。AppState.types から引いて thickness / locationLine を導出。 */
+        public typeId: ElementId,
+        public height: number = 3.0,
         id?: ElementId,
         public baseLevelId?: ElementId,
-        public locationLine: WallElement["locationLine"] = "Center",
+        public overrides?: WallTypeOverride,
     ) {
         this.elementId = id || (Math.random().toString(36).substring(2, 11) as ElementId);
     }
@@ -26,7 +29,11 @@ export class CreateWallCommand implements Command {
 
     execute(): CommandResult {
         const state = useAppState.getState();
-        
+        const eff = effectiveWallType(state.types, this.typeId, this.overrides);
+        if (!eff) {
+            return { success: false, message: `WallType not found: ${this.typeId}` };
+        }
+
         const newWall: WallElement = {
             id: this.elementId,
             type: "Wall",
@@ -34,24 +41,27 @@ export class CreateWallCommand implements Command {
             visible: true,
             locked: false,
             transform: mat4.create(),
-            dirtyFlags: new Set(["Geometry", "Mesh", "Render", "Topology"]), // Needs to be built
+            dirtyFlags: new Set(["Geometry", "Mesh", "Render", "Topology"]),
             shape: null,
+            typeId: this.typeId,
+            overrides: this.overrides,
             axis: this.axis,
-            thickness: this.thickness,
+            // Type 由来のキャッシュ。Type 変更時に再投影。
+            thickness: eff.thickness,
             height: this.height,
             baseOffset: 0,
             topOffset: 0,
-            locationLine: this.locationLine,
+            locationLine: eff.locationLine,
             baseLevelId: this.baseLevelId,
             joinStart: true,
             joinEnd: true,
             openings: []
         };
-        
+
         state.addElement(newWall);
         return { success: true };
     }
-    
+
     undo(): CommandResult {
         const state = useAppState.getState();
         state.removeElement(this.elementId);

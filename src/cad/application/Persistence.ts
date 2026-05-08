@@ -57,25 +57,62 @@ function snapshot(): PersistedScene {
 
 export function saveScene(): boolean {
     try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot(), replacer));
+        const snap = snapshot();
+        const json = JSON.stringify(snap, replacer);
+        localStorage.setItem(STORAGE_KEY, json);
+        // eslint-disable-next-line no-console
+        console.log(
+            `[saveScene] ok bytes=${json.length} ` +
+            `elements=${Object.keys(snap.elements).length} ` +
+            `grids=${snap.grids.length} ` +
+            `levels=${snap.levels.length} ` +
+            `activeLevelId=${snap.activeLevelId} ` +
+            `constraints=${Object.keys(snap.constraints).length}`,
+        );
+        // eslint-disable-next-line no-console
+        console.log("[saveScene] levels content:", snap.levels);
         return true;
     } catch (e) {
-        console.warn("saveScene failed:", e);
+        // eslint-disable-next-line no-console
+        console.warn("[saveScene] FAILED:", e);
         return false;
     }
 }
 
 export function loadScene(): boolean {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return false;
+    if (!raw) {
+        // eslint-disable-next-line no-console
+        console.log("[loadScene] no saved data in localStorage");
+        return false;
+    }
     let data: PersistedScene;
     try {
         data = JSON.parse(raw, reviver) as PersistedScene;
     } catch (e) {
-        console.warn("loadScene: parse failed:", e);
+        // eslint-disable-next-line no-console
+        console.warn("[loadScene] parse failed:", e);
         return false;
     }
-    if (data.schemaVersion !== SCHEMA_VERSION) return false;
+    if (data.schemaVersion !== SCHEMA_VERSION) {
+        // eslint-disable-next-line no-console
+        console.warn(
+            `[loadScene] schema version mismatch: saved=${data.schemaVersion} ` +
+            `current=${SCHEMA_VERSION}`,
+        );
+        return false;
+    }
+    // eslint-disable-next-line no-console
+    console.log(
+        `[loadScene] reading bytes=${raw.length} ` +
+        `elements=${Object.keys(data.elements ?? {}).length} ` +
+        `grids=${(data.grids ?? []).length} ` +
+        `levels=${(data.levels ?? []).length} ` +
+        `activeLevelId=${data.activeLevelId} ` +
+        `constraints=${Object.keys(data.constraints ?? {}).length}`,
+    );
+    // eslint-disable-next-line no-console
+    console.log("[loadScene] levels content:", data.levels);
     // Force every element to regenerate derived geometry/mesh on first render
     // after load by dropping `shape` and raising all build-related dirty flags.
     const restored: Record<string, any> = {};

@@ -4,7 +4,8 @@ import { useAppState } from "../../application/AppState";
 import { BeamElement, BeamZJustification, BeamKind } from "../../model/elements/BeamElement";
 import { ElementId } from "../../model/base/ElementId";
 import { Vec3 } from "../../geometry/math/Vec3";
-import { Profile, RectangleProfile } from "../../model/profiles/Profile";
+import { BeamTypeOverride } from "../../model/catalog/ElementTypeDef";
+import { effectiveBeamType } from "../../model/catalog/TypeResolver";
 import { mat4 } from "gl-matrix";
 
 let nextId = 0;
@@ -18,12 +19,14 @@ export class CreateBeamCommand implements Command {
 
     constructor(
         public axis: [Vec3, Vec3],
-        public profile: Profile = { kind: "Rectangle", width: 0.3, depth: 0.6 } as RectangleProfile,
+        /** BeamType の id。AppState.types から引いて profile を導出。 */
+        public typeId: ElementId,
         public topOffset: number = 0,
         public zJustification: BeamZJustification = "Top",
         public rotation: number = 0,
         public levelId?: ElementId,
         public kind: BeamKind = "Structural",
+        public overrides?: BeamTypeOverride,
         id?: ElementId,
     ) {
         this.elementId = id ?? genId();
@@ -33,6 +36,10 @@ export class CreateBeamCommand implements Command {
 
     execute(): CommandResult {
         const state = useAppState.getState();
+        const eff = effectiveBeamType(state.types, this.typeId, this.overrides);
+        if (!eff) {
+            return { success: false, message: `BeamType not found: ${this.typeId}` };
+        }
         const beam: BeamElement = {
             id: this.elementId,
             type: "Beam",
@@ -42,8 +49,10 @@ export class CreateBeamCommand implements Command {
             transform: mat4.create(),
             dirtyFlags: new Set(["Geometry", "Mesh", "Render"]),
             shape: null,
+            typeId: this.typeId,
+            overrides: this.overrides,
+            profile: eff.profile,
             axis: this.axis,
-            profile: this.profile,
             levelId: this.levelId,
             topOffset: this.topOffset,
             zJustification: this.zJustification,

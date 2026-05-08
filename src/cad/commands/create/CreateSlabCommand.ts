@@ -5,6 +5,8 @@ import { SlabElement } from "../../model/elements/SlabElement";
 import { SpaceElement } from "../../model/elements/SpaceElement";
 import { ElementId } from "../../model/base/ElementId";
 import { Vec2 } from "../../geometry/math/Vec2";
+import { SlabTypeOverride } from "../../model/catalog/ElementTypeDef";
+import { effectiveSlabType } from "../../model/catalog/TypeResolver";
 import { mat4 } from "gl-matrix";
 import polygonClipping from "polygon-clipping";
 
@@ -83,11 +85,13 @@ export class CreateSlabCommand implements Command {
 
     constructor(
         public boundary: Vec2[],
-        public thickness: number = 0.2,
+        /** SlabType の id。AppState.types から引いて thickness を導出。 */
+        public typeId: ElementId,
         public elevation: number = 0,
         public holes: Vec2[][] = [],
         public levelId?: ElementId,
         public sourceSpaceId?: ElementId,
+        public overrides?: SlabTypeOverride,
     ) {
         this.slabId = genId();
     }
@@ -95,7 +99,7 @@ export class CreateSlabCommand implements Command {
     getSlabId(): ElementId { return this.slabId; }
 
     /** Convenience: build a CreateSlabCommand from a Space. */
-    static fromSpace(spaceId: ElementId, thickness = 0.2): CreateSlabCommand | null {
+    static fromSpace(spaceId: ElementId, typeId: ElementId): CreateSlabCommand | null {
         const state = useAppState.getState();
         const space = state.elements[spaceId] as SpaceElement | undefined;
         if (!space || space.type !== "Space") return null;
@@ -103,7 +107,7 @@ export class CreateSlabCommand implements Command {
         if (!profile) return null;
         return new CreateSlabCommand(
             profile.outer,
-            thickness,
+            typeId,
             0,
             profile.holes,
             space.levelId,
@@ -113,6 +117,10 @@ export class CreateSlabCommand implements Command {
 
     execute(): CommandResult {
         const state = useAppState.getState();
+        const eff = effectiveSlabType(state.types, this.typeId, this.overrides);
+        if (!eff) {
+            return { success: false, message: `SlabType not found: ${this.typeId}` };
+        }
         const slab: SlabElement = {
             id: this.slabId,
             type: "Slab",
@@ -122,9 +130,11 @@ export class CreateSlabCommand implements Command {
             transform: mat4.create(),
             dirtyFlags: new Set(["Geometry", "Mesh", "Render"]),
             shape: null,
+            typeId: this.typeId,
+            overrides: this.overrides,
             boundary: this.boundary,
             holes: this.holes.length > 0 ? this.holes : undefined,
-            thickness: this.thickness,
+            thickness: eff.thickness,
             elevation: this.elevation,
             levelId: this.levelId,
         };

@@ -4,7 +4,8 @@ import { useAppState } from "../../application/AppState";
 import { ColumnElement, ColumnKind } from "../../model/elements/ColumnElement";
 import { ElementId } from "../../model/base/ElementId";
 import { Vec3 } from "../../geometry/math/Vec3";
-import { Profile, RectangleProfile } from "../../model/profiles/Profile";
+import { ColumnTypeOverride } from "../../model/catalog/ElementTypeDef";
+import { effectiveColumnType } from "../../model/catalog/TypeResolver";
 import { mat4 } from "gl-matrix";
 
 let nextId = 0;
@@ -18,13 +19,15 @@ export class CreateColumnCommand implements Command {
 
     constructor(
         public basePoint: Vec3,
-        public profile: Profile = { kind: "Rectangle", width: 0.4, depth: 0.4 } as RectangleProfile,
+        /** ColumnType の id。AppState.types から引いて profile を導出。 */
+        public typeId: ElementId,
         public baseLevelId?: ElementId,
         public topLevelId?: ElementId,
         public baseOffset: number = 0,
         public topOffset: number = 0,
         public rotation: number = 0,
         public kind: ColumnKind = "Structural",
+        public overrides?: ColumnTypeOverride,
         id?: ElementId,
     ) {
         this.elementId = id ?? genId();
@@ -43,6 +46,11 @@ export class CreateColumnCommand implements Command {
             }
         }
 
+        const eff = effectiveColumnType(state.types, this.typeId, this.overrides);
+        if (!eff) {
+            return { success: false, message: `ColumnType not found: ${this.typeId}` };
+        }
+
         const column: ColumnElement = {
             id: this.elementId,
             type: "Column",
@@ -52,8 +60,11 @@ export class CreateColumnCommand implements Command {
             transform: mat4.create(),
             dirtyFlags: new Set(["Geometry", "Mesh", "Render"]),
             shape: null,
+            typeId: this.typeId,
+            overrides: this.overrides,
+            // profile は Type+overrides 由来のキャッシュ。Type 変更時に再投影。
+            profile: eff.profile,
             basePoint: this.basePoint,
-            profile: this.profile,
             baseLevelId: this.baseLevelId,
             topLevelId: this.topLevelId,
             baseOffset: this.baseOffset,

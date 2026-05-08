@@ -1,9 +1,12 @@
 import { MeshData } from "../MeshData";
 import { AABB } from "../../geometry/primitives/AABB";
 import { Vec3 } from "../../geometry/math/Vec3";
+import { Vec2 } from "../../geometry/math/Vec2";
 import { vec3 } from "gl-matrix";
 import { BeamElement, BeamZJustification } from "../../model/elements/BeamElement";
 import { Profile } from "../../model/profiles/Profile";
+import polygonClipping, { type Pair, type Ring } from "polygon-clipping";
+import earcut from "earcut";
 
 export interface BeamMeshParams {
     axis: [Vec3, Vec3];
@@ -12,6 +15,10 @@ export interface BeamMeshParams {
     topY: number;
     zJustification: BeamZJustification;
     rotation: number;
+    /** 柱フットプリント (XZ 2D, CCW)。指定されると beam の水平断面から
+     *  Clipper diff で柱を引き、残ったピース毎に独立した押し出し体を作る。
+     *  rotation === 0 の梁にのみ適用 (回転梁は元実装で押し出し)。 */
+    columnFootprints?: Vec2[][];
 }
 
 function profileBox(profile: Profile): { width: number; depth: number } {
@@ -34,18 +41,23 @@ function profileBox(profile: Profile): { width: number; depth: number } {
  * - rotation rotates the profile around the axis (radians)
  */
 export class BeamMeshBuilder {
-    public static buildFromElement(el: BeamElement, topY: number): MeshData {
+    public static buildFromElement(
+        el: BeamElement,
+        topY: number,
+        columnFootprints?: Vec2[][],
+    ): MeshData {
         return BeamMeshBuilder.build({
             axis: el.axis,
             profile: el.profile,
             topY,
             zJustification: el.zJustification,
             rotation: el.rotation,
+            columnFootprints,
         });
     }
 
     public static build(p: BeamMeshParams): MeshData {
-        const { axis, profile, topY, zJustification, rotation } = p;
+        const { axis, profile, topY, zJustification, rotation, columnFootprints } = p;
         const [a, b] = axis;
         const dx = b[0] - a[0];
         const dz = b[2] - a[2];
@@ -104,6 +116,48 @@ export class BeamMeshBuilder {
         const t2 = makeCorner(1,  halfW,  halfD);
         const t3 = makeCorner(1, -halfW,  halfD);
 
+        // 回転 0 + 柱フットプリントが指定されているケースは、Clipper で梁の
+        // 水平断面から柱を引き算してから押し出す経路に切り替える。これで柱の
+        // 形状が梁から打ち抜かれ、柱優先の見た目になる。
+        if (columnFootprints && columnFootprints.length > 0 && Math.abs(rotation) < 1e-6) {
+            const yBottom = yCenter - halfD;
+            const yTop = yCenter + halfD;
+            // beamRing: 上から見た梁の 4 頂点。CCW を保証するため signed area を
+            // 確認 (axis dir と n の関係でどちらにもなり得る)。
+            const r0: Pair = [b0[0], b0[2]]; // start, -n
+            const r1: Pair = [b1[0], b1[2]]; // start, +n
+            const r2: Pair = [b2[0], b2[2]]; // end,   +n
+            const r3: Pair = [b3[0], b3[2]]; // end,   -n
+            const beamRing: Pair[] = [r0, r1, r2, r3];
+            // signed area (CCW > 0) を見て必要なら反転。
+            let sa = 0;
+            for (let i = 0; i < beamRing.length; i++) {
+                const x = beamRing[i], y = beamRing[(i + 1) % beamRing.length];
+                sa += x[0] * y[1] - y[0] * x[1];
+            }
+            const ringCCW: Pair[] = sa < 0 ? [...beamRing].reverse() : beamRing;
+            const intersecting: Ring[][] = [];
+            for (const col of columnFootprints) {
+                if (col.length < 3) continue;
+                const colRing: Pair[] = col.map<Pair>((p) => [p[0], p[1]]);
+                try {
+                    const inter = polygonClipping.intersection([ringCCW], [colRing]);
+                    if (inter.length > 0) intersecting.push([colRing]);
+                } catch { /* ignore */ }
+            }
+            if (intersecting.length > 0) {
+                let pieces: Ring[][] | null = null;
+                try {
+                    pieces = polygonClipping.difference([ringCCW], ...intersecting);
+                } catch {
+                    pieces = null;
+                }
+                if (pieces) {
+                    return buildExtrudedPiecesMesh(pieces, yBottom, yTop);
+                }
+            }
+        }
+
         const positions: number[] = [];
         const normals: number[] = [];
         const indices: number[] = [];
@@ -158,5 +212,106 @@ function emptyMesh(): MeshData {
         indices: new Uint32Array(),
         edgeIndices: new Uint32Array(),
         bounds: { min: [0, 0, 0], max: [0, 0, 0] },
+    };
+}
+
+/**
+ * polygon-clipping.difference の結果 (= 0+ の polygon ピース) を yBottom..yTop
+ * の高さで押し出して、1 つの MeshData に統合する。
+ * 各ピースの outer ring (CCW) を上から見た時の +Y 法線で天井、 -Y で床を組み、
+ * 側面は ring の各エッジから 4 頂点 quad を作る。
+ */
+function buildExtrudedPiecesMesh(
+    pieces: Ring[][],
+    yBottom: number,
+    yTop: number,
+): MeshData {
+    const positions: number[] = [];
+    const normals: number[] = [];
+    const indices: number[] = [];
+    const edges: number[] = [];
+
+    const addTri = (p0: Vec3, p1: Vec3, p2: Vec3) => {
+        const idx0 = positions.length / 3;
+        positions.push(...p0, ...p1, ...p2);
+        const v1 = vec3.subtract(vec3.create(), p1, p0);
+        const v2 = vec3.subtract(vec3.create(), p2, p0);
+        const n = vec3.cross(vec3.create(), v1, v2);
+        vec3.normalize(n, n);
+        for (let i = 0; i < 3; i++) normals.push(...n);
+        indices.push(idx0, idx0 + 1, idx0 + 2);
+    };
+    const addEdge = (p0: Vec3, p1: Vec3) => {
+        const i0 = positions.length / 3;
+        positions.push(...p0);
+        normals.push(0, 1, 0);
+        const i1 = positions.length / 3;
+        positions.push(...p1);
+        normals.push(0, 1, 0);
+        edges.push(i0, i1);
+    };
+
+    for (const piece of pieces) {
+        const ring = piece[0];
+        if (!ring || ring.length < 4) continue;
+        // ring は末尾 = 先頭で閉じている。open list で扱う。
+        const open: Pair[] = ring.slice(0, -1);
+        // 上面 (earcut, +Y 法線) — earcut の出力は CCW なので CW に反転して +Y。
+        const flat: number[] = [];
+        for (const p of open) flat.push(p[0], p[1]);
+        const tris = earcut(flat, undefined, 2);
+        for (let i = 0; i < tris.length; i += 3) {
+            const a = tris[i], b = tris[i + 1], c = tris[i + 2];
+            const pa: Vec3 = [open[a][0], yTop, open[a][1]];
+            const pb: Vec3 = [open[b][0], yTop, open[b][1]];
+            const pc: Vec3 = [open[c][0], yTop, open[c][1]];
+            addTri(pc, pb, pa); // reverse → +Y
+        }
+        // 下面 (-Y) は元の winding のままで -Y 法線。
+        for (let i = 0; i < tris.length; i += 3) {
+            const a = tris[i], b = tris[i + 1], c = tris[i + 2];
+            const pa: Vec3 = [open[a][0], yBottom, open[a][1]];
+            const pb: Vec3 = [open[b][0], yBottom, open[b][1]];
+            const pc: Vec3 = [open[c][0], yBottom, open[c][1]];
+            addTri(pa, pb, pc);
+        }
+        // 側面 (ring の各エッジから 4 頂点 quad)。CCW ring なら外向き法線。
+        for (let i = 0; i < open.length; i++) {
+            const j = (i + 1) % open.length;
+            const a: Vec3 = [open[i][0], yBottom, open[i][1]];
+            const b: Vec3 = [open[j][0], yBottom, open[j][1]];
+            const at: Vec3 = [open[i][0], yTop, open[i][1]];
+            const bt: Vec3 = [open[j][0], yTop, open[j][1]];
+            // 2 三角形 (a, at, bt) + (a, bt, b)
+            addTri(a, at, bt);
+            addTri(a, bt, b);
+            // シルエット用エッジ
+            addEdge(a, b);
+            addEdge(at, bt);
+            addEdge(a, at);
+        }
+    }
+
+    const posArray = new Float32Array(positions);
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    if (posArray.length > 0) {
+        for (let i = 0; i < posArray.length; i += 3) {
+            const x = posArray[i], y = posArray[i + 1], z = posArray[i + 2];
+            if (x < minX) minX = x; if (x > maxX) maxX = x;
+            if (y < minY) minY = y; if (y > maxY) maxY = y;
+            if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+        }
+    } else {
+        minX = minY = minZ = 0;
+        maxX = maxY = maxZ = 0;
+    }
+    const bounds: AABB = { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
+    return {
+        positions: posArray,
+        normals: new Float32Array(normals),
+        indices: new Uint32Array(indices),
+        edgeIndices: new Uint32Array(edges),
+        bounds,
     };
 }

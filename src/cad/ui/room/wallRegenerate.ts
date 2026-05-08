@@ -30,15 +30,21 @@ import {
     applyCaps,
     virtualEdgeFootprint,
     type ColumnFootprint,
+    type EdgeThicknessMap,
+    makeEdgeThicknessKey,
 } from "../../topology/junctions/JunctionGraph";
 import { ColumnElement } from "../../model/elements/ColumnElement";
+import { WallElement } from "../../model/elements/WallElement";
 import { columnFootprint2D } from "../../mesh/builders/ColumnMeshBuilder";
+import polygonClipping, { type Pair, type Ring } from "polygon-clipping";
 
 export interface RegenerateAllWallsOptions {
     /** 壁厚 (mm)。"200" のような数値文字列でも数値でも受け付ける。 */
     wallThicknessMm: string | number;
     /** 円ポリゴンのテッセレーション角 (deg)。 */
     circleWallAngleDeg: string | number;
+    /** スケッチ線を壁のどこに置くか。未指定なら "Center" にフォールバック。 */
+    wallReferenceMode?: "Center" | "Interior" | "Exterior";
     /** デバッグログを出すか (既定 false)。UI ボタン経由の時だけ true で呼ぶ想定。 */
     debug?: boolean;
     /**
@@ -59,6 +65,30 @@ export interface RegenerateAllWallsOptions {
  * の本体をそのまま移植したもの。エッジ単位ではなく **コリニア部分区間** 単位で
  * 共有判定するので、長さの違うエッジが一部だけ重なるケース (spec §6) に対応する。
  */
+/**
+ * realtime regen が ON の時だけ最新の AppState を読んで壁を再生成する共通
+ * トリガ。部屋モードのポリゴン編集だけでなく、柱の配置・移動・削除など、
+ * 壁の最終フットプリントに影響する全操作から呼ぶ。
+ *
+ * `reason` はログ用 (例: "column-create", "column-delete")。
+ * `seedPolyIds` を渡すと影響範囲を絞れる (未指定なら全部屋再生成)。
+ */
+export function triggerWallRegenIfEnabled(reason: string, seedPolyIds?: string[]): void {
+    const s = useAppState.getState();
+    if (!s.realtimeWallGen) return;
+    // eslint-disable-next-line no-console
+    console.log(`[wallRegen-trigger] ${reason}` +
+        (seedPolyIds && seedPolyIds.length
+            ? ` seeds=[${seedPolyIds.map((p) => p.slice(0, 6)).join(",")}]`
+            : ""));
+    regenerateAllWalls({
+        wallThicknessMm: s.wallThicknessMm,
+        circleWallAngleDeg: s.circleWallAngleDeg,
+        wallReferenceMode: s.wallReferenceMode,
+        seedPolyIds,
+    });
+}
+
 export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
     const wallThickness = (parseFloat(String(opts.wallThicknessMm)) || 200) / 1000;
     const circleAngleDeg = Math.max(
@@ -72,10 +102,19 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
     const state = useAppState.getState();
     const { elements, constraints, executeCommand, updateElement, removeElement } = state;
 
-    // 新データモデルでの壁基準線。現状 UI が無いので "Center" 固定。
-    const wallReference: WallReferenceLine = "Center";
-    const innerT = wallThickness / 2;
-    const outerT = wallThickness / 2;
+    // 壁基準線。UI から `wallReferenceMode` で受け取り、polygon.wallReference
+    // とエッジ単位 inner/outer 厚さに反映する。
+    //  - Center   : inner = outer = T/2 (= スケッチ線が壁芯)
+    //  - Interior : inner = 0, outer = T (= スケッチ線が室内側仕上げ面、壁は外側へ)
+    //  - Exterior : inner = T, outer = 0 (= スケッチ線が屋外側仕上げ面、壁は内側へ)
+    const wallReference: WallReferenceLine = opts.wallReferenceMode ?? "Center";
+    let innerT: number, outerT: number;
+    switch (wallReference) {
+        case "Interior": innerT = 0;             outerT = wallThickness;     break;
+        case "Exterior": innerT = wallThickness; outerT = 0;                 break;
+        case "Center":
+        default:         innerT = wallThickness / 2; outerT = wallThickness / 2; break;
+    }
 
     interface AABB { minX: number; minY: number; maxX: number; maxY: number; }
     interface PolyWork {
@@ -338,6 +377,67 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
     }
     if (works.length === 0) return;
 
+    // ── 0. Column footprints (壁分断のために cluster 段で必要) ───────
+    // works に含まれる polygon の levelId 集合に紐付く Column のみ対象。
+    // levelId が未設定の Column は安全側で含める。
+    const earlyRoomLevelIds = new Set<ElementId>();
+    for (const w of works) {
+        if (w.room.levelId) earlyRoomLevelIds.add(w.room.levelId);
+    }
+    // 診断: 全 Column 要素を列挙してフィルタの結果を出力。
+    let allColumnsCount = 0;
+    let filteredOutByLevel = 0;
+    let filteredOutByFp = 0;
+    const columnFootprints: ColumnFootprint[] = [];
+    for (const eid in elements) {
+        const el = elements[eid];
+        if (!el || el.type !== "Column") continue;
+        allColumnsCount++;
+        const col = el as ColumnElement;
+        if (col.baseLevelId && earlyRoomLevelIds.size > 0
+            && !earlyRoomLevelIds.has(col.baseLevelId)) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[wallRegen/§0] col ${(col.id as string).slice(0,6)} ` +
+                `SKIPPED by level: col.baseLevelId=${col.baseLevelId} ` +
+                `roomLevelIds=[${[...earlyRoomLevelIds].join(",")}]`,
+            );
+            filteredOutByLevel++;
+            continue;
+        }
+        const fp = columnFootprint2D(col);
+        if (fp.length >= 3) {
+            columnFootprints.push({ id: col.id as string, points: ensureCCW(fp) });
+        } else {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[wallRegen/§0] col ${(col.id as string).slice(0,6)} ` +
+                `SKIPPED by fp: fp.length=${fp.length} ` +
+                `basePoint=${col.basePoint ? `(${col.basePoint[0].toFixed(2)},${col.basePoint[2].toFixed(2)})` : "null"}`,
+            );
+            filteredOutByFp++;
+        }
+    }
+    // eslint-disable-next-line no-console
+    console.log(
+        `[wallRegen/§0] columns total=${allColumnsCount} ` +
+        `passed=${columnFootprints.length} ` +
+        `filteredByLevel=${filteredOutByLevel} ` +
+        `filteredByFp=${filteredOutByFp} ` +
+        `roomLevelIds=[${[...earlyRoomLevelIds].join(",")}]`,
+    );
+
+    // 柱フットプリントを 1 度だけ console に出して位置を確認できるようにする。
+    if (columnFootprints.length > 0) {
+        // eslint-disable-next-line no-console
+        console.log(
+            `[wallRegen/§0] columnFootprints (${columnFootprints.length}):` +
+            columnFootprints.map((c) =>
+                `\n  id=${c.id.slice(0, 6)} pts=[${c.points.map((p) => `(${p[0].toFixed(2)},${p[1].toFixed(2)})`).join(" ")}]`,
+            ).join(""),
+        );
+    }
+
     // ── 1. Cluster edges by collinear line (cross-room) ─────────────
     const ANGLE_TOL = (3 * Math.PI) / 180;
     const DIST_TOL = Math.max(0.02, wallThickness);
@@ -525,6 +625,11 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         newOuter: Vec2[];
         newEdges: [number, number][];
         newWallIds: string[];
+        /** 各 new edge に対応する全 wall id (柱で分断された場合は複数)。
+         *  newWallIds[i] は `newWallsPerEdge[i][0]` (= canonical wallId) と
+         *  一致する。`newWallsPerEdge` が未設定 (= 柱分断なし) の場合は
+         *  newWallIds から `[id]` で導出する。 */
+        newWallsPerEdge?: string[][];
         newSharedEdgeIds: (string | undefined)[];
         newEdgeIds: string[];
         modified: boolean;
@@ -533,7 +638,8 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         isOpen: boolean;
     }
 
-    const groupWallId = new Map<string, string>();
+    // 1 sub-group につき 0+ 個の wall id を保持 (柱で分断された場合は複数)。
+    const groupWallIds = new Map<string, string[]>();
     const groupSharedEdgeId = new Map<string, string>();
 
     const polyRebuilds: PolyRebuild[] = [];
@@ -599,9 +705,64 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
     }
 
     // ── 6. Drop existing walls referenced by any contributing polygon ─
+    // wallIds (= 各エッジの canonical) と wallsPerEdge (= 柱で分断された
+    // 子壁を含む全 ID) の両方を見て古い壁を確実に消す。
+    //
+    // 削除前に **per-edge で typeId / overrides を捕獲** しておく。再生成
+    // で新規 wall を CreateWallCommand で作るとき、global activeTypeId では
+    // なくこの per-edge スナップショットの typeId を優先することで、ユーザが
+    // ChangeElementTypeCommand で個別に変えた wall の Type 情報がドラッグ等
+    // の regen を介して保持される。
+    interface PrevWallInfo {
+        typeId: ElementId;
+        overrides?: any;
+        thickness: number;
+        innerThickness: number;
+        outerThickness: number;
+        locationLine: WallElement["locationLine"];
+    }
+    const prevWallTypeByEdge = new Map<string, PrevWallInfo>();
+    const prevEdgeKey = (polyId: string, edgeIdx: number) => `${polyId}:${edgeIdx}`;
+    // Phase 2: per-edge 厚さマップ。JunctionGraph に流して、ユーザが Type 変更
+    // した壁の厚さで隣接壁との接合を計算する。
+    const edgeThicknessMap: EdgeThicknessMap = new Map();
+
     const prevWallIds = new Set<string>();
     for (const w of works) {
-        for (const wid of w.poly.wallIds ?? []) if (wid) prevWallIds.add(wid);
+        const wallIds = w.poly.wallIds ?? [];
+        for (let edgeIdx = 0; edgeIdx < wallIds.length; edgeIdx++) {
+            const wid = wallIds[edgeIdx];
+            if (!wid) continue;
+            prevWallIds.add(wid);
+            const wallEl = elements[wid] as WallElement | undefined;
+            if (wallEl && wallEl.type === "Wall") {
+                const t = wallEl.thickness;
+                const innerT = wallEl.innerThickness ?? t / 2;
+                const outerT = wallEl.outerThickness ?? t / 2;
+                if (wallEl.typeId) {
+                    prevWallTypeByEdge.set(prevEdgeKey(w.poly.id, edgeIdx), {
+                        typeId: wallEl.typeId,
+                        overrides: wallEl.overrides,
+                        thickness: t,
+                        innerThickness: innerT,
+                        outerThickness: outerT,
+                        locationLine: wallEl.locationLine,
+                    });
+                }
+                // per-edge 厚さマップを構築。Type 違いで thickness が違っても、
+                // JunctionGraph は各 ve 自身の inner/outer offset で miter / Clipper
+                // diff を行うので、隣接壁が違う厚さでも接合面が自然に閉じる。
+                edgeThicknessMap.set(
+                    makeEdgeThicknessKey(w.poly.id, edgeIdx),
+                    { inner: innerT, outer: outerT },
+                );
+            }
+        }
+        // wallsPerEdge は柱で分断された場合の補助。canonical (= wallIds[i]) の
+        // typeId を採用する方針なので追加捕獲は不要。
+        for (const idsForEdge of w.poly.wallsPerEdge ?? []) {
+            for (const wid of idsForEdge) if (wid) prevWallIds.add(wid);
+        }
     }
     for (const wid of prevWallIds) {
         if (elements[wid]) removeElement(wid);
@@ -655,30 +816,61 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
             sharedEdgeIds: r.newSharedEdgeIds,
         };
     });
-    const roomLevelIds = new Set<ElementId>();
-    for (const w of works) {
-        if (w.room.levelId) roomLevelIds.add(w.room.levelId);
-    }
-    const columnFootprints: ColumnFootprint[] = [];
-    for (const eid in elements) {
-        const el = elements[eid];
-        if (!el || el.type !== "Column") continue;
-        const col = el as ColumnElement;
-        if (col.baseLevelId && roomLevelIds.size > 0
-            && !roomLevelIds.has(col.baseLevelId)) {
-            continue;
+    // ── 6.7. Shared edge の厚さ / typeId を統一 ──────────────────────
+    //
+    // Phase 2 補正: 部屋境界の共有エッジは「片方の部屋が Type 変更で違う
+    // 厚さ・Type になっている」ケースがある。両ポリゴンの edgeThicknessMap
+    // と prevWallTypeByEdge に別々の値が入っていると、JunctionGraph が
+    // **同じ axis 上に異厚さの 2 ves** として処理し、step (b) miter が両側で
+    // 食い違い、接合部に三角形のスリバーや段差が出る。
+    //
+    // 解決: 各 shared subgroup について、「最大厚さの prevInfo を持つ
+    // contributor」を canonical とみなし、その prevInfo / 厚さを **全
+    // contributors に伝搬** する。
+    //   - max 選択: ユーザが明示的に厚くした方を優先 (= 太い側を維持して
+    //     薄い側のフットプリントが食い込まないようにする)。
+    //   - 伝搬範囲: prevWallTypeByEdge (= §7 wall 作成時の Type 復元キー)
+    //     と edgeThicknessMap (= JunctionGraph の per-edge 厚さ) の両方。
+    //   - polyId 順 (= §7 canonical) と独立に動くので、どの polygon が
+    //     canonical でも結果は同じ。
+    for (const [, group] of subGroups) {
+        if (group.polysContributing.size <= 1) continue;
+        let bestPrev: PrevWallInfo | undefined;
+        let bestSum = -1;
+        for (const c of group.contributors) {
+            const k = prevEdgeKey(works[c.workIdx].poly.id, c.oldEdgeIdx);
+            const info = prevWallTypeByEdge.get(k);
+            if (!info) continue;
+            const sum = info.innerThickness + info.outerThickness;
+            if (sum > bestSum) { bestSum = sum; bestPrev = info; }
         }
-        const fp = columnFootprint2D(col);
-        if (fp.length >= 3) {
-            columnFootprints.push({ id: col.id as string, points: ensureCCW(fp) });
+        if (!bestPrev) continue;
+        const propagated = {
+            inner: bestPrev.innerThickness,
+            outer: bestPrev.outerThickness,
+        };
+        for (const c of group.contributors) {
+            const polyId = works[c.workIdx].poly.id;
+            // prevWallTypeByEdge: canonical の Type 情報を全 contributors に
+            // 上書き伝搬する (= 上書きしないと §7 が contributor 別に違う
+            // Type で wall を作ってしまう可能性)。
+            prevWallTypeByEdge.set(prevEdgeKey(polyId, c.oldEdgeIdx), bestPrev);
+            edgeThicknessMap.set(makeEdgeThicknessKey(polyId, c.oldEdgeIdx), propagated);
         }
     }
 
+    // columnFootprints は §0 で計算済み (cluster 段で柱を breakpoint として
+    // 使うため、JunctionGraph 用にも同じデータを再利用)。
+    // Phase 2: edgeThicknessMap を渡して per-edge 厚さで miter / Clipper diff
+    // を計算させる。マップに無いエッジはポリゴン共通厚さにフォールバック。
     const jgraph = buildJunctionGraph(rebuiltPolysForGraph);
-    resolveJunctions(jgraph, rebuiltPolysForGraph, columnFootprints);
-    applyCaps(jgraph, rebuiltPolysForGraph);
+    resolveJunctions(jgraph, rebuiltPolysForGraph, columnFootprints, edgeThicknessMap);
+    applyCaps(jgraph, rebuiltPolysForGraph, edgeThicknessMap);
 
-    // ── 7. Create one wall per sub-group ──────────────────────────────
+    // ── 7. Create wall(s) per sub-group ───────────────────────────────
+    // Sub-group は通常 1 つの wall に対応するが、柱が wall fp と重なる場合は
+    // wall fp - (柱の union) を polygon-clipping で計算し、結果のピースごとに
+    // 別々の wall element を作る (= ユーザ仕様)。
     let sharedGroups = 0;
     let createdWallCount = 0;
     for (const [key, group] of subGroups) {
@@ -699,31 +891,18 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         const canonicalNewEdgeIdx =
             canonical.subIdx < newEdges.length ? newEdges[canonical.subIdx] : -1;
 
-        const cmd = new CreateWallCommand(
-            group.axis,
-            wallThickness,
-            canonicalWork.room.height,
-            undefined,
-            canonicalWork.room.levelId,
-        );
-        executeCommand(cmd);
-        const wid = cmd.getElementId();
-        let footprint: Vec2[] | null = null;
+        // ─ JunctionGraph で計算済みのミター済みフットプリント (4 頂点)。
+        let mitered: Vec2[] | null = null;
         let veIsShared = false;
         if (canonicalNewEdgeIdx >= 0) {
             const veKey = `${canonicalWork.poly.id}:${canonicalNewEdgeIdx}`;
             const veIds = jgraph.edgeToVes.get(veKey);
             if (veIds && veIds.length > 0) {
-                // T 字接合があると JunctionGraph はエッジを 2+ 個の VE に
-                // split する。polyRebuilds 側は 1 エッジのままなので壁は 1
-                // 個だが、フットプリントは **先頭 VE の startCorners + 末尾
-                // VE の endCorners** を結合してエッジ全長をカバーする必要が
-                // ある (= veIds[0] だけ使うと半分しか描画されない)。
                 const firstVe = jgraph.virtualEdges.get(veIds[0]);
                 const lastVe = jgraph.virtualEdges.get(veIds[veIds.length - 1]);
                 if (firstVe && lastVe
                     && firstVe.startCorners && lastVe.endCorners) {
-                    footprint = [
+                    mitered = [
                         [firstVe.startCorners.inner[0], firstVe.startCorners.inner[1]],
                         [firstVe.startCorners.outer[0], firstVe.startCorners.outer[1]],
                         [lastVe.endCorners.outer[0],    lastVe.endCorners.outer[1]],
@@ -731,34 +910,190 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
                     ];
                     veIsShared = firstVe.isShared || lastVe.isShared;
                 } else if (firstVe) {
-                    // フォールバック: 末尾 VE が解決できなかった場合は先頭 VE のみ。
-                    footprint = virtualEdgeFootprint(firstVe);
+                    mitered = virtualEdgeFootprint(firstVe);
                     veIsShared = firstVe.isShared;
                 }
             }
         }
-        updateElement(wid, {
-            wallCategory: isShared ? "shared" : "exterior",
-            innerThickness: innerT,
-            outerThickness: outerT,
-            polyRef: canonicalNewEdgeIdx >= 0 ? {
-                spaceId: canonicalWork.roomId,
-                polyId: canonicalWork.poly.id,
-                edgeIdx: canonicalNewEdgeIdx,
-            } : undefined,
-            footprint: footprint ?? undefined,
-            isShared: veIsShared || isShared,
-        } as any);
-        groupWallId.set(key, wid);
-        createdWallCount++;
+        // フォールバック: ミター情報が取れない時は group.axis ± thickness/2 で矩形。
         const ax0 = group.axis[0];
         const ax1 = group.axis[1];
-        const axisLen = Math.hypot(ax1[0] - ax0[0], ax1[2] - ax0[2]);
+        const adx = ax1[0] - ax0[0], adz = ax1[2] - ax0[2];
+        const axLen = Math.hypot(adx, adz);
+        if (!mitered && axLen > 1e-9) {
+            const ux = adx / axLen, uz = adz / axLen;
+            const px = -uz, pz = ux;  // 90° CCW perpendicular
+            const ht = wallThickness / 2;
+            mitered = [
+                [ax0[0] + px * ht, ax0[2] + pz * ht],
+                [ax0[0] - px * ht, ax0[2] - pz * ht],
+                [ax1[0] - px * ht, ax1[2] - pz * ht],
+                [ax1[0] + px * ht, ax1[2] + pz * ht],
+            ];
+        }
+
+        // ─ 柱 ↔ wall fp の polygon-clipping。
+        // intersectingCols = この wall fp と実際に重なる柱フットプリントだけ。
+        const wallRing: Pair[] = (mitered ?? []).map<Pair>((p) => [p[0], p[1]]);
+        const intersectingCols: Ring[][] = [];
+        const intersectingColIds: string[] = [];
+        if (wallRing.length >= 3) {
+            for (const col of columnFootprints) {
+                const colRing: Pair[] = col.points.map<Pair>((p) => [p[0], p[1]]);
+                try {
+                    const inter = polygonClipping.intersection([wallRing], [colRing]);
+                    if (inter.length > 0) {
+                        intersectingCols.push([colRing]);
+                        intersectingColIds.push(col.id);
+                    }
+                } catch (e) {
+                    // eslint-disable-next-line no-console
+                    console.warn(`[wallRegen] intersection 失敗 col=${col.id.slice(0,6)}`, e);
+                }
+            }
+        }
         // eslint-disable-next-line no-console
         console.log(
-            `[regenerateAllWalls] wall ${wid.slice(0, 6)} ${isShared ? "SHARED" : "exterior"} ` +
+            `[wallRegen/§7] subgroup=${key.slice(0,12)} ` +
+            `mitered=${mitered ? `[${mitered.length}pt]` : "null"} ` +
+            `wallRing=[${wallRing.map((p) => `(${p[0].toFixed(2)},${p[1].toFixed(2)})`).join(" ")}] ` +
+            `intersectCols=[${intersectingColIds.map((id) => id.slice(0,6)).join(",")}]`,
+        );
+
+        // ─ ピース計算: 柱が無ければ wall fp = mitered のまま 1 ピース。
+        //              柱があれば wall fp - union(columns) で 0+ ピース。
+        type Piece = { ring: Vec2[]; tMin: number; tMax: number };
+        const pieces: Piece[] = [];
+        if (intersectingCols.length === 0 || axLen < 1e-9) {
+            if (mitered) pieces.push({ ring: mitered, tMin: 0, tMax: axLen });
+        } else {
+            const ux = adx / axLen, uz = adz / axLen;
+            let result: Ring[][] | null = null;
+            let diffError: unknown = null;
+            try {
+                result = polygonClipping.difference([wallRing], ...intersectingCols);
+            } catch (e) {
+                diffError = e;
+                result = null;
+            }
+            // eslint-disable-next-line no-console
+            console.log(
+                `[wallRegen/§7] subgroup=${key.slice(0,12)} difference ` +
+                `result.length=${result?.length ?? "null"} ` +
+                (diffError ? `error=${String(diffError)}` : ""),
+            );
+            if (result && result.length > 0) {
+                for (let pi = 0; pi < result.length; pi++) {
+                    const piece = result[pi];
+                    const ring = piece[0];
+                    if (!ring || ring.length < 4) {
+                        // eslint-disable-next-line no-console
+                        console.log(`  piece[${pi}]: ring too small (len=${ring?.length})`);
+                        continue;
+                    }
+                    const open = ring.slice(0, -1);
+                    const ringV2: Vec2[] = open.map<Vec2>((p) => [p[0], p[1]]);
+                    let tMin = Infinity, tMax = -Infinity;
+                    for (const p of open) {
+                        const t = (p[0] - ax0[0]) * ux + (p[1] - ax0[2]) * uz;
+                        if (t < tMin) tMin = t;
+                        if (t > tMax) tMax = t;
+                    }
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `  piece[${pi}]: ${open.length}pt ` +
+                        `tMin=${tMin.toFixed(3)} tMax=${tMax.toFixed(3)} ` +
+                        `verts=[${open.map((p) => `(${p[0].toFixed(2)},${p[1].toFixed(2)})`).join(" ")}]`,
+                    );
+                    if (tMax - tMin < 1e-6) {
+                        // eslint-disable-next-line no-console
+                        console.log(`  piece[${pi}]: skipped (degenerate t-range)`);
+                        continue;
+                    }
+                    pieces.push({ ring: ringV2, tMin, tMax });
+                }
+            } else if (mitered) {
+                // eslint-disable-next-line no-console
+                console.log(`[wallRegen/§7] subgroup=${key.slice(0,12)} difference produced 0 pieces — fallback to original`);
+                pieces.push({ ring: mitered, tMin: 0, tMax: axLen });
+            }
+        }
+
+        // ─ 各ピースについて wall element を生成。
+        const widsForGroup: string[] = [];
+        for (const piece of pieces) {
+            // ピースの中心線 axis (= group.axis 方向に沿って tMin..tMax を切り出す)。
+            const ux = axLen > 1e-9 ? adx / axLen : 1;
+            const uz = axLen > 1e-9 ? adz / axLen : 0;
+            const startT = Math.max(0, piece.tMin);
+            const endT = Math.min(axLen, piece.tMax);
+            const pieceAxis: [Vec3, Vec3] = [
+                [ax0[0] + ux * startT, ax0[1], ax0[2] + uz * startT],
+                [ax0[0] + ux * endT,   ax0[1], ax0[2] + uz * endT],
+            ];
+            // 既存壁の typeId / overrides を per-edge で復元 (= ChangeElementType
+            // で個別に変えた wall の Type が regen 後も保持される)。canonical
+            // edge (= work.poly.id : canonicalWork.oldEdgeIdx) のスナップショットを
+            // 引く。無ければ global activeTypeId にフォールバック。
+            const prevInfo = prevWallTypeByEdge.get(
+                prevEdgeKey(canonicalWork.poly.id, canonical.oldEdgeIdx),
+            );
+            const wallTypeId = prevInfo?.typeId
+                ?? useAppState.getState().activeTypeIdByCategory.Wall;
+            if (!wallTypeId) {
+                // Type 未 seed の異常系。fallback で生成スキップ。
+                console.warn("[wallRegen] no active WallType — skipping piece");
+                continue;
+            }
+            // overrides も同様に復元。なければ {thickness: wallThickness} で
+            // ポリゴン共通厚を上書き。
+            const cmdOverrides = prevInfo?.overrides
+                ?? { thickness: wallThickness };
+            const cmd = new CreateWallCommand(
+                pieceAxis,
+                wallTypeId as any,
+                canonicalWork.room.height,
+                undefined,
+                canonicalWork.room.levelId,
+                cmdOverrides,
+            );
+            executeCommand(cmd);
+            const wid = cmd.getElementId();
+            // Per-edge 厚さの保持: prevInfo があればその inner/outer を採用、
+            // 無ければポリゴン共通の innerT/outerT を使う。これにより、ユーザが
+            // ChangeElementTypeCommand で個別に変えた壁の厚さが、ドラッグ等で
+            // wallRegenerate が再実行されても保持される。
+            const wallInnerT = prevInfo?.innerThickness ?? innerT;
+            const wallOuterT = prevInfo?.outerThickness ?? outerT;
+            // locationLine も per-edge で復元 (= ChangeWallReferenceCommand で
+            // 個別に変えた基準線が regen 後も保持される)。prevInfo が無い場合
+            // (= 新規 edge) は CreateWallCommand が Type 既定値で設定済み。
+            updateElement(wid, {
+                wallCategory: isShared ? "shared" : "exterior",
+                innerThickness: wallInnerT,
+                outerThickness: wallOuterT,
+                ...(prevInfo?.locationLine ? { locationLine: prevInfo.locationLine } : {}),
+                polyRef: canonicalNewEdgeIdx >= 0 ? {
+                    spaceId: canonicalWork.roomId,
+                    polyId: canonicalWork.poly.id,
+                    edgeIdx: canonicalNewEdgeIdx,
+                } : undefined,
+                footprint: piece.ring,
+                // 柱との polygon-clipping は §7 で確定。WallGeometryBuilder で
+                // clipByColumns を再適用しないようマークする (二重クリップ防止)。
+                footprintIsFinal: intersectingCols.length > 0,
+                isShared: veIsShared || isShared,
+            } as any);
+            widsForGroup.push(wid);
+            createdWallCount++;
+        }
+        groupWallIds.set(key, widsForGroup);
+        // eslint-disable-next-line no-console
+        console.log(
+            `[regenerateAllWalls] subgroup key=${key.slice(0, 12)} ${isShared ? "SHARED" : "exterior"} ` +
             `axis=(${ax0[0].toFixed(2)},${ax0[2].toFixed(2)})→(${ax1[0].toFixed(2)},${ax1[2].toFixed(2)}) ` +
-            `len=${axisLen.toFixed(3)} fp=${footprint ? `[${footprint.length}pt]` : "null"}`,
+            `len=${axLen.toFixed(3)} pieces=${pieces.length}` +
+            (intersectingCols.length > 0 ? ` (cols=${intersectingCols.length})` : ""),
         );
     }
     // eslint-disable-next-line no-console
@@ -778,10 +1113,15 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
             for (let k = 0; k < subs.length; k++) {
                 const sub = subs[k];
                 const key = groupKey(sub.clusterIdx, sub.tA, sub.tB);
-                const wid = groupWallId.get(key);
+                const wids = groupWallIds.get(key) ?? [];
+                const canonicalWid = wids[0];
                 const sharedId = groupSharedEdgeId.get(key);
                 if (k < newEdgeIdxList.length) {
-                    if (wid)      rebuild.newWallIds[newEdgeIdxList[k]] = wid;
+                    if (canonicalWid) rebuild.newWallIds[newEdgeIdxList[k]] = canonicalWid;
+                    if (!rebuild.newWallsPerEdge) {
+                        rebuild.newWallsPerEdge = rebuild.newWallIds.map(() => []);
+                    }
+                    rebuild.newWallsPerEdge[newEdgeIdxList[k]] = wids;
                     if (sharedId) rebuild.newSharedEdgeIds[newEdgeIdxList[k]] = sharedId;
                 }
             }
@@ -817,7 +1157,10 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
                 groups.push({ startEi: 0, endEi: N - 1, ownerId });
             }
         } else if (poly.edgeOwners && poly.edgeOwners.length === rebuild.oldEdgeToNewEdges.length) {
-            // (b) Arc 連続 edge グループ。旧 → 新マッピング。
+            // (b) 弧 (ArcEntity 由来) の連続 edge を 1 wall に統合し、curved
+            //     footprint で「分割されていない」見た目にする。実体はポリ
+            //     ライン近似の chord 列 (= IFC 出力等で多角形として扱える)
+            //     だが、表示は弧として一体化する。旧 → 新 edge マッピング。
             const newOwners = new Array<string>(N).fill("");
             for (let oi = 0; oi < poly.edgeOwners.length; oi++) {
                 for (const ne of rebuild.oldEdgeToNewEdges[oi]) {
@@ -968,6 +1311,74 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         }
     }
 
+    // ── 8.2. Internal-edge detection (隣接壁の接合面マスク) ───────────
+    //
+    // 壁同士が L 字 / T 字で接合した部分は、各壁の miter 端 cap が **互いに
+    // 完全一致** する (= 壁 A の cap edge と壁 B の cap edge が逆向きで
+    // 同じ線分)。このペアは内部接合面で外から見えないので 3D 側面・
+    // silhouette edge を生成しないようマスクする。
+    //
+    // 検出方法: 全壁ペアの footprint edge を端点 5mm tol で比較し、
+    // 反転一致 (a.start ≒ b.end かつ a.end ≒ b.start) すれば双方の
+    // edge を internal としてマーク。柱で分断された壁の同方向同位置
+    // の継ぎ目もここで除去される。
+    //
+    // 計算量: 壁数 W, 平均 footprint 頂点数 V で O(W² × V²)。典型的な
+    // シーン (W=数十、V=4-6) では十分速い。AABB pre-filter を入れれば
+    // 線形に近づくが、現状は不要。
+    const liveElementsForInternal = useAppState.getState().elements;
+    interface WallEdge {
+        wallId: ElementId;
+        edgeIdx: number;
+        a: Vec2;
+        b: Vec2;
+    }
+    const allEdges: WallEdge[] = [];
+    for (const elId in liveElementsForInternal) {
+        const el = liveElementsForInternal[elId];
+        if (!el || el.type !== "Wall") continue;
+        const wEl = el as WallElement;
+        const fp = wEl.footprint;
+        if (!fp || fp.length < 3) continue;
+        for (let i = 0; i < fp.length; i++) {
+            allEdges.push({
+                wallId: elId as ElementId,
+                edgeIdx: i,
+                a: fp[i],
+                b: fp[(i + 1) % fp.length],
+            });
+        }
+    }
+    const TOL_INTERNAL = 5e-3; // 5mm — VERTEX_TOL_M と整合
+    const eq = (p: Vec2, q: Vec2) =>
+        Math.abs(p[0] - q[0]) < TOL_INTERNAL && Math.abs(p[1] - q[1]) < TOL_INTERNAL;
+    const internalByWall = new Map<ElementId, Set<number>>();
+    for (let i = 0; i < allEdges.length; i++) {
+        const ei = allEdges[i];
+        for (let j = i + 1; j < allEdges.length; j++) {
+            const ej = allEdges[j];
+            if (ei.wallId === ej.wallId) continue;
+            // 反転一致: ei.a ≒ ej.b かつ ei.b ≒ ej.a
+            if (eq(ei.a, ej.b) && eq(ei.b, ej.a)) {
+                if (!internalByWall.has(ei.wallId)) internalByWall.set(ei.wallId, new Set());
+                if (!internalByWall.has(ej.wallId)) internalByWall.set(ej.wallId, new Set());
+                internalByWall.get(ei.wallId)!.add(ei.edgeIdx);
+                internalByWall.get(ej.wallId)!.add(ej.edgeIdx);
+            }
+        }
+    }
+    // 各壁に internalEdges (boolean[]) を書き戻す。マスク無し壁は undefined のまま。
+    for (const [wid, idxSet] of internalByWall) {
+        const w = liveElementsForInternal[wid] as WallElement | undefined;
+        if (!w || !w.footprint) continue;
+        const mask = new Array<boolean>(w.footprint.length).fill(false);
+        for (const idx of idxSet) mask[idx] = true;
+        updateElement(wid, {
+            internalEdges: mask,
+            dirtyFlags: new Set([...(w.dirtyFlags ?? []), "Mesh", "Render"]),
+        } as any);
+    }
+
     // ── 8.5. Build vertexConnections (cross-polygon vertex incidence) ──
     interface VCEntry {
         polyId: string;
@@ -1067,8 +1478,14 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
                     }
                 }
             }
+            // 柱分断で 1 edge に複数 wall がある場合は newWallsPerEdge から、
+            // それ以外は canonical 1 件を [id] で包んで wallsPerEdge を構築。
             const wallsPerEdge: string[][] = rebuild.newWallIds.map(
-                (id) => (id ? [id] : []),
+                (id, i) => {
+                    const list = rebuild.newWallsPerEdge?.[i];
+                    if (list && list.length > 0) return list;
+                    return id ? [id] : [];
+                },
             );
             const explicitEdges: [number, number][] | undefined = rebuild.isOpen
                 ? rebuild.newEdges.map(([a, b]) => [a, b] as [number, number])

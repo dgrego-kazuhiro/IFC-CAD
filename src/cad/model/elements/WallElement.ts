@@ -2,10 +2,15 @@ import { BaseElement } from "../base/BaseElement";
 import { Vec3 } from "../../geometry/math/Vec3";
 import { Vec2 } from "../../geometry/math/Vec2";
 import { ElementId } from "../base/ElementId";
+import type { WallTypeOverride } from "../catalog/ElementTypeDef";
 
 export interface WallElement extends BaseElement {
     type: "Wall";
+    /** 参照する WallType の id。新規作成では必須。 */
+    typeId: ElementId;
+    overrides?: WallTypeOverride;
     axis: [Vec3, Vec3];
+    /** Type+overrides から導出された有効厚のキャッシュ。 */
     thickness: number;
     height: number;
     baseLevelId?: ElementId;
@@ -16,6 +21,7 @@ export interface WallElement extends BaseElement {
     joinStart: boolean;
     joinEnd: boolean;
     openings: ElementId[];
+    /** @deprecated Use `typeId` instead. Kept for old payloads. */
     wallTypeId?: ElementId;
     /**
      * 壁分類 (per docs/specification/new.md §4):
@@ -63,4 +69,19 @@ export interface WallElement extends BaseElement {
      * 表示・選択・IFC 出力での区別に利用。
      */
     isShared?: boolean;
+    /**
+     * `footprint` が **既に柱との polygon-clipping で確定済み** かどうか。
+     * wallRegenerate が柱で壁を分断したピース fp をセットする際 true にする。
+     * これが true の場合、WallGeometryBuilder.build は `clipByColumns` を
+     * スキップして fp をそのまま 3D 化する (二重クリップ防止)。
+     */
+    footprintIsFinal?: boolean;
+    /**
+     * 隣接壁の footprint と逆向きで一致した「内部接合面」のフラグ。
+     * 長さ = footprint.length。`internalEdges[i] === true` なら、
+     * footprint[i] → footprint[(i+1)%n] の辺は他の壁と完全に接しているため
+     * 3D 側面・シルエットエッジを生成しない (= 壁同士の見えない内部面・
+     * 線を消す)。wallRegenerate が pairwise 比較で計算する。
+     */
+    internalEdges?: boolean[];
 }

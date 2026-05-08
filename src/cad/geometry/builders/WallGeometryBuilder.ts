@@ -32,6 +32,14 @@ export interface WallGeometryData {
      * 3D 化するときに使う。未設定なら穴なし。
      */
     holes?: Vec3[][];
+    /**
+     * 隣接壁と完全一致する「内部接合面」の per-edge マスク。
+     * 長さ = footprint.length。true の edge は WallMeshBuilder が
+     * 側面 quad と silhouette edge を生成しない (= 内部の見えない面・
+     * 線を消す)。`wall.footprint` が反転されて使われる場合は、ここでも
+     * 同じ反転を適用してインデックスを揃える。
+     */
+    internalEdges?: boolean[];
 }
 
 export class WallGeometryBuilder {
@@ -67,6 +75,9 @@ export class WallGeometryBuilder {
         const openingCount = renderOpeningCount ?? (wall.openings ?? []).length;
         if (openingCount > 0) return data;
         if (!columnFootprints || columnFootprints.length === 0) return data;
+        // wallRegenerate 側で既に柱を引き算した最終 fp を持つ壁は、二重クリップ
+        // を避けるため clipByColumns をスキップする。
+        if (wall.footprintIsFinal) return data;
         return clipByColumns(data, columnFootprints);
     }
 
@@ -97,6 +108,10 @@ export class WallGeometryBuilder {
         if (wall.footprint && wall.footprint.length >= 3) {
             const baseY = wall.axis[0][1] + wall.baseOffset;
             let fp = wall.footprint;
+            let internalMask: boolean[] | undefined = wall.internalEdges
+                && wall.internalEdges.length === fp.length
+                ? wall.internalEdges.slice()
+                : undefined;
             const openingCount = renderOpeningCount ?? (wall.openings ?? []).length;
             const hasOpenings = openingCount > 0;
             // JunctionGraph の virtual edge は、ある polygon の edge を辿る向きで
@@ -112,6 +127,17 @@ export class WallGeometryBuilder {
                 const d0End   = (fp[0][0] - aE[0]) ** 2 + (fp[0][1] - aE[2]) ** 2;
                 if (d0End < d0Start) {
                     fp = [...fp].reverse();
+                    if (internalMask) {
+                        // 反転後の edge i (= 元 fp の頂点 n-1-i → n-2-i) は
+                        // 元の edge n-2-i に対応する。長さ n の cycle で
+                        // newMask[i] = oldMask[(n-2-i+n) % n]。
+                        const n = internalMask.length;
+                        const reversed = new Array<boolean>(n);
+                        for (let i = 0; i < n; i++) {
+                            reversed[i] = internalMask[(n - 2 - i + n) % n];
+                        }
+                        internalMask = reversed;
+                    }
                 }
             }
             if (hasOpenings && fp.length === 4) {
@@ -150,6 +176,7 @@ export class WallGeometryBuilder {
                 height: wall.height + wall.topOffset,
                 isHexFootprint: true,
                 holes,
+                internalEdges: internalMask,
             };
         }
 
@@ -281,6 +308,10 @@ function clipByColumns(
     if (result.length === 0) {
         return { ...data, footprint: [], isHexFootprint: false };
     }
+    // 壁が複数ピースに分断されるケース (= 柱が壁の中間で壁を貫く) は
+    // wallRegenerate 側で polygon edge を分割しており、ここに来る個別の wall は
+    // 柱に対して 1 ピースに clip される想定。それでも稀に複数ピースになった
+    // 場合は念のため最大ピースを採用する。
     let bestRing: Pair[] | null = null;
     let bestArea = 0;
     for (const piece of result) {

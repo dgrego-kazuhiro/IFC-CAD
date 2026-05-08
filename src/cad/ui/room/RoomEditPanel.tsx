@@ -8,6 +8,8 @@ import { SpaceElement, RoomPolygon, polygonEdges, isPolygonClosed } from "../../
 import { generateId } from "../../utils/ids";
 import { WallElement } from "../../model/elements/WallElement";
 import { CreateWallCommand } from "../../commands/create/CreateWallCommand";
+import { ChangeWallReferenceCommand, type WallReferenceMode } from "../../commands/modify/ChangeWallReferenceCommand";
+import { STANDARD_FAMILIES } from "../../model/catalog";
 import {
     AddConstraintCommand,
     RemoveConstraintCommand,
@@ -20,7 +22,7 @@ import { ElementId } from "../../model/base/ElementId";
 
 import { computeMiteredWallAxes, computeWalledOutlineGeometry, offsetClosedPolygonOCCT } from "./wallSync";
 import type { PolylineEntity } from "../../model/sketch/SketchEntity";
-import { regenerateAllWalls } from "./wallRegenerate";
+import { regenerateAllWalls, triggerWallRegenIfEnabled } from "./wallRegenerate";
 
 export default function RoomEditPanel() {
     // OCCT 内/外オフセットの距離 (mm)。負値で内側、正値で外側。
@@ -31,6 +33,8 @@ export default function RoomEditPanel() {
     // regenerateAllWalls を呼ぶための前提。
     const wallThicknessMm = useAppState((s: AppState) => s.wallThicknessMm);
     const setWallThicknessMm = useAppState((s: AppState) => s.setWallThicknessMm);
+    const wallReferenceMode = useAppState((s: AppState) => s.wallReferenceMode);
+    const setWallReferenceMode = useAppState((s: AppState) => s.setWallReferenceMode);
     const circleWallAngleDeg = useAppState((s: AppState) => s.circleWallAngleDeg);
     const setCircleWallAngleDeg = useAppState((s: AppState) => s.setCircleWallAngleDeg);
     const realtimeWallGen = useAppState((s: AppState) => s.realtimeWallGen);
@@ -50,6 +54,124 @@ export default function RoomEditPanel() {
     const removeElement = useAppState((s: AppState) => s.removeElement);
     const setSelection = useAppState((s: AppState) => s.setSelection);
     const setSpaceEntities = useAppState((s: AppState) => s.setSpaceEntities);
+
+    // ── 基準線モード切替 ────────────────────────────────────────
+    //
+    // ドロップダウンの挙動は **エッジ選択の有無** で分岐する:
+    //   - エッジが 1 本以上選択されていれば、そのエッジの壁だけ
+    //     ChangeWallReferenceCommand で更新 (= per-edge)。既定値
+    //     (AppState.wallReferenceMode) は触らない。
+    //   - 何も選択されていなければ、アクティブ部屋の全壁に一括適用 +
+    //     既定値も更新 (= bulk)。新規壁の既定基準線はここで決まる。
+    //
+    // 一括適用は wallRegenerate に prevInfo で per-edge 旧値を保持される
+    // ため、壁要素の inner/outer/locationLine を先に上書きしてから regen
+    // を呼ぶ必要がある (これをしないと「ドロップダウン変えても見た目が
+    // 変わらない」現象になる)。
+    const applyWallReferenceModeToActiveRoom = React.useCallback(
+        (mode: WallReferenceMode) => {
+            if (!activeRoomId) {
+                // 部屋未選択時はドロップダウンが「新規作成壁の既定」用なので
+                // 既定値だけ更新する。
+                setWallReferenceMode(mode);
+                return;
+            }
+            const live = useAppState.getState();
+            const room = live.elements[activeRoomId as string] as SpaceElement | undefined;
+            if (!room || room.type !== "Space") return;
+
+            // ── per-edge 経路: 選択エッジの壁だけを切替 ────────────────
+            const selectedEdges = live.sketchSelection.filter(
+                (s): s is { kind: "edge"; spaceId: string; polyId: string; edgeIdx: number } =>
+                    s.kind === "edge" && s.spaceId === activeRoomId,
+            );
+            if (selectedEdges.length > 0) {
+                const targetWallIds = new Set<string>();
+                for (const sel of selectedEdges) {
+                    const poly = room.polygons?.find((p) => p.id === sel.polyId);
+                    if (!poly) continue;
+                    const wid = poly.wallIds?.[sel.edgeIdx]
+                        ?? poly.wallsPerEdge?.[sel.edgeIdx]?.[0]
+                        ?? null;
+                    if (wid) targetWallIds.add(wid);
+                }
+                for (const wid of targetWallIds) {
+                    executeCommand(new ChangeWallReferenceCommand(wid as ElementId, mode));
+                }
+                return;
+            }
+
+            // ── bulk 経路: 部屋全体に一括適用 + 既定値も更新 ──────────
+            setWallReferenceMode(mode);
+            const newLocationLine: WallElement["locationLine"] =
+                mode === "Interior" ? "FinishInterior" :
+                mode === "Exterior" ? "FinishExterior" :
+                "Center";
+
+            const seedPolyIds: string[] = [];
+            for (const poly of room.polygons ?? []) {
+                if (poly.wallOutlineOf) continue;  // outline polygon は派生
+                seedPolyIds.push(poly.id);
+                for (const wid of poly.wallIds ?? []) {
+                    if (!wid) continue;
+                    const w = live.elements[wid] as WallElement | undefined;
+                    if (!w || w.type !== "Wall") continue;
+                    const T = w.thickness;
+                    let inner: number, outer: number;
+                    switch (mode) {
+                        case "Interior": inner = 0;     outer = T;     break;
+                        case "Exterior": inner = T;     outer = 0;     break;
+                        case "Center":
+                        default:         inner = T / 2; outer = T / 2; break;
+                    }
+                    updateElement(wid, {
+                        innerThickness: inner,
+                        outerThickness: outer,
+                        locationLine: newLocationLine,
+                        // footprint をクリアして wallRegenerate に再計算させる
+                        footprint: undefined,
+                        footprintHoles: undefined,
+                        footprintIsFinal: false,
+                        dirtyFlags: new Set(["Topology", "Geometry", "Mesh", "Render"]),
+                    } as Partial<WallElement>);
+                }
+            }
+            // 更新済み per-edge 厚さで JunctionGraph 接合再計算
+            if (seedPolyIds.length > 0) {
+                triggerWallRegenIfEnabled("wallReferenceMode-change", seedPolyIds);
+            }
+        },
+        [activeRoomId, setWallReferenceMode, updateElement, executeCommand],
+    );
+
+    // ── 部屋モード用の WallType ピッカー ──────────────────────────
+    // 部屋確定 / 壁生成 / リアルタイム壁生成は wallRegenerate 内で
+    // `useAppState.getState().activeTypeIdByCategory.Wall` を参照して
+    // CreateWallCommand に渡している。ここで Type を選び替えると、以後
+    // 生成される壁の Type が切り替わる。
+    const types = useAppState((s: AppState) => s.types);
+    const activeWallTypeId = useAppState(
+        (s: AppState) => s.activeTypeIdByCategory.Wall,
+    );
+    const setActiveTypeId = useAppState((s: AppState) => s.setActiveTypeId);
+    const wallTypesGrouped = React.useMemo(() => {
+        const families = STANDARD_FAMILIES.filter((f) => f.categoryId === "Wall");
+        return families.map((fam) => ({
+            family: fam,
+            types: Object.values(types)
+                .filter((t) => t.familyId === fam.id)
+                .sort((a, b) => a.name.localeCompare(b.name, "ja")),
+        })).filter((g) => g.types.length > 0);
+    }, [types]);
+    // 選択中 Type の thickness を mm で表示すると、ユーザーが現在の Type の
+    // 既定値と override (= 入力欄) のズレに気付ける。Type を切替えたら
+    // wallThicknessMm 入力欄も追従させる (= ColumnTool と同じ思想)。
+    React.useEffect(() => {
+        if (!activeWallTypeId) return;
+        const t = types[activeWallTypeId];
+        if (!t || t.kind !== "WallType") return;
+        setWallThicknessMm(String(Math.round(t.thickness * 1000)));
+    }, [activeWallTypeId, types, setWallThicknessMm]);
 
     // Delete / Backspace handler registered at top level (above the early
     // returns) so the hook order remains stable across renders. The actual
@@ -292,8 +414,17 @@ export default function RoomEditPanel() {
                 }
             }
         }
+        const wallTypeId = useAppState.getState().activeTypeIdByCategory.Wall;
+        if (!wallTypeId) {
+            console.warn("[walls] no active WallType — skipping creation");
+            return;
+        }
         for (const [root, { axis }] of groupRepresentative) {
-            const cmd = new CreateWallCommand(axis, wallThickness, room.height, undefined, room.levelId);
+            // ユーザ入力 wallThickness は override で渡し、Type デフォルトより優先。
+            const cmd = new CreateWallCommand(
+                axis, wallTypeId as any, room.height, undefined, room.levelId,
+                { thickness: wallThickness },
+            );
             executeCommand(cmd);
             groupWallId.set(root, cmd.getElementId());
         }
@@ -473,6 +604,7 @@ export default function RoomEditPanel() {
             regenerateAllWalls({
                 wallThicknessMm: live.wallThicknessMm,
                 circleWallAngleDeg: live.circleWallAngleDeg,
+                wallReferenceMode: live.wallReferenceMode,
             });
         }
         setSelection([]);
@@ -481,6 +613,27 @@ export default function RoomEditPanel() {
     const selectedEdges = sketchSelection.filter(
         (s): s is { kind: "edge"; spaceId: string; polyId: string; edgeIdx: number } => s.kind === "edge",
     );
+
+    // 基準ドロップダウンの表示値: エッジ選択がある時は **選択中の壁の現在値**
+    // を映す (= per-edge モードでは「今この壁が何になっているか」を見せる)。
+    // 何も選択されていない時は AppState の既定値 (= 新規壁・bulk apply の既定)。
+    const referenceDropdownValue: WallReferenceMode = (() => {
+        if (selectedEdges.length === 0) return wallReferenceMode;
+        for (const sel of selectedEdges) {
+            if (sel.spaceId !== activeRoomId) continue;
+            const space = elements[sel.spaceId] as SpaceElement | undefined;
+            const poly = space?.polygons?.find((p) => p.id === sel.polyId);
+            const wid = poly?.wallIds?.[sel.edgeIdx]
+                ?? poly?.wallsPerEdge?.[sel.edgeIdx]?.[0]
+                ?? null;
+            const w = wid ? (elements[wid] as WallElement | undefined) : undefined;
+            if (!w || w.type !== "Wall") continue;
+            return w.locationLine === "FinishInterior" ? "Interior"
+                : w.locationLine === "FinishExterior" ? "Exterior"
+                : "Center";
+        }
+        return wallReferenceMode;
+    })();
 
     // Delete selected edges. Two paths depending on whether the edge has an
     // associated wall:
@@ -805,16 +958,63 @@ export default function RoomEditPanel() {
                 Trim
             </button>
             <div className="w-px h-6 bg-zinc-600 mx-1" />
-            <div className="flex items-center gap-1">
+            {/* WallType ピッカー — 部屋から派生して生成される壁の Type を選ぶ。
+                Type を切替えると下の厚さ入力欄も Type デフォルトへ追従する。 */}
+            <div className="flex items-center gap-1" title="壁タイプ — 部屋から生成される壁の Type を選択">
+                <span className="text-[10px] text-zinc-400">壁</span>
+                <select
+                    value={activeWallTypeId ?? ""}
+                    onChange={(e) => setActiveTypeId("Wall", e.target.value)}
+                    className="bg-zinc-900 border border-zinc-600 rounded px-1.5 py-1 text-xs text-zinc-100 outline-none focus:border-blue-500 max-w-[12rem]"
+                >
+                    {wallTypesGrouped.map(({ family, types: ts }) => (
+                        <optgroup key={family.id} label={family.name}>
+                            {ts.map((t) => (
+                                <option key={t.id} value={t.id}>
+                                    {t.name}{t.isStandard ? "" : " *"}
+                                </option>
+                            ))}
+                        </optgroup>
+                    ))}
+                </select>
+            </div>
+            <div className="flex items-center gap-1" title="壁厚 (mm) — Type の既定厚を上書きする override 値">
                 <input
                     type="number"
                     value={wallThicknessMm}
                     onChange={(e) => setWallThicknessMm(e.target.value)}
                     className="w-14 bg-zinc-900 border border-zinc-600 rounded px-1.5 py-1 text-xs text-zinc-100 text-center outline-none focus:border-blue-500"
-                    title="Wall thickness (mm)"
+                    title="Wall thickness override (mm)"
                     min={1}
                 />
                 <span className="text-[10px] text-zinc-500">mm</span>
+            </div>
+            {/* 基準線位置 — スケッチ線を壁のどこに置くかを決める。
+                Center: スケッチ線が壁芯 (= 内外に T/2 ずつ振り分け)
+                Interior: スケッチ線が室内側仕上げ面 (= 壁は外側へ T)
+                Exterior: スケッチ線が屋外側仕上げ面 (= 壁は内側へ T)
+                変更時は次の wallRegenerate でポリゴンの wallReference に反映。
+                エッジ選択中は per-edge 切替、未選択時は部屋全体に一括適用。 */}
+            <div className="flex items-center gap-1" title="基準線位置 (壁芯 / 室内面 / 屋外面)">
+                <span className="text-[10px] text-zinc-400">基準</span>
+                <select
+                    value={referenceDropdownValue}
+                    onChange={(e) => applyWallReferenceModeToActiveRoom(
+                        e.target.value as WallReferenceMode,
+                    )}
+                    className="bg-zinc-900 border border-zinc-600 rounded px-1.5 py-1 text-xs text-zinc-100 outline-none focus:border-blue-500"
+                    title={
+                        selectedEdges.length > 0
+                            ? `選択エッジ ${selectedEdges.length} 本のみ基準線を切替 (= per-edge)。`
+                        : activeRoomId
+                            ? "選択中の部屋の全壁を新基準線で再生成 + 既定値も更新 (= bulk)。1本だけ変えたい場合はエッジを選択してから切替"
+                            : "新規作成壁の既定基準線"
+                    }
+                >
+                    <option value="Center">壁芯</option>
+                    <option value="Interior">内側面 (壁を外へ)</option>
+                    <option value="Exterior">外側面 (壁を内へ)</option>
+                </select>
             </div>
             {hasSelectedCircle && (
                 <div className="flex items-center gap-1 pl-1 border-l border-zinc-600 ml-1">
