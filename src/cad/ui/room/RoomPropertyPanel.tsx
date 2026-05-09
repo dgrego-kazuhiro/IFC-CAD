@@ -70,27 +70,59 @@ export default function RoomPropertyPanel({ activeRoomId }: { activeRoomId: Elem
             </Field>
 
             <Field label="用途">
-                <input
-                    type="text"
-                    list={`room-usage-options-${activeRoomId}`}
-                    value={usageDraft}
-                    placeholder="個室 / LDK / 収納 …"
-                    onChange={(e) => setUsageDraft(e.target.value)}
-                    onBlur={commitUsage}
-                    onKeyDown={(e) => {
-                        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                        else if (e.key === "Escape") {
-                            setUsageDraft(currentUsage);
-                            (e.target as HTMLInputElement).blur();
-                        }
-                    }}
-                    className={inputCls}
-                />
-                <datalist id={`room-usage-options-${activeRoomId}`}>
-                    {["個室", "LDK", "寝室", "子ども室", "収納", "玄関", "洗面", "浴室", "WC", "廊下"].map((u) => (
-                        <option key={u} value={u} />
-                    ))}
-                </datalist>
+                {(() => {
+                    const presetOptions = ["個室", "LDK", "寝室", "子ども室", "収納", "玄関", "洗面", "浴室", "WC", "廊下"];
+                    // 現在値がプリセットに無ければ "__custom__" 扱いで自由入力欄を出す。
+                    // datalist だと既存値で候補がフィルタされて他の選択肢が見えなく
+                    // なる仕様だったので、明示的な <select> + 自由入力に分離する。
+                    const isPreset = presetOptions.includes(usageDraft);
+                    return (
+                        <div className="space-y-1">
+                            <select
+                                value={isPreset ? usageDraft : (usageDraft ? "__custom__" : "")}
+                                onChange={(e) => {
+                                    const v = e.target.value;
+                                    if (v === "__custom__") {
+                                        // 自由入力に切替 (現在値は維持)。
+                                        if (isPreset) {
+                                            setUsageDraft("");
+                                            updateElement(activeRoomId, { usage: "" } as any);
+                                        }
+                                        return;
+                                    }
+                                    setUsageDraft(v);
+                                    if (v !== currentUsage) {
+                                        updateElement(activeRoomId, { usage: v } as any);
+                                    }
+                                }}
+                                className={inputCls}
+                            >
+                                <option value="">未設定</option>
+                                {presetOptions.map((u) => (
+                                    <option key={u} value={u}>{u}</option>
+                                ))}
+                                <option value="__custom__">その他 (自由入力)</option>
+                            </select>
+                            {!isPreset && (
+                                <input
+                                    type="text"
+                                    value={usageDraft}
+                                    placeholder="自由入力"
+                                    onChange={(e) => setUsageDraft(e.target.value)}
+                                    onBlur={commitUsage}
+                                    onKeyDown={(e) => {
+                                        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                                        else if (e.key === "Escape") {
+                                            setUsageDraft(currentUsage);
+                                            (e.target as HTMLInputElement).blur();
+                                        }
+                                    }}
+                                    className={inputCls}
+                                />
+                            )}
+                        </div>
+                    );
+                })()}
             </Field>
 
             {m ? (

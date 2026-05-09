@@ -2,7 +2,7 @@
 
 import React, { useState } from "react";
 import { mat4 } from "gl-matrix";
-import { RectangleHorizontal, Trash2, MousePointer2, Square, Spline, Circle, Boxes, Minus, Slash, Scissors, GitCompareArrows } from "lucide-react";
+import { RectangleHorizontal, Trash2, MousePointer2, Square, Spline, Circle, Boxes, Minus, Scissors, GitCompareArrows, Eraser } from "lucide-react";
 import { useAppState, AppState } from "../../application/AppState";
 import { SpaceElement, RoomPolygon, polygonEdges, isPolygonClosed } from "../../model/elements/SpaceElement";
 import { generateId } from "../../utils/ids";
@@ -936,7 +936,10 @@ export default function RoomEditPanel() {
                 Wall Path
             </button>
 
-            
+
+            {/* Line ボタンは Wall Path が同等機能 (= 2 点の単独壁ポリライン) を
+                兼ねているのでコメントアウト。Wall Path で 2 点だけ打って Enter /
+                右クリックすれば線分相当のスケッチが作れる。
             <button
                 className={btnClass(roomEditMode === "line")}
                 onClick={() => setRoomEditMode("line")}
@@ -945,7 +948,8 @@ export default function RoomEditPanel() {
                 <Slash size={14} />
                 Line
             </button>
-            
+            */}
+
             <button
                 className={btnClass(roomEditMode === "arc")}
                 onClick={() => setRoomEditMode("arc")}
@@ -962,6 +966,15 @@ export default function RoomEditPanel() {
             >
                 <Scissors size={14} />
                 Trim
+            </button>
+
+            <button
+                className={btnClass(roomEditMode === "wallSkip")}
+                onClick={() => setRoomEditMode("wallSkip")}
+                title="壁の部分削除 (= 3D 壁を生成しない区間): エッジを選び、2 点で範囲を指定"
+            >
+                <Eraser size={14} />
+                壁トリム
             </button>
             
             <div className="w-px h-6 bg-zinc-600 mx-1" />

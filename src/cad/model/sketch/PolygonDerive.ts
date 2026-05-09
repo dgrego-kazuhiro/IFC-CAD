@@ -98,6 +98,18 @@ export function derivePolygonsFromEntities(
             // 開チェインは edge 数 = points.length - 1。tessellateChainWithOwners
             // は閉チェインを想定して edge 数 = points.length を出すので末尾を切る。
             overrides.edgeOwners = edgeOwners.slice(0, edges.length);
+        } else if (prev && prev.edges) {
+            // 開チェイン → 閉チェイン (= 部屋になる) の遷移。前 polygon の
+            // wallIds / wallsPerEdge / edgeIds は古い edge index 前提なので、
+            // edge 数が増えたあとも流用すると不整合になる (= edge[i] と
+            // wallId[i] の対応が崩れて壁レンダーが崩壊)。閉化遷移時は
+            // wallIds 系をクリアして wallRegenerate に再構築させる。
+            overrides.edges = undefined;
+            overrides.wallIds = undefined;
+            overrides.wallsPerEdge = undefined;
+            overrides.edgeIds = undefined;
+            overrides.sharedEdgeIds = undefined;
+            overrides.vertexConnections = undefined;
         }
         polygons.push(makeRoomPolygon(polyId, points, prev, overrides));
     }
@@ -131,6 +143,12 @@ function makeRoomPolygon(
         // 隣接 setSpaceEntities が走った瞬間に joints が消えて WallPath の
         // 接合情報が失われる。
         joints: prev?.joints,
+        // wallSkips: ユーザが「壁を削除 / 部分削除」で指定したエッジ範囲。
+        // 部屋を移動 / 頂点ドラッグすると entity 駆動の re-derive が走るが、
+        // edgeIdx ベースで保存されているので outer の数値だけが変わる典型ケース
+        // (= 平行移動・拡大) では引き継いで問題ない。ここで継承しないと、
+        // ドラッグ完了の wallRegenerate が wallSkips を見失って 3D 壁が復活する。
+        wallSkips: prev?.wallSkips,
         ...overrides,
     };
 }

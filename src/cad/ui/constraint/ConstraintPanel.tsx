@@ -211,6 +211,26 @@ export default function ConstraintPanel() {
         if (!t0 || !t1) return;
         add(mkC("Length", [t0, t1], v));
     };
+    /** 通芯 + 点 の Length 拘束 (= 通芯線への垂直距離、軸平行通芯では X/Y 直接固定)。 */
+    const addGridPointLength = () => {
+        const v = parseFloat(lengthValue);
+        if (!Number.isFinite(v) || v <= 0) return;
+        if (gridLineSel.length !== 1 || pointLikeSel.length !== 1) return;
+        const tg = toEdgeTarget(gridLineSel[0]);
+        const tp = toPointTarget(pointLikeSel[0]);
+        if (!tg || !tp) return;
+        add(mkC("Length", [tg, tp], v));
+    };
+    /** 通芯 + 通芯 の Length 拘束 (= 平行通芯間の距離)。 */
+    const addGridGridLength = () => {
+        const v = parseFloat(lengthValue);
+        if (!Number.isFinite(v) || v <= 0) return;
+        if (gridLineSel.length < 2) return;
+        const t0 = toEdgeTarget(gridLineSel[0]);
+        const t1 = toEdgeTarget(gridLineSel[1]);
+        if (!t0 || !t1) return;
+        add(mkC("Length", [t0, t1], v));
+    };
     const addParallel = () => {
         if (edgeLikeSel.length < 2) return;
         const t0 = toEdgeTarget(edgeLikeSel[0]);
@@ -842,6 +862,21 @@ export default function ConstraintPanel() {
         (nPoints === 1 && nEdges === 1 && nCircles === 0) ||
         (nPoints === 0 && nCircles === 0 && polyEdgeCount === 1 && refEdgeCount === 1)
     );
+    // 通芯 + 点 の Length 拘束 (= 通芯線への距離)。
+    // 1 通芯 + 1 点 (= 部屋頂点 / 壁端点 / 柱 / 通芯端点 / 原点) で他の edge / circle が無い時。
+    const canGridPointLength = (
+        gridLineSel.length === 1
+        && pointLikeSel.length === 1
+        && nEdges === 0   // polygon edge / wall axis を含まない
+        && nCircles === 0
+    );
+    // 通芯 + 通芯 の Length 拘束 (= 通芯間の距離)。
+    const canGridGridLength = (
+        gridLineSel.length === 2
+        && pointLikeSel.length === 0
+        && nEdges === 0   // polygon edge / wall axis を含まない
+        && nCircles === 0
+    );
     const canCoincident = onlyPoints && nPoints >= 2;
     const canPointOnGrid = onlyPoints && nPoints >= 1 && grids.length > 0;
     const canCircleRadius = onlyCircles && nCircles >= 1;
@@ -858,6 +893,7 @@ export default function ConstraintPanel() {
     const anyApplicable =
         canHV || canLength || canP2PLength || canParallel || canPerpendicular || canAngle || canCollinear || canEqualLength || canCoincident || canPointOnGrid ||
         canPerpDistance ||
+        canGridPointLength || canGridGridLength ||
         canCircleRadius || canCircleDiameter || canConcentric || canEqualRadius || canTangent || canPointOnCircle ||
         canArcRadius || canArcDiameter;
 
@@ -966,6 +1002,42 @@ export default function ConstraintPanel() {
                                 onClick={addP2PLength}
                                 title="選択した 2 点間 (柱・通芯端点・原点・部屋頂点・壁端点 など) を距離 d に固定"
                             >2点距離 ↔</button>
+                        </div>
+                    )}
+                    {canGridPointLength && (
+                        <div className="flex items-center gap-1">
+                            <input
+                                className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
+                                type="number"
+                                step="0.1"
+                                placeholder="距離 m"
+                                value={lengthValue}
+                                onChange={(e) => setLengthValue(e.target.value)}
+                            />
+                            <button
+                                className={btn + " disabled:opacity-30 disabled:cursor-not-allowed"}
+                                disabled={!lengthValue}
+                                onClick={addGridPointLength}
+                                title="通芯と点の距離を固定。軸平行通芯なら X / Y 座標を直接固定"
+                            >通芯-点距離 ↔</button>
+                        </div>
+                    )}
+                    {canGridGridLength && (
+                        <div className="flex items-center gap-1">
+                            <input
+                                className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
+                                type="number"
+                                step="0.1"
+                                placeholder="距離 m"
+                                value={lengthValue}
+                                onChange={(e) => setLengthValue(e.target.value)}
+                            />
+                            <button
+                                className={btn + " disabled:opacity-30 disabled:cursor-not-allowed"}
+                                disabled={!lengthValue}
+                                onClick={addGridGridLength}
+                                title="2 本の通芯間距離を固定 (両通芯は固定値、現位置の検証用)"
+                            >通芯間距離 ↔</button>
                         </div>
                     )}
                     {(canParallel || canPerpendicular) && (

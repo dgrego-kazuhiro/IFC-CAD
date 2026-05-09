@@ -66,6 +66,7 @@ import { WallJoinResolver, WallJoinResult } from "../../topology/joins/WallJoinR
 import { snapToGrids, pickGrid, snapAngle, snapAxisAlign, GridSnapResult, AxisAlignSnapResult } from "../../model/grid/GridSnap";
 import GridBubbleOverlay from "../grid/GridBubbleOverlay";
 import GridEditOverlay from "../grid/GridEditOverlay";
+import GridAxisGuideOverlay from "../grid/GridAxisGuideOverlay";
 import { gridVertices } from "../../model/grid/GridLine";
 import { triggerWallRegenIfEnabled } from "../room/wallRegenerate";
 
@@ -852,6 +853,51 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         setGridlineDrafting(false);
     }, [setGridlineDrafting]);
 
+    /**
+     * 通芯作成直後にジオメトリから自動拘束を付ける。
+     *   - 端点のいずれかが原点近傍 (1mm 以内) → Length(grid, Origin, 0)
+     *   - 通芯方向 dz ≈ 0 (= 水平) → Horizontal
+     *   - 通芯方向 dx ≈ 0 (= 垂直) → Vertical
+     * snap 経由で原点や軸整列に乗せた通芯にユーザの意図を「拘束」として
+     * 自動記録する。手動で水平/垂直に揃えなくても、作図時に拘束が付く。
+     */
+    const applyAutoGridConstraints = (
+        gridId: string,
+        start: Vec3,
+        end: Vec3,
+    ) => {
+        const ORIGIN_TOL = 1e-3; // 1 mm
+        const AXIS_TOL = 1e-4;   // 0.1 mm
+        const startAtOrigin = Math.hypot(start[0], start[2]) < ORIGIN_TOL;
+        const endAtOrigin = Math.hypot(end[0], end[2]) < ORIGIN_TOL;
+        if (startAtOrigin || endAtOrigin) {
+            executeCommand(new AddConstraintCommand({
+                id: generateConstraintId(),
+                type: "Length",
+                targets: [
+                    { kind: "Grid", gridId },
+                    { kind: "Origin" },
+                ],
+                value: 0,
+            }));
+        }
+        const dx = end[0] - start[0];
+        const dz = end[2] - start[2];
+        if (Math.abs(dz) < AXIS_TOL && Math.abs(dx) > AXIS_TOL) {
+            executeCommand(new AddConstraintCommand({
+                id: generateConstraintId(),
+                type: "Horizontal",
+                targets: [{ kind: "Grid", gridId }],
+            }));
+        } else if (Math.abs(dx) < AXIS_TOL && Math.abs(dz) > AXIS_TOL) {
+            executeCommand(new AddConstraintCommand({
+                id: generateConstraintId(),
+                type: "Vertical",
+                targets: [{ kind: "Grid", gridId }],
+            }));
+        }
+    };
+
     // Enter finalizes the polyline draft (if any) or exits line drafting.
     // Esc still bubbles up to CadShell / useEffect cleanup.
     useEffect(() => {
@@ -1091,7 +1137,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh: meshData,
                         transform: wallYTransform(el),
                         visible: true,
-                        color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [140 / 255, 140 / 255, 145 / 255, 0.85],
+                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [140 / 255, 140 / 255, 145 / 255, 0.85],
                     });
                 } else {
                     // 3D Geometry: hex footprint when wall has polyRef AND
@@ -1173,9 +1219,9 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh: meshData,
                         transform: wallYTransform(el),
                         visible: true,
-                        color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [0.88, 0.88, 0.9, 1.0],
-                        //color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [0.88, 0.88, 0.9, 1.0],
-                        //color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [0.45, 0.45, 0.5, 1.0],
+                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.88, 0.88, 0.9, 1.0],
+                        //color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.88, 0.88, 0.9, 1.0],
+                        //color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.45, 0.45, 0.5, 1.0],
                         cylinderCenter,
                     });
 
@@ -1469,7 +1515,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh,
                         transform: mat4.create(),
                         visible: true,
-                        color: isSelected ? [0.25, 0.75, 1.0, 0.85] : [0.5, 0.8, 1.0, 0.55],
+                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.5, 0.8, 1.0, 0.55],
                     });
                 });
             }
@@ -1506,7 +1552,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 transform: mat4.create(),
                 visible: true,
                 color: isSel
-                    ? [1.0, 0.4, 0.0, 1.0]              // selection: orange
+                    ? [249 / 255, 115 / 255, 22 / 255, 1.0]              // selection: orange
                     : isSketchSel
                     ? [0.1, 0.85, 0.35, 1.0]            // sketchSelection: emerald
                     : [0.85, 0.85, 0.88, 1.0],
@@ -1610,7 +1656,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 mesh: BeamMeshBuilder.buildFromElement(beam, elevation, beamColFps.length > 0 ? beamColFps : undefined),
                 transform: mat4.create(),
                 visible: true,
-                color: selection.includes(beam.id as string) ? [1.0, 0.4, 0.0, 1.0] : [0.83, 0.83, 0.86, 1.0],
+                color: selection.includes(beam.id as string) ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.83, 0.83, 0.86, 1.0],
             });
         }
 
@@ -1721,7 +1767,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     mesh: SlabMeshBuilder.build(slab),
                     transform: slabXform,
                     visible: true,
-                    color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [0.9, 0.9, 0.92, 1.0],
+                    color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.9, 0.9, 0.92, 1.0],
                     // 裏側 (= 床下から見上げ) からも slab が柱・壁を occlude
                     // するように両面描画。
                     noCull: true,
@@ -1774,7 +1820,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh,
                         transform: openingTransform,
                         visible: true,
-                        color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [0.55, 0.35, 0.18, 1.0],
+                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.55, 0.35, 0.18, 1.0],
                         noCull: true,
                     });
                 } else {
@@ -1791,7 +1837,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh,
                         transform: openingTransform,
                         visible: true,
-                        color: isSelected ? [1.0, 0.4, 0.0, 1.0] : [0.6, 0.78, 0.92, 0.85],
+                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.6, 0.78, 0.92, 0.85],
                         noCull: true,
                     });
                 }
@@ -2000,9 +2046,13 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
 
         // 通芯 — render in both 2D and 3D, including room-edit mode
         {
-            const primaryColor: [number, number, number, number] = useOrtho ? [0.85, 0.2, 0.2, 1.0] : [0.85, 0.3, 0.3, 0.85];
-            const auxColor: [number, number, number, number] = useOrtho ? [0.85, 0.55, 0.2, 1.0] : [0.85, 0.6, 0.3, 0.85];
-            const selectedColor: [number, number, number, number] = [0.98, 0.78, 0.08, 1.0];
+            // 通芯 Primary はピンク (≒ ec4899 = Tailwind pink-500)、
+            // Auxiliary は薄ピンク。3D ビューはアルファを下げて控えめに。
+            const primaryColor: [number, number, number, number] = useOrtho ? [0.925, 0.282, 0.6, 1.0] : [0.925, 0.282, 0.6, 0.85];
+            const auxColor: [number, number, number, number] = useOrtho ? [0.965, 0.658, 0.815, 1.0] : [0.965, 0.658, 0.815, 0.85];
+            // 全モードで統一した選択色 (= orange-500、RoomSketchOverlay の
+            // C_RECT_SEL と同色)。
+            const selectedColor: [number, number, number, number] = [249 / 255, 115 / 255, 22 / 255, 1.0];
             // Screen-constant thickness in ortho: world thickness = px * (2*zoom / canvasHeight).
             // Perspective keeps a fixed world thickness.
             const GRID_LINE_PX = 1.5;
@@ -2041,7 +2091,13 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         if (useOrtho && !inRoomMode) {
             if (activeTool === "gridline" && gridlineDrafting && gridSnap) {
                 const sp = gridSnap.point;
-                const s = 0.25;
+                // クロスマーカーの腕長を **ピクセル一定** にする (= ortho zoom と
+                // canvas 高さから world-per-pixel 比に換算)。世界 0.25m 固定だと
+                // ズームインで巨大に、ズームアウトで小さくなるため。
+                const canvasH = canvasRef.current?.clientHeight ?? 800;
+                const pxToWorld = (2 * orthoZoom) / canvasH;
+                const SNAP_CROSS_HALF_PX = 8; // 腕長 = 8px → 全長 16px
+                const s = SNAP_CROSS_HALF_PX * pxToWorld;
                 const cross: Vec3[] = [
                     [sp[0] - s, 0, sp[2]], [sp[0] + s, 0, sp[2]],
                 ];
@@ -2063,46 +2119,13 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 });
             }
 
-            // Axis-alignment guide lines from reference endpoints to the cursor
-            if (activeTool === "gridline" && gridlineDrafting && gridAxisSnap) {
-                const guideColor: [number, number, number, number] = [0.2, 0.75, 0.95, 0.9];
-                const sp = gridAxisSnap.point;
-                if (gridAxisSnap.refPointH) {
-                    const r = gridAxisSnap.refPointH;
-                    scene.addObject({
-                        id: "grid-axis-guide-h",
-                        mesh: LineMeshBuilder.build([[r[0], 0, r[2]], [sp[0], 0, r[2]]]),
-                        transform: mat4.create(),
-                        visible: true,
-                        color: guideColor,
-                    });
-                }
-                if (gridAxisSnap.refPointV) {
-                    const r = gridAxisSnap.refPointV;
-                    scene.addObject({
-                        id: "grid-axis-guide-v",
-                        mesh: LineMeshBuilder.build([[r[0], 0, r[2]], [r[0], 0, sp[2]]]),
-                        transform: mat4.create(),
-                        visible: true,
-                        color: guideColor,
-                    });
-                }
-                const s = 0.2;
-                scene.addObject({
-                    id: "grid-axis-marker-h",
-                    mesh: LineMeshBuilder.build([[sp[0] - s, 0, sp[2]], [sp[0] + s, 0, sp[2]]]),
-                    transform: mat4.create(),
-                    visible: true,
-                    color: guideColor,
-                });
-                scene.addObject({
-                    id: "grid-axis-marker-v",
-                    mesh: LineMeshBuilder.build([[sp[0], 0, sp[2] - s], [sp[0], 0, sp[2] + s]]),
-                    transform: mat4.create(),
-                    visible: true,
-                    color: guideColor,
-                });
-            }
+            // Axis-alignment guide は GridAxisGuideOverlay (SVG) で描画する。
+            // 線幅 1px ・点線パターン・距離ラベルが camera 距離に依存しない
+            // 一定見た目になるため、世界空間メッシュからは除外。
+
+            // 通芯モード時の原点マーカーは RoomSketchOverlay 側で描画する
+            // (= 部屋モードと完全に同じ SketchOverlayRenderer 経由で描く)。
+            // ここでは何もしない。
 
             // Active draft previews
             if (activeTool === "gridline" && gridlineDrafting) {
@@ -2778,7 +2801,8 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             const raw = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
             if (!raw) return;
             // Priority (spec §10 + drafting aids):
-            //   structural object snap (柱中心/壁端点/壁軸/通芯交点) > axis alignment > angle snap > free
+            //   原点 (0,0,0) > structural object snap (柱中心/壁端点/壁軸/通芯交点)
+            //     > 通芯スナップ > axis alignment > angle snap > free
             const lastDraftPt = gridDraftMode === "polyline" && gridDraftPoints.length > 0
                 ? gridDraftPoints[gridDraftPoints.length - 1]
                 : gridStart;
@@ -2788,12 +2812,17 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 for (const v of gridVertices(g.curve)) refPoints.push(v);
             }
             if (lastDraftPt) refPoints.push(lastDraftPt);
+            // 原点スナップ (= 通芯モードの最優先スナップ)。0.5m トレランス。
+            const distToOrigin = Math.hypot(raw[0], raw[2]);
+            const originSnap = distToOrigin <= 0.5;
             // 柱・壁端点・壁軸・通芯交点 を網羅する snapForBeam を優先。
             const structSnap = snapForBeam(raw, elements, grids as any, 0.5,
                 designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined);
             const objSnap = snapToGrids(raw, grids);
             let pt: Vec3;
-            if (structSnap.kind) {
+            if (originSnap) {
+                pt = [0, 0, 0];
+            } else if (structSnap.kind) {
                 pt = structSnap.point;
             } else if (objSnap) {
                 pt = objSnap.point;
@@ -2815,7 +2844,14 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     const first = gridDraftPoints[0];
                     const closeDist = Math.hypot(pt[0] - first[0], pt[2] - first[2]);
                     if (closeDist < 0.3) {
-                        addGridPolyline(gridDraftPoints, gridKind);
+                        const newId = addGridPolyline(gridDraftPoints, gridKind);
+                        if (newId) {
+                            applyAutoGridConstraints(
+                                newId,
+                                gridDraftPoints[0],
+                                gridDraftPoints[gridDraftPoints.length - 1],
+                            );
+                        }
                         setGridDraftPoints([]);
                         setGridHover(null);
                         setGridSnap(null);
@@ -2833,7 +2869,8 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 setGridStart(pt);
                 setGridHover(pt);
             } else {
-                addGrid(gridStart, pt, gridKind);
+                const newId = addGrid(gridStart, pt, gridKind);
+                if (newId) applyAutoGridConstraints(newId, gridStart, pt);
                 setGridStart(null);
                 setGridHover(null);
                 setGridSnap(null);
@@ -2992,7 +3029,10 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     for (const v of gridVertices(g.curve)) refPoints.push(v);
                 }
                 if (lastDraftPt) refPoints.push(lastDraftPt);
-                // 構造体スナップ (柱・壁端点・壁軸) を最優先、次に通芯スナップ。
+                // 原点スナップを最優先 (0.5m トレランス)。
+                const distToOrigin = Math.hypot(raw[0], raw[2]);
+                const originSnap = distToOrigin <= 0.5;
+                // 構造体スナップ (柱・壁端点・壁軸) を次の優先、次に通芯スナップ。
                 const structSnap = snapForBeam(raw, elements, grids as any, 0.5,
                     designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined);
                 const objSnap = snapToGrids(raw, grids);
@@ -3000,7 +3040,10 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 let angleDeg: number | null = null;
                 let pt: Vec3;
                 let snapForMarker: GridSnapResult | null = objSnap;
-                if (structSnap.kind) {
+                if (originSnap) {
+                    pt = [0, 0, 0];
+                    snapForMarker = { point: [0, 0, 0], kind: "Endpoint", gridIds: [] };
+                } else if (structSnap.kind) {
                     pt = structSnap.point;
                     // gridSnap state はマーカー表示用にも使われる。Endpoint
                     // 種別の合成オブジェクトを置く。
@@ -3282,6 +3325,11 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             <GridEditOverlay
                 getCamera={() => cameraRef.current}
                 getCanvas={() => canvasRef.current}
+            />
+            <GridAxisGuideOverlay
+                getCamera={() => cameraRef.current}
+                getCanvas={() => canvasRef.current}
+                axisSnap={activeTool === "gridline" && gridlineDrafting ? gridAxisSnap : null}
             />
             {activeRoomId && (
                 <ConstraintIconOverlay
@@ -3752,12 +3800,16 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                                 >Polyline</button>
                             </div>
                         </div>
-                        <button
-                            className={`w-full px-3 py-1 text-xs rounded border ${gridlineDrafting ? "bg-red-600 border-red-400 text-white" : "bg-zinc-100 border-zinc-300 hover:bg-zinc-200"}`}
-                            onClick={() => {
-                                if (gridlineDrafting) {
-                                    exitGridDrafting();
-                                } else {
+                        {/* サブモード切替: 追加 (drafting) ⇔ 編集 (vertex drag / 選択) */}
+                        <div className="flex gap-1">
+                            <button
+                                className={`flex-1 px-3 py-1 text-xs rounded border ${
+                                    gridlineDrafting
+                                        ? "bg-red-600 border-red-400 text-white"
+                                        : "bg-zinc-100 border-zinc-300 hover:bg-zinc-200 text-zinc-700"
+                                }`}
+                                onClick={() => {
+                                    if (gridlineDrafting) return;
                                     setGridStart(null);
                                     setGridHover(null);
                                     setGridSnap(null);
@@ -3766,11 +3818,22 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                                     setGridDraftPoints([]);
                                     setSelectedGridIds([]);
                                     setGridlineDrafting(true);
-                                }
-                            }}
-                        >
-                            {gridlineDrafting ? "描画終了" : "追加"}
-                        </button>
+                                }}
+                                title="新しい通芯を作図"
+                            >追加</button>
+                            <button
+                                className={`flex-1 px-3 py-1 text-xs rounded border ${
+                                    !gridlineDrafting
+                                        ? "bg-blue-600 border-blue-400 text-white"
+                                        : "bg-zinc-100 border-zinc-300 hover:bg-zinc-200 text-zinc-700"
+                                }`}
+                                onClick={() => {
+                                    if (!gridlineDrafting) return;
+                                    exitGridDrafting();
+                                }}
+                                title="通芯の頂点をドラッグ・選択して拘束を追加"
+                            >編集</button>
+                        </div>
                         {!gridlineDrafting && (
                             <div className="space-y-1">
                                 <div className="text-[10px] text-zinc-500">選択中: {selectedGridIds.length}</div>
@@ -3793,7 +3856,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                             <div className="text-[10px] text-zinc-500 mb-1">系列</div>
                             <div className="flex gap-1">
                                 <button
-                                    className={`flex-1 text-[10px] py-1 rounded border ${gridKind === "Primary" ? "bg-red-600 text-white border-red-500" : "bg-zinc-100 border-zinc-300 hover:bg-zinc-200"}`}
+                                    className={`flex-1 text-[10px] py-1 rounded border ${gridKind === "Primary" ? "bg-pink-600 text-white border-pink-500" : "bg-zinc-100 border-zinc-300 hover:bg-zinc-200"}`}
                                     onClick={() => setGridKind("Primary")}
                                 >Primary</button>
                                 <button

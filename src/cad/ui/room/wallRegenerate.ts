@@ -935,6 +935,16 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
     // 別々の wall element を作る (= ユーザ仕様)。
     let sharedGroups = 0;
     let createdWallCount = 0;
+    // 「edge 全体に wall を生成しない」スキップ判定。contributors のいずれかが
+    // wallSkips で full skip (= t0=0, t1=1) を指定していれば、この wall group
+    // 自体を作らずスキップ。共有壁では「いずれかの部屋が削除を望む」だけで
+    // 壁を消す挙動 (= 開口を作るのに十分)。部分削除 (t0/t1 が中間) は
+    // wallRegenerate ではまだ扱わず、後段の applyPartialWallSkips で処理する想定。
+    const isContributorFullySkipped = (c: { workIdx: number; oldEdgeIdx: number }) => {
+        const poly = works[c.workIdx].poly;
+        const skips = poly.wallSkips ?? [];
+        return skips.some((s) => s.edgeIdx === c.oldEdgeIdx && s.t0 <= 0 && s.t1 >= 1);
+    };
     for (const [key, group] of subGroups) {
         const isShared = group.polysContributing.size > 1;
         if (isShared) {
@@ -946,6 +956,13 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
             const cId = works[c.workIdx].poly.id;
             const bestId = works[canonical.workIdx].poly.id;
             if (cId < bestId) canonical = c;
+        }
+        // wallSkips: full skip があれば壁を生成しない。canonical / 全 contributor
+        // のいずれかにマークがあれば skip 対象。
+        if (group.contributors.some(isContributorFullySkipped)) {
+            // eslint-disable-next-line no-console
+            console.log(`[wallRegen/§7] subGroup ${key.slice(0,12)} fully skipped via wallSkips — no wall created`);
+            continue;
         }
         const canonicalWork = works[canonical.workIdx];
         const canonicalRebuild = polyRebuilds[canonical.workIdx];

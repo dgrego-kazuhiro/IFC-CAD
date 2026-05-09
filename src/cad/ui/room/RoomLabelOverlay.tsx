@@ -42,11 +42,22 @@ function labelPolygons(space: SpaceElement): RoomPolygon[] {
     return out;
 }
 
-function centroidXZ(poly: RoomPolygon): [number, number] {
-    let cx = 0, cy = 0;
-    for (const v of poly.outer) { cx += v[0]; cy += v[1]; }
-    cx /= poly.outer.length; cy /= poly.outer.length;
-    return [cx, cy];
+/**
+ * Axis-aligned bounding box の中心を返す。頂点平均 (centroid) を使うと、弧の
+ * tessellation などで頂点が密集する側にラベルが寄ってしまう (= D 形状で右側
+ * の弧側にラベルが偏る)。AABB 中心は頂点密度に依存しないため、ユーザの感覚
+ * に合った「真ん中」になる。
+ */
+function bboxCenterXZ(poly: RoomPolygon): [number, number] {
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    for (const v of poly.outer) {
+        if (v[0] < minX) minX = v[0];
+        if (v[0] > maxX) maxX = v[0];
+        if (v[1] < minY) minY = v[1];
+        if (v[1] > maxY) maxY = v[1];
+    }
+    return [(minX + maxX) * 0.5, (minY + maxY) * 0.5];
 }
 
 interface LabelEntry {
@@ -76,7 +87,7 @@ export default function RoomLabelOverlay({ getCamera, getCanvas }: Props) {
             const name = (el.name ?? "").trim();
             if (!name) continue;
             for (const poly of labelPolygons(el)) {
-                const [cx, cy] = centroidXZ(poly);
+                const [cx, cy] = bboxCenterXZ(poly);
                 const thickness = poly.wallThickness ?? 0.105;
                 const m = computeRoomMetrics(poly, thickness);
                 const sub = m.tatami > 0 ? `${m.tatami}畳` : null;

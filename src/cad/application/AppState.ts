@@ -109,6 +109,7 @@ export type RoomEditMode =
     | "arc"      // 3 点指定の円弧 (start, mid, end)。SketchEntity の arc を生成。
     | "arcEdge"  // 既存エッジ → Arc 化。chord は固定、マウスで bulge を決定。
     | "trim"     // 既存エンティティ (主に circle) を 2 点で部分化 → arc 化。
+    | "wallSkip" // 既存エッジの部分削除 (= 3D 壁を生成しない区間) を 2 クリックで定義。
     | "wallPath";
 
 /** Wall-tool sub-mode: "add" draws new walls, "select" picks sketch lines. */
@@ -606,8 +607,101 @@ export const useAppState = create<AppState>((set, get) => ({
             if (g.id !== id) return g;
             const v = gridVertices(g.curve);
             if (index < 0 || index >= v.length) return g;
+            // この通芯に水平 / 垂直拘束が付いていれば、ドラッグ点の座標と
+            // 他頂点の座標を **共有** して拘束を維持する。
+            //   - Horizontal (水平): 全頂点が同じ Z を持つ → ドラッグ点の Z
+            //     をそのまま使い、他頂点の Z も同値に更新 (= 線が上下に平行
+            //     移動できる)
+            //   - Vertical (垂直): 全頂点が同じ X を持つ → 同様に X を共有
+            // 旧実装では「ドラッグ点の Z を他頂点に強制」していたため、線が
+            // 上下に動かせなかった。
+            //
+            // また、原点との Length 拘束 (= 通過 / 距離) があれば、Horizontal
+            // 軸での Z または Vertical 軸での X を「原点から D の位置」に強制
+            // して拘束を保つ。
+            const cons = Object.values(state.constraints);
+            const hasH = cons.some((c) => c.type === "Horizontal"
+                && c.targets.some((t) => t.kind === "Grid" && t.gridId === id));
+            const hasV = cons.some((c) => c.type === "Vertical"
+                && c.targets.some((t) => t.kind === "Grid" && t.gridId === id));
+            const originLen = cons.find((c) =>
+                c.type === "Length"
+                && c.value !== undefined
+                && c.targets.some((t) => t.kind === "Grid" && t.gridId === id)
+                && c.targets.some((t) => t.kind === "Origin"));
+            // 通芯-通芯 の Length 拘束を集める (= 他通芯との距離を固定)。
+            // self の現在側 (= 他通芯から +n 側 / -n 側) を保ったまま強制。
+            const gridGridLens = cons.filter((c) =>
+                c.type === "Length"
+                && c.value !== undefined
+                && c.targets.length === 2
+                && c.targets.every((t) => t.kind === "Grid")
+                && c.targets.some((t) => t.kind === "Grid" && t.gridId === id),
+            );
+            let pos: typeof position = [position[0], position[1], position[2]];
+            // 原点との距離拘束を最優先。軸平行通芯ならその軸で原点距離 D を保つ。
+            if (originLen && originLen.value !== undefined) {
+                const D = originLen.value;
+                if (hasH) {
+                    const prevZ = v[0][2];
+                    const sign = prevZ >= 0 ? 1 : -1;
+                    pos = [pos[0], pos[1], sign * D];
+                } else if (hasV) {
+                    const prevX = v[0][0];
+                    const sign = prevX >= 0 ? 1 : -1;
+                    pos = [sign * D, pos[1], pos[2]];
+                }
+            } else if (gridGridLens.length > 0) {
+                // 通芯-通芯 距離拘束: self が水平/垂直軸平行で、他通芯も同方向
+                // なら、その軸座標 (Z or X) を「他通芯の座標 ± D」に強制。
+                //   - 両方水平 → Z 固定 (other.Z ± D)
+                //   - 両方垂直 → X 固定 (other.X ± D)
+                // 複数あれば最初の 1 個を採用 (= 矛盾拘束は前段で無効化想定)。
+                for (const c of gridGridLens) {
+                    const otherT = c.targets.find(
+                        (t) => t.kind === "Grid" && t.gridId !== id,
+                    );
+                    if (!otherT || otherT.kind !== "Grid") continue;
+                    const otherGrid = state.grids.find((g2) => g2.id === otherT.gridId);
+                    if (!otherGrid) continue;
+                    const ov = gridVertices(otherGrid.curve);
+                    if (ov.length < 2) continue;
+                    const odx = ov[1][0] - ov[0][0];
+                    const odz = ov[1][2] - ov[0][2];
+                    const olen = Math.hypot(odx, odz);
+                    if (olen < 1e-9) continue;
+                    const otherIsH = Math.abs(odz) / olen < 1e-3;
+                    const otherIsV = Math.abs(odx) / olen < 1e-3;
+                    const D = c.value as number;
+                    if (hasH && otherIsH) {
+                        const otherZ = ov[0][2];
+                        const prevZ = v[0][2];
+                        const sign = prevZ >= otherZ ? 1 : -1;
+                        pos = [pos[0], pos[1], otherZ + sign * D];
+                        break;
+                    }
+                    if (hasV && otherIsV) {
+                        const otherX = ov[0][0];
+                        const prevX = v[0][0];
+                        const sign = prevX >= otherX ? 1 : -1;
+                        pos = [otherX + sign * D, pos[1], pos[2]];
+                        break;
+                    }
+                }
+            }
             const next = v.slice();
-            next[index] = position;
+            next[index] = pos;
+            // Horizontal/Vertical: ドラッグ点の座標を全頂点に伝播。
+            if (hasH) {
+                for (let k = 0; k < next.length; k++) {
+                    if (k !== index) next[k] = [next[k][0], next[k][1], pos[2]];
+                }
+            }
+            if (hasV) {
+                for (let k = 0; k < next.length; k++) {
+                    if (k !== index) next[k] = [pos[0], next[k][1], next[k][2]];
+                }
+            }
             const curve = curveFromVertices(next);
             return curve ? { ...g, curve } : g;
         }),

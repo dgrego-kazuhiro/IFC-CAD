@@ -115,6 +115,66 @@ export interface RoomPolygon {
      * (旧データ等) は従来通り 1 edge = 1 wall。
      */
     edgeOwners?: string[];
+
+    /**
+     * 「3D 壁を生成しないエッジ範囲」のリスト。アーチ開口や通り抜けなど、
+     * 部屋の境界線は維持しつつ壁だけ削除したい部分を表現する。
+     *
+     *   - 完全削除: `t0 = 0, t1 = 1` (= edge 全体に壁を生成しない)
+     *   - 部分削除: `t0, t1 ∈ [0, 1]` (= edge を 弦上で 0..1 にパラメータ化、
+     *               範囲 [t0, t1] のみ壁省略、残り部分は通常通り生成)
+     *
+     * 同一 edge に複数 skip が許される (= 区分けして複数の開口)。
+     * 範囲はオーバーラップしてもよい (= 適用時に union を取る)。
+     *
+     * 弧由来の edge (= 同じ arc owner で複数 edge を持つ場合) では、各
+     * テッセレーション edge ごとに skip を持たせる必要がある。簡易な使い方
+     * では「edge 全体を削除」する `t0=0, t1=1` のみを推奨。
+     */
+    wallSkips?: WallSkip[];
+}
+
+/** 壁生成をスキップするエッジ範囲。詳細は RoomPolygon.wallSkips を参照。 */
+export interface WallSkip {
+    edgeIdx: number;
+    /** 弦パラメータ [0, 1] の開始位置 (= edge 始点 = 0)。 */
+    t0: number;
+    /** 弦パラメータ [0, 1] の終了位置 (= edge 終点 = 1)。`t1 > t0` を想定。 */
+    t1: number;
+}
+
+/**
+ * `wallSkips` の指定 edge に対する **未スキップ範囲** を [0, 1] の区間
+ * リストとして返す。複数の skip が重なっていても union を取って正しく
+ * 補集合を計算する。空配列なら edge 全体がスキップ。`[[0, 1]]` なら
+ * 全体未スキップ (= 通常通り壁を生成)。
+ */
+export function unskippedRanges(
+    wallSkips: WallSkip[] | undefined,
+    edgeIdx: number,
+): Array<[number, number]> {
+    const skips = (wallSkips ?? [])
+        .filter((s) => s.edgeIdx === edgeIdx && s.t1 > s.t0)
+        .map((s) => [Math.max(0, s.t0), Math.min(1, s.t1)] as [number, number])
+        .filter(([a, b]) => b > a);
+    if (skips.length === 0) return [[0, 1]];
+    // skip 区間を union (start で sort + merge)。
+    skips.sort((a, b) => a[0] - b[0]);
+    const merged: Array<[number, number]> = [];
+    for (const r of skips) {
+        const last = merged[merged.length - 1];
+        if (!last || r[0] > last[1]) merged.push([r[0], r[1]]);
+        else last[1] = Math.max(last[1], r[1]);
+    }
+    // 補集合 [0, 1] − merged。
+    const out: Array<[number, number]> = [];
+    let prevEnd = 0;
+    for (const [a, b] of merged) {
+        if (a > prevEnd) out.push([prevEnd, a]);
+        prevEnd = b;
+    }
+    if (prevEnd < 1) out.push([prevEnd, 1]);
+    return out;
 }
 
 /**

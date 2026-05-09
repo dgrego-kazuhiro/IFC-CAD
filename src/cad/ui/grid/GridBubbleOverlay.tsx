@@ -100,8 +100,10 @@ export default function GridBubbleOverlay({ getCamera, getCanvas }: Props) {
                 if (!g.visible) return null;
                 if (!gridFirstVertex(g.curve)) return null;
                 const isSelected = selectedGridIds.includes(g.id);
-                const fill = g.kind === "Auxiliary" ? "#ea862a" : "#d93434";
-                const stroke = isSelected ? "#facc15" : "#ffffff";
+                // Primary はピンク (= Tailwind pink-500 系)、Auxiliary は薄ピンク。
+                const fill = g.kind === "Auxiliary" ? "#f472b6" : "#ec4899";
+                // 統一した選択色 (= orange-500、Tailwind orange-500)。
+                const stroke = isSelected ? "#f97316" : "#ffffff";
                 const r = 12;
                 return (
                     <g key={g.id}>

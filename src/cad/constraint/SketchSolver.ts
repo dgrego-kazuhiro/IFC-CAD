@@ -1424,6 +1424,9 @@ function translateConstraint(
     };
     // SketchEdge and WallAxis both collapse to the same (line, p1, p2) bundle
     // since wall axes are pushed as a 2-vertex line primitive in solveOnce.
+    // Grid は通芯線 (= 動かない参照線) として fixed 点 2 個 + line を即席で
+    // push し、その ids を返す。Parallel / Perpendicular / Length 等の
+    // edge 系拘束を通芯にもかけられるようにするため。
     const edgeIdsFor = (t: ConstraintTarget): { line: number; p1: number; p2: number } | null => {
         if (t.kind === "SketchEdge") {
             // outline edge → inner edge へリダイレクト (= pointIdFor と同じ理由)。
@@ -1443,6 +1446,20 @@ function translateConstraint(
             const ids = wallIds.get(t.wallId as string);
             if (!ids) return null;
             return { line: ids.line, p1: ids.p1, p2: ids.p2 };
+        }
+        if (t.kind === "Grid") {
+            const grid = grids.find((g) => g.id === t.gridId);
+            const verts = grid ? gridVertices(grid.curve) : [];
+            if (verts.length < 2) return null;
+            const a = verts[0];
+            const b = verts[verts.length - 1];
+            const aId = idAlloc.next();
+            const bId = idAlloc.next();
+            const lineId = idAlloc.next();
+            out.push({ type: "point", id: String(aId), x: a[0], y: a[2], fixed: true });
+            out.push({ type: "point", id: String(bId), x: b[0], y: b[2], fixed: true });
+            out.push({ type: "line",  id: String(lineId), p1_id: String(aId), p2_id: String(bId) });
+            return { line: lineId, p1: aId, p2: bId };
         }
         return null;
     };
@@ -1481,6 +1498,145 @@ function translateConstraint(
                     id: String(idAlloc.next()),
                     p1_id: String(eIds.p1),
                     p2_id: String(eIds.p2),
+                    distance: c.value,
+                });
+                break;
+            }
+            // パターン3: 通芯 + 点 → 通芯線への垂直距離 (= PerpDistance 相当)。
+            // 軸平行通芯は coordinate_x / coordinate_y で点座標を直接固定し、
+            // 斜め通芯は p2l_distance フォールバック。
+            const gridTargets = c.targets.filter((t) => t.kind === "Grid");
+            const pointKindsSet = new Set([
+                "SketchPoint", "WallAxisPoint", "Column", "GridPoint", "Origin",
+            ]);
+            const pointTargets = c.targets.filter((t) => pointKindsSet.has(t.kind));
+            if (gridTargets.length === 1 && pointTargets.length === 1) {
+                const ln = gridTargets[0];
+                const pt = pointTargets[0];
+                const pid = pointIdFor(pt);
+                if (pid == null) break;
+                if (ln.kind !== "Grid") break;
+                const grid = grids.find((g) => g.id === ln.gridId);
+                const verts = grid ? gridVertices(grid.curve) : [];
+                if (verts.length < 2) break;
+                const a = verts[0];
+                const b = verts[verts.length - 1];
+                const ex = b[0] - a[0];
+                const ez = b[2] - a[2];
+                const lineLen = Math.hypot(ex, ez);
+                const axisRel = lineLen > 1e-9 ? 1e-3 : 0;
+                const isVertical = Math.abs(ex) <= axisRel * lineLen;
+                const isHorizontal = Math.abs(ez) <= axisRel * lineLen;
+                // 点側の現ワールド座標 (= 線の左右どちら側にいるか判定用)。
+                const pwOf = (target: ConstraintTarget): [number, number] | null => {
+                    if (target.kind === "SketchPoint") {
+                        const sp = elements[target.spaceId as string];
+                        if (!sp || sp.type !== "Space") return null;
+                        const r = redirectSketchPolyId(
+                            target.spaceId as string, target.polyId, target.vertexIdx,
+                        );
+                        const poly = (sp.polygons ?? []).find((p: RoomPolygon) => p.id === r.polyId);
+                        const v = poly?.outer?.[r.vertexIdx];
+                        return v ? [v[0], v[1]] : null;
+                    }
+                    if (target.kind === "WallAxisPoint") {
+                        const w = elements[target.wallId as string] as WallElement | undefined;
+                        if (!w || w.type !== "Wall") return null;
+                        const av = w.axis[target.endIdx];
+                        return [av[0], av[2]];
+                    }
+                    if (target.kind === "Column") {
+                        const col = elements[target.columnId as string] as ColumnElement | undefined;
+                        if (!col || !col.basePoint) return null;
+                        return [col.basePoint[0], col.basePoint[2]];
+                    }
+                    if (target.kind === "GridPoint") {
+                        const g = grids.find((gg) => gg.id === target.gridId);
+                        if (!g) return null;
+                        const gv = gridVertices(g.curve);
+                        const v = gv[target.vertexIdx];
+                        return v ? [v[0], v[2]] : null;
+                    }
+                    if (target.kind === "Origin") return [0, 0];
+                    return null;
+                };
+                const pw = pwOf(pt);
+                if (isVertical && pw) {
+                    const G = a[0];
+                    const sign = pw[0] >= G ? +1 : -1;
+                    out.push({
+                        type: "coordinate_x",
+                        id: String(idAlloc.next()),
+                        p_id: String(pid),
+                        x: G + sign * c.value,
+                    });
+                    break;
+                }
+                if (isHorizontal && pw) {
+                    const G = a[2];
+                    const sign = pw[1] >= G ? +1 : -1;
+                    out.push({
+                        type: "coordinate_y",
+                        id: String(idAlloc.next()),
+                        p_id: String(pid),
+                        y: G + sign * c.value,
+                    });
+                    break;
+                }
+                // 斜め通芯: 線端点を fixed として push、p2l_distance で
+                // 距離を拘束 (符号無し)。点の現在側で a↔b 向きを反転する。
+                let aa = a, bb = b;
+                if (pw) {
+                    const dx = pw[0] - a[0], dz = pw[1] - a[2];
+                    const signed = dx * ez - dz * ex;
+                    if (signed < 0) { aa = b; bb = a; }
+                }
+                const ga = idAlloc.next();
+                const gb = idAlloc.next();
+                const gl = idAlloc.next();
+                out.push({ type: "point", id: String(ga), x: aa[0], y: aa[2], fixed: true });
+                out.push({ type: "point", id: String(gb), x: bb[0], y: bb[2], fixed: true });
+                out.push({ type: "line",  id: String(gl), p1_id: String(ga), p2_id: String(gb) });
+                out.push({
+                    type: "p2l_distance",
+                    id: String(idAlloc.next()),
+                    p_id: String(pid),
+                    l_id: String(gl),
+                    distance: c.value,
+                });
+                break;
+            }
+            // パターン4: 通芯 + 通芯 → 1 本目の線に対する 2 本目の端点の距離。
+            // 両通芯は固定値で push されるので、平行な場合は距離が「正しいか」を
+            // 検証する制約として機能する (= 通芯位置を solver で動かさない構造)。
+            // 通芯位置を実際に動かしたい場合は別途 grid 編集 UI で調整する想定。
+            if (gridTargets.length === 2) {
+                const gA = gridTargets[0];
+                const gB = gridTargets[1];
+                if (gA.kind !== "Grid" || gB.kind !== "Grid") break;
+                const gridA = grids.find((g) => g.id === gA.gridId);
+                const gridB = grids.find((g) => g.id === gB.gridId);
+                const vA = gridA ? gridVertices(gridA.curve) : [];
+                const vB = gridB ? gridVertices(gridB.curve) : [];
+                if (vA.length < 2 || vB.length < 2) break;
+                // Grid A を線として push。
+                const a = vA[0];
+                const b = vA[vA.length - 1];
+                const aaId = idAlloc.next();
+                const abId = idAlloc.next();
+                const aLineId = idAlloc.next();
+                out.push({ type: "point", id: String(aaId), x: a[0], y: a[2], fixed: true });
+                out.push({ type: "point", id: String(abId), x: b[0], y: b[2], fixed: true });
+                out.push({ type: "line",  id: String(aLineId), p1_id: String(aaId), p2_id: String(abId) });
+                // Grid B の端点を fixed 点として push。p2l_distance で距離を拘束。
+                const bv = vB[0];
+                const bId = idAlloc.next();
+                out.push({ type: "point", id: String(bId), x: bv[0], y: bv[2], fixed: true });
+                out.push({
+                    type: "p2l_distance",
+                    id: String(idAlloc.next()),
+                    p_id: String(bId),
+                    l_id: String(aLineId),
                     distance: c.value,
                 });
                 break;

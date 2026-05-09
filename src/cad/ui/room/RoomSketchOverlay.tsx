@@ -3,7 +3,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { mat4, vec4 } from "gl-matrix";
 import { useAppState, AppState, RESIDENTIAL_GRID_SECONDARY_M } from "../../application/AppState";
-import { SpaceElement, RoomPolygon, PolygonJoint, polygonEdges, isPolygonClosed } from "../../model/elements/SpaceElement";
+import { SpaceElement, RoomPolygon, PolygonJoint, polygonEdges, isPolygonClosed, WallSkip, unskippedRanges } from "../../model/elements/SpaceElement";
 import { WallElement } from "../../model/elements/WallElement";
 import { Camera } from "../../renderer/camera/Camera";
 import { ViewportHandle } from "../layout/Viewport";
@@ -503,7 +503,9 @@ const C_RECT_FILL     = rgba(59, 130, 246, 0.06);
 const C_RECT_HOV      = rgba(96, 165, 250);
 const C_RECT_HOV_FILL = rgba(96, 165, 250, 0.12);
 const C_RECT_SEL      = rgba(249, 115, 22);
-const C_RECT_SEL_FILL = rgba(249, 115, 22, 0.10);
+// 部屋領域のハイライト塗り — 旧 0.10 透過は薄くて視認しづらかったので
+// 0.25 に上げて濃いオレンジ感を出す。
+const C_RECT_SEL_FILL = rgba(249, 115, 22, 0.25);
 const C_TEMP          = rgba(34, 197, 94);
 const C_TEMP_FILL     = rgba(34, 197, 94, 0.08);
 const C_WHITE         = rgba(255, 255, 255);
@@ -521,6 +523,22 @@ const C_OVERLAP_FILL  = rgba(236, 72, 153, 0.18);
 const C_SNAP_OBJ      = rgba(25, 204, 102);
 const C_SNAP_AXIS     = rgba(51, 191, 242);
 const C_EDGE_HOV      = rgba(251, 146, 60);
+// 壁省略 (= wallSkip) を可視化するときの色。dashed thin で描画。
+const C_WALL_SKIP     = rgba(120, 130, 145, 0.85);
+const C_WALL_SKIP_PICK = rgba(220, 90, 90); // wallSkip ピック中のプレビュー
+
+/** [0, 1] の中で `kept` が占めない部分 (= 補集合) を返す。`kept` は
+ *  `unskippedRanges` の出力と同形式 (start で sort 済み、互いに重ならない)。 */
+function complementRanges01(kept: Array<[number, number]>): Array<[number, number]> {
+    const out: Array<[number, number]> = [];
+    let prev = 0;
+    for (const [a, b] of kept) {
+        if (a > prev) out.push([prev, a]);
+        prev = b;
+    }
+    if (prev < 1) out.push([prev, 1]);
+    return out;
+}
 const C_ORIGIN_X      = rgba(239, 68, 68);
 const C_ORIGIN_Z      = rgba(34, 197, 94);
 const C_ORIGIN_DOT    = rgba(80, 80, 80);
@@ -644,6 +662,14 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         p1: Vec2;
     };
     const [arcEdgeChord, setArcEdgeChord] = useState<ArcEdgeChord | null>(null);
+    // wallSkip mode の進行状況。1 クリックで t0 を確定 → 2 クリックで t1 確定 →
+    // WallSkip を polygon.wallSkips に push して mode を抜ける。
+    type WallSkipDraft = {
+        spaceId: string; polyId: string; edgeIdx: number;
+        /** 1 クリック目で確定する弦上の比率 (0..1)。null なら未確定。 */
+        t0: number | null;
+    };
+    const [wallSkipDraft, setWallSkipDraft] = useState<WallSkipDraft | null>(null);
     // 右クリック直後に表示する選択エッジ用のコンテキストメニュー。
     const [edgeContextMenu, setEdgeContextMenu] = useState<{
         x: number; y: number;
@@ -694,6 +720,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const arcChordP0Ref = useRef(arcChordP0); arcChordP0Ref.current = arcChordP0;
     const arcChordP1Ref = useRef(arcChordP1); arcChordP1Ref.current = arcChordP1;
     const arcEdgeChordRef = useRef(arcEdgeChord); arcEdgeChordRef.current = arcEdgeChord;
+    const wallSkipDraftRef = useRef(wallSkipDraft); wallSkipDraftRef.current = wallSkipDraft;
+    const trimTargetEntityIdRef = useRef(trimTargetEntityId); trimTargetEntityIdRef.current = trimTargetEntityId;
+    const trimFirstPointRef = useRef(trimFirstPoint); trimFirstPointRef.current = trimFirstPoint;
     // Populated by the body below — lets the Enter-key effect (declared before
     // the early return) call the latest closure.
     const commitPolyDraftRef = useRef<(pts: [number, number][]) => void>(() => {});
@@ -861,26 +890,48 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         }
 
         // Merge icon (shown at top-right of last-dragged poly when overlapping)
-        if (lastDraggedPolyId && room.polygons) {
-            const focus = room.polygons.find(p => p.id === lastDraggedPolyId);
-            if (focus) {
+        // 「1図形=1Room」の仕様 (449b326 大モード追加 / 4d3b0cc each new shape spawns
+        // its own Room) のため、最後にドラッグした polygon は active room 以外の
+        // Space に属することがある。重ね合わせ判定は **全 Space の polygon** を
+        // 対象にする (同一 Space 内に複数 polygon があるケースもサポート)。
+        if (lastDraggedPolyId) {
+            // focus polygon を全 Space から検索 (= drag した polygon が属する Space)。
+            let focus: RoomPolygon | undefined;
+            let focusSpaceId: string | undefined;
+            for (const id in elements) {
+                const el = elements[id];
+                if (!el || el.type !== "Space") continue;
+                const sp = el as SpaceElement;
+                const f = (sp.polygons ?? []).find((p) => p.id === lastDraggedPolyId);
+                if (f) { focus = f; focusSpaceId = id; break; }
+            }
+            if (focus && focusSpaceId) {
                 const xs = focus.outer.map(p => p[0]);
                 const ys = focus.outer.map(p => p[1]);
                 const fMinX = Math.min(...xs), fMaxX = Math.max(...xs);
                 const fMinZ = Math.min(...ys), fMaxZ = Math.max(...ys);
                 const eps = 1e-6;
                 let hasOverlap = false;
-                for (const other of room.polygons) {
-                    if (other.id === focus.id) continue;
-                    const oxs = other.outer.map(p => p[0]);
-                    const oys = other.outer.map(p => p[1]);
-                    const oMinX = Math.min(...oxs), oMaxX = Math.max(...oxs);
-                    const oMinZ = Math.min(...oys), oMaxZ = Math.max(...oys);
-                    if (fMinX < oMaxX - eps && fMaxX > oMinX + eps &&
-                        fMinZ < oMaxZ - eps && fMaxZ > oMinZ + eps) {
-                        hasOverlap = true;
-                        break;
+                // 全 Space を走査して AABB 交差を検出。outline polygon
+                // (wallOutlineOf set) は派生形状なのでスキップ。
+                for (const id in elements) {
+                    const el = elements[id];
+                    if (!el || el.type !== "Space") continue;
+                    const sp = el as SpaceElement;
+                    for (const other of sp.polygons ?? []) {
+                        if (other.id === focus.id) continue;
+                        if (other.wallOutlineOf) continue;
+                        const oxs = other.outer.map(p => p[0]);
+                        const oys = other.outer.map(p => p[1]);
+                        const oMinX = Math.min(...oxs), oMaxX = Math.max(...oxs);
+                        const oMinZ = Math.min(...oys), oMaxZ = Math.max(...oys);
+                        if (fMinX < oMaxX - eps && fMaxX > oMinX + eps &&
+                            fMinZ < oMaxZ - eps && fMaxZ > oMinZ + eps) {
+                            hasOverlap = true;
+                            break;
+                        }
                     }
+                    if (hasOverlap) break;
                 }
                 if (hasOverlap) {
                     const [mx1, my1] = proj(fMinX, fMinZ);
@@ -1065,6 +1116,32 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         return () => window.removeEventListener("keydown", onKey);
     }, [roomEditMode, polyDraftPoints]);
 
+    // Trim モードの Esc キャンセル: target 解除 / firstPoint クリア / Select に戻る。
+    // ステージごとに段階キャンセル (= firstPoint 解除 → target 解除 → モード抜け)
+    // にすると操作の取り消しが直感的になる。
+    useEffect(() => {
+        if (roomEditMode !== "trim") return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key !== "Escape") return;
+            e.preventDefault();
+            if (trimFirstPoint) {
+                setTrimFirstPoint(null);
+                setMouseWorld(null);
+                setGridSnapInfo(null);
+                return;
+            }
+            if (trimTargetEntityId) {
+                setTrimTargetEntityId(null);
+                setMouseWorld(null);
+                setGridSnapInfo(null);
+                return;
+            }
+            setRoomEditMode("select");
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+    }, [roomEditMode, trimFirstPoint, trimTargetEntityId, setRoomEditMode]);
+
     // Reset drafts when leaving polyline / wallPath / circle / line / arc / trim mode
     useEffect(() => {
         if (roomEditMode !== "polyline" && roomEditMode !== "wallPath" && polyDraftPoints.length > 0) {
@@ -1104,6 +1181,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         }
         if (roomEditMode !== "trim" && (trimTargetEntityId || trimFirstPoint)) {
             setTrimTargetEntityId(null); setTrimFirstPoint(null);
+        }
+        if (roomEditMode !== "wallSkip" && wallSkipDraft) {
+            setWallSkipDraft(null);
         }
     }, [roomEditMode]);
 
@@ -2059,12 +2139,30 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         }));
     };
 
-    // Merge the last-dragged polygon with all polygons that overlap it
+    // Merge the last-dragged polygon with all polygons that overlap it (across
+    // any Space). Cross-Space マージ:
+    //   - focus polygon を全 Space から検索
+    //   - focus と AABB 交差する非 outline polygon (他 Space 含む) を集める
+    //   - polygon-clipping で union を取る
+    //   - 結果は **focus polygon の Space** に書く
+    //   - マージで吸収された側の polygon は元 Space から削除
+    //   - マージで吸収された Space に他に polygon が残っていなければ Space ごと削除
+    //   - 各 polygon の wallIds に紐付く壁も削除
     mergeRef.current = () => {
-        if (!activeRoomId) return;
-        if (!lastDraggedPolyId || !room.polygons) return;
-        const focus = room.polygons.find(p => p.id === lastDraggedPolyId);
-        if (!focus) return;
+        if (!lastDraggedPolyId) return;
+        const liveElements = useAppState.getState().elements;
+
+        // focus polygon の所属 Space を全 Space から検索
+        let focus: RoomPolygon | undefined;
+        let focusSpaceId: string | undefined;
+        for (const id in liveElements) {
+            const el = liveElements[id];
+            if (!el || el.type !== "Space") continue;
+            const sp = el as SpaceElement;
+            const f = (sp.polygons ?? []).find((p) => p.id === lastDraggedPolyId);
+            if (f) { focus = f; focusSpaceId = id; break; }
+        }
+        if (!focus || !focusSpaceId) return;
 
         const polyToCoords = (p: RoomPolygon): [number, number][][] => {
             const ring = p.outer.map(([x, y]) => [x, y] as [number, number]);
@@ -2085,25 +2183,34 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         const fMinX = Math.min(...fxs), fMaxX = Math.max(...fxs);
         const fMinZ = Math.min(...fys), fMaxZ = Math.max(...fys);
         const eps = 1e-6;
-        const mergeSet = new Set<string>([focus.id]);
-        for (const other of room.polygons) {
-            if (other.id === focus.id) continue;
-            const oxs = other.outer.map(p => p[0]);
-            const oys = other.outer.map(p => p[1]);
-            const oMinX = Math.min(...oxs), oMaxX = Math.max(...oxs);
-            const oMinZ = Math.min(...oys), oMaxZ = Math.max(...oys);
-            if (fMinX < oMaxX - eps && fMaxX > oMinX + eps &&
-                fMinZ < oMaxZ - eps && fMaxZ > oMinZ + eps) {
-                mergeSet.add(other.id);
+
+        // 全 Space を走査して交差 polygon を集める。
+        // 形式: { polyId: spaceId } で「どの Space から削除するか」を保持。
+        const mergePolys: { poly: RoomPolygon; spaceId: string }[] = [
+            { poly: focus, spaceId: focusSpaceId },
+        ];
+        for (const id in liveElements) {
+            const el = liveElements[id];
+            if (!el || el.type !== "Space") continue;
+            const sp = el as SpaceElement;
+            for (const other of sp.polygons ?? []) {
+                if (other.id === focus.id) continue;
+                if (other.wallOutlineOf) continue; // 派生 outline はスキップ
+                const oxs = other.outer.map(p => p[0]);
+                const oys = other.outer.map(p => p[1]);
+                const oMinX = Math.min(...oxs), oMaxX = Math.max(...oxs);
+                const oMinZ = Math.min(...oys), oMaxZ = Math.max(...oys);
+                if (fMinX < oMaxX - eps && fMaxX > oMinX + eps &&
+                    fMinZ < oMaxZ - eps && fMaxZ > oMinZ + eps) {
+                    mergePolys.push({ poly: other, spaceId: id });
+                }
             }
         }
-        if (mergeSet.size < 2) return;
+        if (mergePolys.length < 2) return;
 
-        const inputs = room.polygons
-            .filter(p => mergeSet.has(p.id))
-            .map(p => polyToCoords(p));
-        const [first, ...rest] = inputs;
-        const result = polygonClipping.union(first, ...rest);
+        const inputs = mergePolys.map((m) => polyToCoords(m.poly));
+        const [firstIn, ...restIn] = inputs;
+        const result = polygonClipping.union(firstIn, ...restIn);
 
         // Remove consecutive duplicate vertices (tolerance ~1μm) — polygon-
         // clipping may emit duplicates at intersection points when merging
@@ -2117,7 +2224,6 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     out.push(p);
                 }
             }
-            // Also collapse a near-duplicate wrap-around (last ≈ first)
             while (out.length > 1) {
                 const a = out[0];
                 const b = out[out.length - 1];
@@ -2127,7 +2233,8 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             return out;
         };
 
-        const newPolygons: RoomPolygon[] = room.polygons.filter(p => !mergeSet.has(p.id));
+        // 結果 polygon のリストを生成。
+        const resultPolygons: RoomPolygon[] = [];
         for (const poly of result) {
             if (poly.length === 0) continue;
             let outer = poly[0].map(([x, y]) => [x, y] as Vec2);
@@ -2148,21 +2255,52 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 h = dedupRing(h);
                 holes.push(h);
             }
-            newPolygons.push({ id: generateId(), outer, holes });
+            resultPolygons.push({ id: generateId(), outer, holes });
         }
 
-        // Delete any walls that belonged to the merged polygons
-        for (const p of room.polygons) {
-            if (!mergeSet.has(p.id) || !p.wallIds) continue;
-            for (const wid of p.wallIds) {
-                if (wid && elements[wid]) removeElement(wid);
+        // 吸収対象 polygon の wallIds に紐付く壁を削除。
+        for (const m of mergePolys) {
+            if (!m.poly.wallIds) continue;
+            for (const wid of m.poly.wallIds) {
+                if (wid && liveElements[wid]) removeElement(wid);
             }
         }
 
-        updateElement(activeRoomId, {
-            polygons: newPolygons,
-            dirtyFlags: new Set([...room.dirtyFlags, "Geometry", "Mesh", "Render"]),
-        } as any);
+        // Space ごとに集約。focusSpaceId には resultPolygons を入れ、もとの
+        // 吸収対象 polygon を除く。他 Space は吸収対象 polygon を除くだけ。
+        // 残 polygon が空になった Space (focusSpaceId 以外) は Space ごと削除。
+        const removedPolyIdsBySpace = new Map<string, Set<string>>();
+        for (const m of mergePolys) {
+            let s = removedPolyIdsBySpace.get(m.spaceId);
+            if (!s) { s = new Set(); removedPolyIdsBySpace.set(m.spaceId, s); }
+            s.add(m.poly.id);
+        }
+
+        for (const [spaceId, removedIds] of removedPolyIdsBySpace) {
+            const sp = liveElements[spaceId] as SpaceElement | undefined;
+            if (!sp || sp.type !== "Space") continue;
+            // wallOutlineOf が removedIds を指す派生 outline も削除対象に追加。
+            const allRemoved = new Set(removedIds);
+            for (const p of sp.polygons ?? []) {
+                if (p.wallOutlineOf && removedIds.has(p.wallOutlineOf)) {
+                    allRemoved.add(p.id);
+                }
+            }
+            const remaining = (sp.polygons ?? []).filter((p) => !allRemoved.has(p.id));
+            const isFocusSpace = spaceId === focusSpaceId;
+            const finalPolygons = isFocusSpace
+                ? [...remaining, ...resultPolygons]
+                : remaining;
+            if (!isFocusSpace && finalPolygons.length === 0) {
+                // 他 Space が空になったら Space ごと削除。
+                removeElement(spaceId);
+            } else {
+                updateElement(spaceId, {
+                    polygons: finalPolygons,
+                    dirtyFlags: new Set([...(sp.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                } as any);
+            }
+        }
         setLastDraggedPolyId(null);
         setSelection([]);
     };
@@ -2310,8 +2448,23 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         };
 
         // Origin symbol: short X (red) / Z (green) axes with a center dot
-        lines.push({ ax: 0, az: 0, bx: ORIGIN_AXIS_LEN, bz: 0, color: C_ORIGIN_X, width: 1.5 });
-        lines.push({ ax: 0, az: 0, bx: 0, bz: ORIGIN_AXIS_LEN, color: C_ORIGIN_Z, width: 1.5 });
+        // 軸線の長さは **ピクセル一定** にしたいので、camera (ortho) の zoom と
+        // canvas 高さから world-per-pixel 比を計算して world 単位に変換する。
+        // ORIGIN_AXIS_LEN は元々 0.3m (= 世界座標) だったが、ズームで大きさが
+        // 変わってしまうため、固定 PX で表現する。
+        // buildDrawLists は renderer の raf ループから呼ばれる関数だが、
+        // 関数自体は早期 return 後でも null になり得る closure として定義
+        // されているため、camera を再取得して null チェックする。
+        const camLive = viewportRef.current?.getCamera() ?? null;
+        const projY = camLive?.projectionMatrix[5] ?? 0;
+        const canvasH = canvasRef.current?.clientHeight ?? 800;
+        const pxToWorld = (projY > 1e-9 && canvasH > 0)
+            ? 2 / (projY * canvasH)
+            : 0.015;
+        const ORIGIN_AXIS_PX = 30;
+        const axisLenWorld = ORIGIN_AXIS_PX * pxToWorld;
+        lines.push({ ax: 0, az: 0, bx: axisLenWorld, bz: 0, color: C_ORIGIN_X, width: 1.5 });
+        lines.push({ ax: 0, az: 0, bx: 0, bz: axisLenWorld, color: C_ORIGIN_Z, width: 1.5 });
         markers.push({
             wx: 0, wz: 0, radius: 4, shape: "circle",
             fill: C_WHITE, stroke: C_ORIGIN_DOT, strokeWidth: 1.5,
@@ -2592,9 +2745,17 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const isVertSel = (vi: number) => sketchSel.some(
                     (s) => s.kind === "point" && s.polyId === poly.id && s.vertexIdx === vi,
                 );
-                // edge i は (a) 直接選択 / (b) entity 選択の owner が一致
-                // のどちらかでハイライト対象になる。Arc 全体選択 (= entity)
-                // は同 owner の全テッセレーション辺を一括強調する。
+                // owner が arc / circle の edge は「弧 1 本」として hover / select
+                // を伝播する (= 同じ弧のテッセレーション辺を一括強調)。それ以外
+                // (line / polyline) は **該当辺のみ** ハイライトする (= polyline
+                // 由来の閉ループでも、ホバー / 選択した辺だけが色付く)。
+                const isArcLikeOwner = (ownerId: string | undefined): boolean => {
+                    if (!ownerId) return false;
+                    const ent = (rm.entities ?? []).find((e) => e.id === ownerId);
+                    return !!ent && (ent.kind === "arc" || ent.kind === "circle");
+                };
+                // edge i は (a) 直接選択 / (b) entity 選択 (arc/circle のみ owner 一致で伝播)
+                // のどちらかでハイライト対象になる。
                 const isEdgeSel = (ei: number) => {
                     const ownerId = poly.edgeOwners?.[ei];
                     return sketchSel.some((s) => {
@@ -2602,7 +2763,13 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                             return s.polyId === poly.id && s.edgeIdx === ei;
                         }
                         if (s.kind === "entity" && ownerId) {
-                            return s.entityId === ownerId;
+                            // entity 選択は arc/circle entity の場合のみ、その
+                            // テッセレーション辺全体を一括ハイライトする。
+                            // Polyline / Line entity 選択時は該当辺だけに
+                            // 留めたいが、現状 polyline edge クリックは
+                            // kind:"edge" 経由なのでここに到達しない。安全に
+                            // arc/circle フィルタを追加する。
+                            return s.entityId === ownerId && isArcLikeOwner(ownerId);
                         }
                         return false;
                     });
@@ -2617,12 +2784,14 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const isEdgeHov = (ei: number) => {
                     if (!hovE) return false;
                     if (hovE.polyId === poly.id && hovE.edgeIdx === ei) return true;
-                    // Arc グループは hover も entity 単位でハイライト。
-                    const ownerId = poly.edgeOwners?.[ei];
-                    if (!ownerId) return false;
+                    // Arc / Circle グループのみ hover を entity 単位で伝播。
+                    // Polyline は同じ entity が全辺を所有するので、伝播すると
+                    // ホバー時に全辺が点灯してしまうため除外。
                     if (hovE.polyId !== poly.id) return false;
+                    const ownerId = poly.edgeOwners?.[ei];
                     const hoveredOwner = poly.edgeOwners?.[hovE.edgeIdx];
-                    return hoveredOwner === ownerId;
+                    if (!ownerId || hoveredOwner !== ownerId) return false;
+                    return isArcLikeOwner(ownerId);
                 };
 
                 // For wall-outline polygons, any edge coincident with a
@@ -2677,6 +2846,13 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     let width = sw;
                     if (selE) { col = C_HL_ORANGE; width = sw + 1.5; }
                     else if (hovEd) { col = C_EDGE_HOV; width = sw + 1; }
+                    // wallSkips: edge[i] に skip があれば、未スキップ範囲を通常
+                    // ストロークで、スキップ範囲を dashed gray で描画する
+                    // (= 「ここの 3D 壁は出ない」ことを 2D で可視化)。
+                    const keptRanges = unskippedRanges(poly.wallSkips, i);
+                    const hasSkip = !(keptRanges.length === 1
+                        && keptRanges[0][0] === 0 && keptRanges[0][1] === 1);
+                    const skipRanges = hasSkip ? complementRanges01(keptRanges) : [];
                     // Arc / Circle 所有 edge: 端点 a, b を arc.center 基準で
                     // 角度に変換し、その範囲を細分化して滑らかな弧として描画。
                     const ownerId = poly.edgeOwners?.[i];
@@ -2692,20 +2868,96 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         let sweep = ang1 - ang0;
                         while (sweep <= -Math.PI) sweep += Math.PI * 2;
                         while (sweep > Math.PI) sweep -= Math.PI * 2;
-                        const SUB = 10; // edge 1 本あたり 10 細分
-                        let prevX = a[0], prevY = a[1];
-                        for (let k = 1; k <= SUB; k++) {
-                            const t = k / SUB;
-                            const ang = ang0 + sweep * t;
-                            const nx = cx + r * Math.cos(ang);
-                            const ny = cy + r * Math.sin(ang);
-                            lines.push({ ax: prevX, az: prevY, bx: nx, bz: ny, color: col, width });
-                            prevX = nx; prevY = ny;
+                        const drawArcRange = (
+                            t0: number, t1: number,
+                            color: RGBA, w: number,
+                            dash?: number, dashRatio?: number,
+                        ) => {
+                            const SUB = Math.max(2, Math.round(10 * (t1 - t0)));
+                            let prevX = cx + r * Math.cos(ang0 + sweep * t0);
+                            let prevY = cy + r * Math.sin(ang0 + sweep * t0);
+                            for (let k = 1; k <= SUB; k++) {
+                                const t = t0 + (t1 - t0) * (k / SUB);
+                                const ang = ang0 + sweep * t;
+                                const nx = cx + r * Math.cos(ang);
+                                const ny = cy + r * Math.sin(ang);
+                                lines.push({
+                                    ax: prevX, az: prevY, bx: nx, bz: ny,
+                                    color, width: w, dash, dashRatio,
+                                });
+                                prevX = nx; prevY = ny;
+                            }
+                        };
+                        for (const [t0, t1] of keptRanges) {
+                            drawArcRange(t0, t1, col, width);
+                        }
+                        for (const [t0, t1] of skipRanges) {
+                            drawArcRange(t0, t1, C_WALL_SKIP, Math.max(1, sw - 0.5), 6, 0.5);
                         }
                     } else {
-                        lines.push({ ax: a[0], az: a[1], bx: b[0], bz: b[1], color: col, width });
+                        const drawSeg = (
+                            t0: number, t1: number,
+                            color: RGBA, w: number,
+                            dash?: number, dashRatio?: number,
+                        ) => {
+                            const x0 = a[0] + (b[0] - a[0]) * t0;
+                            const y0 = a[1] + (b[1] - a[1]) * t0;
+                            const x1 = a[0] + (b[0] - a[0]) * t1;
+                            const y1 = a[1] + (b[1] - a[1]) * t1;
+                            lines.push({
+                                ax: x0, az: y0, bx: x1, bz: y1,
+                                color, width: w, dash, dashRatio,
+                            });
+                        };
+                        for (const [t0, t1] of keptRanges) {
+                            drawSeg(t0, t1, col, width);
+                        }
+                        for (const [t0, t1] of skipRanges) {
+                            drawSeg(t0, t1, C_WALL_SKIP, Math.max(1, sw - 0.5), 6, 0.5);
+                        }
                     }
                 }
+                // wallSkips の境界点 (= 切断 t0 / t1) に小さなマーカを表示。
+                // 完全削除 (t0=0, t1=1) では端点が outer 頂点と重なるのでマーカ
+                // 重複は許容 (= 同位置に頂点ハンドル + skip マーカが重なる)。
+                if (poly.wallSkips && poly.wallSkips.length > 0) {
+                    const entByIdM = entById; // alias
+                    for (const skip of poly.wallSkips) {
+                        const ei = skip.edgeIdx;
+                        if (ei < 0 || ei >= polyEdgeList.length) continue;
+                        const [ai, bi] = polyEdgeList[ei];
+                        const a = poly.outer[ai];
+                        const b = poly.outer[bi];
+                        const ownerId = poly.edgeOwners?.[ei];
+                        const owner = ownerId ? entByIdM.get(ownerId) : undefined;
+                        const tPair: [number, number] = [skip.t0, skip.t1];
+                        for (const t of tPair) {
+                            const tc = Math.max(0, Math.min(1, t));
+                            let wx: number, wz: number;
+                            if (owner && (owner.kind === "arc" || owner.kind === "circle")) {
+                                const cx = owner.center[0];
+                                const cy = owner.center[1];
+                                const r = owner.kind === "arc" ? owner.radius : owner.radius;
+                                const ang0 = Math.atan2(a[1] - cy, a[0] - cx);
+                                const ang1 = Math.atan2(b[1] - cy, b[0] - cx);
+                                let sweep = ang1 - ang0;
+                                while (sweep <= -Math.PI) sweep += Math.PI * 2;
+                                while (sweep > Math.PI) sweep -= Math.PI * 2;
+                                const ang = ang0 + sweep * tc;
+                                wx = cx + r * Math.cos(ang);
+                                wz = cy + r * Math.sin(ang);
+                            } else {
+                                wx = a[0] + (b[0] - a[0]) * tc;
+                                wz = a[1] + (b[1] - a[1]) * tc;
+                            }
+                            markers.push({
+                                wx, wz, radius: 3.5, shape: "circle",
+                                fill: rgba(55, 65, 81), stroke: C_WHITE, strokeWidth: 1.2,
+                            });
+                        }
+                    }
+                }
+
                 // Holes (outline only, no per-vertex constraint targets)
                 for (const h of poly.holes ?? []) {
                     if (h.length < 2) continue;
@@ -2718,13 +2970,14 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
 
                 // Outer ring vertex handles — hidden for parametric circles
                 // and for arc-interior vertices (tessellation artifacts after
-                // polygon merges with a circle). For walled inner / wall
-                // outline polygons we NEVER render the white stroke ring
-                // (it reads as "chipped" corners against the gray wall).
-                // Hover / selection feedback relies on colour + size change.
+                // polygon merges with a circle).
+                //
+                // walled inner polygon: 白いストロークリングは付けるが、wall slab
+                //   (中明度グレー) に対してコーナーが「欠けて」見えないように
+                //   塗りはコーナー色 (slate-700) のまま、リングはやや細めにする。
+                // wall outline polygon: ストロークリング無し (元仕様)。
                 const isCircle = poly.shape?.type === "circle";
                 const hasWalls = !!(poly.wallIds && poly.wallIds.some(Boolean));
-                const onWallBackground = hasWalls || isWallOutline;
                 if (!isCircle) {
                     for (let i = 0; i < n; i++) {
                         if (isCurveInteriorVertex(poly, i)) continue; // 弧/円の途中点はハンドルを出さない
@@ -2733,19 +2986,20 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         const isCh = hovPVtx?.polyId === poly.id && hovPVtx.vertexIdx === i;
                         const selP = isVertSel(i);
                         const radius = selP ? 5.5 : (isCh ? 5 : (isSel || isHov ? 3.5 : 2.5));
-                        // Fill: orange for sel/hover, polygon's stroke colour otherwise.
-                        // On walled/outline polygons the fall-through fill is slate —
-                        // make it a bit darker so it reads clearly on gray wall.
-                        const baseFill: RGBA = onWallBackground ? rgba(55, 65, 81) : stroke;
+                        const baseFill: RGBA = hasWalls || isWallOutline ? rgba(55, 65, 81) : stroke;
                         const fillC: RGBA = selP ? C_HL_ORANGE
                             : isCh ? C_HL_ORANGE
                             : isSel ? C_RECT_SEL
                             : baseFill;
+                        // wall outline polygon は元仕様通りストロークなし。それ以外
+                        // (= 通常 / walled inner) は白リングを付けて hit target が
+                        // 視認できるようにする。
+                        const noRing = isWallOutline;
                         markers.push({
                             wx, wz, radius, shape: "circle",
                             fill: fillC,
-                            stroke: onWallBackground ? ([0, 0, 0, 0] as RGBA) : C_WHITE,
-                            strokeWidth: onWallBackground ? 0 : (selP ? 1.8 : 1),
+                            stroke: noRing ? ([0, 0, 0, 0] as RGBA) : C_WHITE,
+                            strokeWidth: noRing ? 0 : (selP ? 1.8 : 1),
                         });
                     }
                 }
@@ -3008,6 +3262,183 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             }
         }
 
+        // Trim draft の視覚フィードバック:
+        //   stage 1: target が選ばれていなければ何も追加描画しない
+        //            (= ユーザは円/弧をクリックして picked にする)
+        //   stage 2 (target picked、trimFirstPoint 未): target をオレンジで強調 +
+        //            cursor を target 上に projection した点に小さなマーカを表示
+        //   stage 3 (target picked + trimFirstPoint set): 上記に加え、
+        //            firstPoint マーカ + 「first → cursor の CCW 弧」をプレビュー
+        //            (= 切断後に残る側を破線で見せる)
+        if (mode === "trim") {
+            const targetId = trimTargetEntityIdRef.current;
+            const firstPt = trimFirstPointRef.current;
+            const target = targetId
+                ? (rm.entities ?? []).find((e) => e.id === targetId)
+                : undefined;
+            if (target && (target.kind === "circle" || target.kind === "arc")) {
+                const cx = target.center[0];
+                const cy = target.center[1];
+                const r = target.radius;
+                // 1) Target を C_HL_ORANGE で太線描画 (= 選択強調)。
+                //    Circle は全周、Arc は aStart→aEnd の sweep のみ。
+                const aStart = target.kind === "circle" ? 0 : target.aStart;
+                let sweep = target.kind === "circle"
+                    ? Math.PI * 2
+                    : target.aEnd - target.aStart;
+                while (sweep <= 0) sweep += Math.PI * 2;
+                const segs = Math.max(32, Math.ceil(sweep * 32 / (Math.PI / 2)));
+                let prev: Vec2 = [
+                    cx + r * Math.cos(aStart),
+                    cy + r * Math.sin(aStart),
+                ];
+                for (let i = 1; i <= segs; i++) {
+                    const a = aStart + sweep * (i / segs);
+                    const next: Vec2 = [
+                        cx + r * Math.cos(a),
+                        cy + r * Math.sin(a),
+                    ];
+                    lines.push({
+                        ax: prev[0], az: prev[1], bx: next[0], bz: next[1],
+                        color: C_HL_ORANGE, width: 2.5,
+                    });
+                    prev = next;
+                }
+                // 2) cursor を target 円周上に projection した位置 (= スナップ
+                //    ヒント) を緑マーカで示す。projected = center + r * normalize(cursor - center)。
+                if (mw) {
+                    const dx = mw[0] - cx;
+                    const dy = mw[1] - cy;
+                    const len = Math.hypot(dx, dy);
+                    if (len > 1e-6) {
+                        const px = cx + r * dx / len;
+                        const py = cy + r * dy / len;
+                        markers.push({
+                            wx: px, wz: py, radius: 5, shape: "circle",
+                            fill: C_TEMP, stroke: C_WHITE, strokeWidth: 1.5,
+                        });
+                        // 3) firstPoint があれば、firstPoint → cursor projection の
+                        //    CCW 弧を破線でプレビュー (= 切断後に残る側)。
+                        if (firstPt) {
+                            const a1 = Math.atan2(firstPt[1] - cy, firstPt[0] - cx);
+                            const a2 = Math.atan2(py - cy, px - cx);
+                            let prevSweep = a2 - a1;
+                            while (prevSweep <= 0) prevSweep += Math.PI * 2;
+                            const previewSegs = Math.max(16, Math.ceil(prevSweep * 32 / (Math.PI / 2)));
+                            let pv: Vec2 = [
+                                cx + r * Math.cos(a1),
+                                cy + r * Math.sin(a1),
+                            ];
+                            for (let i = 1; i <= previewSegs; i++) {
+                                const a = a1 + prevSweep * (i / previewSegs);
+                                const nx: Vec2 = [
+                                    cx + r * Math.cos(a),
+                                    cy + r * Math.sin(a),
+                                ];
+                                lines.push({
+                                    ax: pv[0], az: pv[1], bx: nx[0], bz: nx[1],
+                                    color: C_TEMP, width: 2,
+                                    dash: 8, dashRatio: 0.55,
+                                });
+                                pv = nx;
+                            }
+                        }
+                    }
+                }
+                // 4) firstPoint マーカ (= 1 つ目の切断点)。
+                if (firstPt) {
+                    markers.push({
+                        wx: firstPt[0], wz: firstPt[1], radius: 5, shape: "circle",
+                        fill: C_HL_ORANGE, stroke: C_WHITE, strokeWidth: 1.5,
+                    });
+                }
+            }
+        }
+
+        // wallSkip ピックモード: 対象 edge を強調 + 1 点目 / cursor 投影点を
+        // マーカで表示 + (1 点目があれば) 1 点目 → cursor の区間を破線赤で
+        // プレビュー。確定すると polygon.wallSkips に push されて 3D 壁が消える。
+        if (mode === "wallSkip") {
+            const draft = wallSkipDraftRef.current;
+            // Stage 1: edge 未選択。hoveredEdge があれば対象候補としてオレンジ
+            // 強調を出して「これをクリックすれば対象になる」ことを示唆。
+            if (!draft) {
+                const hov = hoveredEdgeRef.current;
+                if (hov) {
+                    const sp = elementsRef.current[activeRoomIdRef.current ?? ""] as SpaceElement | undefined;
+                    const poly = sp?.polygons?.find((p) => p.id === hov.polyId);
+                    if (poly) {
+                        const edges = polygonEdges(poly);
+                        if (hov.edgeIdx >= 0 && hov.edgeIdx < edges.length) {
+                            const [ai, bi] = edges[hov.edgeIdx];
+                            const a = poly.outer[ai];
+                            const b = poly.outer[bi];
+                            lines.push({
+                                ax: a[0], az: a[1], bx: b[0], bz: b[1],
+                                color: C_WALL_SKIP_PICK, width: 2.5,
+                                dash: 6, dashRatio: 0.5,
+                            });
+                        }
+                    }
+                }
+            }
+            if (draft) {
+                const sp = elementsRef.current[draft.spaceId] as SpaceElement | undefined;
+                const poly = sp?.polygons?.find((p) => p.id === draft.polyId);
+                if (poly) {
+                    const edges = polygonEdges(poly);
+                    if (draft.edgeIdx >= 0 && draft.edgeIdx < edges.length) {
+                        const [eai, ebi] = edges[draft.edgeIdx];
+                        const a = poly.outer[eai];
+                        const b = poly.outer[ebi];
+                        const dx = b[0] - a[0], dy = b[1] - a[1];
+                        const len2 = dx * dx + dy * dy;
+                        // edge 自体をオレンジで強調 (= 「これを編集中」)。
+                        lines.push({
+                            ax: a[0], az: a[1], bx: b[0], bz: b[1],
+                            color: C_HL_ORANGE, width: 2.5,
+                        });
+                        // cursor を edge 上に projection した点 t_cur。
+                        let tCur: number | null = null;
+                        if (mw && len2 > 1e-12) {
+                            tCur = Math.max(
+                                0,
+                                Math.min(1, ((mw[0] - a[0]) * dx + (mw[1] - a[1]) * dy) / len2),
+                            );
+                        }
+                        if (tCur !== null) {
+                            const px = a[0] + dx * tCur;
+                            const py = a[1] + dy * tCur;
+                            markers.push({
+                                wx: px, wz: py, radius: 5, shape: "circle",
+                                fill: C_WALL_SKIP_PICK, stroke: C_WHITE, strokeWidth: 1.5,
+                            });
+                        }
+                        // 1 点目マーカ + プレビュー線。
+                        if (draft.t0 !== null) {
+                            const t0 = draft.t0;
+                            const fx = a[0] + dx * t0;
+                            const fy = a[1] + dy * t0;
+                            markers.push({
+                                wx: fx, wz: fy, radius: 5, shape: "circle",
+                                fill: C_WALL_SKIP_PICK, stroke: C_WHITE, strokeWidth: 1.5,
+                            });
+                            if (tCur !== null && Math.abs(tCur - t0) > 1e-4) {
+                                const lo = Math.min(t0, tCur);
+                                const hi = Math.max(t0, tCur);
+                                lines.push({
+                                    ax: a[0] + dx * lo, az: a[1] + dy * lo,
+                                    bx: a[0] + dx * hi, bz: a[1] + dy * hi,
+                                    color: C_WALL_SKIP_PICK, width: 3,
+                                    dash: 6, dashRatio: 0.5,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Polyline / wallPath draft (while drawing). wallPath は閉じないので
         // close leg のヒントを描かない。
         if (mode === "polyline" || mode === "wallPath") {
@@ -3086,12 +3517,16 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         }
 
         // Grid snap indicator (cross marker + axis-alignment guide lines)
+        // 通芯 / 原点 / 軸整列のスナップシンボルは、SketchMarker.radius が
+        // CSS pixel 単位 (= カメラ位置・ズームに非依存) なので 12px 固定で
+        // 表示する (SketchOverlayRenderer の marker shader 仕様)。
+        const SNAP_MARKER_PX = 12;
         const snapInfo = gridSnapInfoRef.current;
         if (snapInfo) {
             const [sx, sz] = snapInfo.point;
             if (snapInfo.kind === "obj") {
                 markers.push({
-                    wx: sx, wz: sz, radius: 6, shape: "square",
+                    wx: sx, wz: sz, radius: SNAP_MARKER_PX, shape: "square",
                     fill: C_SNAP_OBJ, stroke: C_WHITE, strokeWidth: 1.5,
                 });
             } else {
@@ -3110,7 +3545,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     });
                 }
                 markers.push({
-                    wx: sx, wz: sz, radius: 5, shape: "circle",
+                    wx: sx, wz: sz, radius: SNAP_MARKER_PX, shape: "circle",
                     fill: C_SNAP_AXIS, stroke: C_WHITE, strokeWidth: 1.5,
                 });
             }
@@ -3223,7 +3658,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
 
     /**
      * 開いたエンティティ (line / arc / open polyline) を active or pending room に
-     * 追加。閉ループにならないので polygon は派生しない。
+     * 追加。チェイン検出 (derivePolygonsFromEntities) が単独 entity を「開
+     * polygon」として派生する (= edges 明示の 1 本鎖)。WallPath と同様、entity
+     * 追加後すぐに `maybeRealtimeRegenWalls` をトリガして 3D 壁を生成する。
      */
     const commitOpenEntity = (entity: SketchEntity): ElementId | null => {
         const live = useAppState.getState().elements;
@@ -3242,6 +3679,16 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         }
         if (!targetId || !targetRoom) return null;
         setSpaceEntities(targetId, (es) => [...es, entity]);
+        // 派生した polygon の polyId を引いて wall regen を seed する。
+        // setSpaceEntities が同期的に polygons / polyIdByEntity を更新するので
+        // ここで読めば最新値が取れる。polygon が派生しなかった (= entity 単独で
+        // chain を成さない異常系) は seedPolyIds 省略 → 全 regen にフォールバック。
+        const fresh = useAppState.getState().elements[targetId as string] as SpaceElement | undefined;
+        const polyId = fresh?.polyIdByEntity?.[entity.id];
+        maybeRealtimeRegenWalls(
+            `open-entity ${entity.kind}`,
+            polyId ? [polyId] : undefined,
+        );
         return targetId;
     };
 
@@ -4600,6 +5047,87 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             return;
         }
 
+        // wallSkip mode (Trim と同じ 3 段ピック):
+        //   stage 1 (draft なし): エッジをクリックして対象を決定
+        //   stage 2 (draft.t0 === null): 1 つ目の切断点をクリック (= t0 確定)
+        //   stage 3 (draft.t0 あり): 2 つ目をクリック → polygon.wallSkips に push
+        // 右クリックは段階的キャンセル (handleContextMenu 側で実装)。
+        if (roomEditMode === "wallSkip") {
+            // ─ Stage 1: エッジ未選択。スクリーン位置でエッジをヒットテスト。
+            if (!wallSkipDraft) {
+                if (!activeRoomId) return;
+                const r = getCanvasRect();
+                const sx = e.clientX - (r?.left ?? 0);
+                const sy = e.clientY - (r?.top ?? 0);
+                const edge = hitTestEdge(sx, sy);
+                if (edge) {
+                    setWallSkipDraft({
+                        spaceId: activeRoomId,
+                        polyId: edge.polyId,
+                        edgeIdx: edge.edgeIdx,
+                        t0: null,
+                    });
+                }
+                return;
+            }
+            // ─ Stage 2 / 3: t0 → t1。
+            const draft = wallSkipDraft;
+            const sp = elements[draft.spaceId] as SpaceElement | undefined;
+            const poly = sp?.polygons?.find((p) => p.id === draft.polyId);
+            if (!poly) { setWallSkipDraft(null); return; }
+            const edges = polygonEdges(poly);
+            if (draft.edgeIdx < 0 || draft.edgeIdx >= edges.length) {
+                setWallSkipDraft(null); return;
+            }
+            const [ai, bi] = edges[draft.edgeIdx];
+            const a = poly.outer[ai];
+            const b = poly.outer[bi];
+            const dx = b[0] - a[0], dy = b[1] - a[1];
+            const len2 = dx * dx + dy * dy;
+            if (len2 < 1e-12) { setWallSkipDraft(null); return; }
+            const t = Math.max(
+                0,
+                Math.min(1, ((wp[0] - a[0]) * dx + (wp[1] - a[1]) * dy) / len2),
+            );
+            if (draft.t0 === null) {
+                setWallSkipDraft({ ...draft, t0: t });
+                return;
+            }
+            const t0 = Math.min(draft.t0, t);
+            const t1 = Math.max(draft.t0, t);
+            if (t1 - t0 < 1e-4) {
+                // 同一点クリック扱い: 再度 t0 から。
+                setWallSkipDraft({ ...draft, t0: null });
+                return;
+            }
+            const latest = useAppState.getState().elements[draft.spaceId] as SpaceElement | undefined;
+            if (latest) {
+                const newPolys = latest.polygons.map((p) => {
+                    if (p.id !== draft.polyId) return p;
+                    const cur = p.wallSkips ?? [];
+                    return {
+                        ...p,
+                        wallSkips: [...cur, { edgeIdx: draft.edgeIdx, t0, t1 }],
+                    };
+                });
+                updateElement(draft.spaceId as ElementId, {
+                    polygons: newPolys,
+                    dirtyFlags: new Set([...(latest.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                } as any);
+                const s = useAppState.getState();
+                regenerateAllWalls({
+                    wallThicknessMm: s.wallThicknessMm,
+                    circleWallAngleDeg: s.circleWallAngleDeg,
+                    wallReferenceMode: s.wallReferenceMode,
+                    seedPolyIds: [draft.polyId],
+                });
+            }
+            // 連続編集を許す: draft をリセットしてエッジ pick から再開。mode は維持。
+            setWallSkipDraft(null);
+            setMouseWorld(null); setGridSnapInfo(null);
+            return;
+        }
+
         if (roomEditMode === "select") {
             const r = getCanvasRect();
             const sx = e.clientX - (r?.left ?? 0), sy = e.clientY - (r?.top ?? 0);
@@ -5024,6 +5552,14 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         // と感じる。同じ applyDrawSnap でカーソル位置を補正しつつ
         // gridSnapInfo を立てて視覚フィードバックを出す。
         if ((roomEditMode === "line" || roomEditMode === "arc") && wp) {
+            const s = applyDrawSnap(wp);
+            setGridSnapInfo(s.info);
+            setMouseWorld(s.p);
+            return;
+        }
+        // Trim モードのカーソル追従。target 円/弧上に projection した位置を
+        // mouseWorld に反映し、buildDrawLists の trim プレビューを駆動する。
+        if (roomEditMode === "trim" && wp) {
             const s = applyDrawSnap(wp);
             setGridSnapInfo(s.info);
             setMouseWorld(s.p);
@@ -5640,27 +6176,11 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     // 「線+弧」が一体の図形では perp 制限を外して直感的な操作にする。
                     const tdx = sp[0] - d.startWorld[0];
                     const tdy = sp[1] - d.startWorld[1];
-                    // eslint-disable-next-line no-console
-                    console.log(`[polyEdge/D-translate] tdx=${tdx.toFixed(4)} tdy=${tdy.toFixed(4)} entities=${d.origEntitiesForTranslate.map((o) => `${o.snapshot.kind}:${o.entityId.slice(0,6)}`).join(",")}`);
                     setSpaceEntities(activeRoomId, (entities) =>
                         entities.map((e) => {
                             const orig = d.origEntitiesForTranslate!.find((o) => o.entityId === e.id);
                             if (!orig) return e;
-                            const translated = translateEntity(orig.snapshot, tdx, tdy);
-                            // 各 entity が translate されたかログ出力
-                            if (translated.kind === "line") {
-                                // eslint-disable-next-line no-console
-                                console.log(`  line ${e.id.slice(0,6)} p0=(${translated.p0[0].toFixed(3)},${translated.p0[1].toFixed(3)}) p1=(${translated.p1[0].toFixed(3)},${translated.p1[1].toFixed(3)})`);
-                            } else if (translated.kind === "arc") {
-                                const startPt = [translated.center[0] + translated.radius * Math.cos(translated.aStart), translated.center[1] + translated.radius * Math.sin(translated.aStart)];
-                                const endPt = [translated.center[0] + translated.radius * Math.cos(translated.aEnd), translated.center[1] + translated.radius * Math.sin(translated.aEnd)];
-                                // eslint-disable-next-line no-console
-                                console.log(`  arc  ${e.id.slice(0,6)} center=(${translated.center[0].toFixed(3)},${translated.center[1].toFixed(3)}) start=(${startPt[0].toFixed(3)},${startPt[1].toFixed(3)}) end=(${endPt[0].toFixed(3)},${endPt[1].toFixed(3)})`);
-                            } else if (translated.kind === "polyline") {
-                                // eslint-disable-next-line no-console
-                                console.log(`  polyline ${e.id.slice(0,6)} pts=[${translated.points.map(p=>`(${p[0].toFixed(3)},${p[1].toFixed(3)})`).join(",")}]`);
-                            }
-                            return translated;
+                            return translateEntity(orig.snapshot, tdx, tdy);
                         }),
                     );
                     return;
@@ -5682,7 +6202,10 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             }
             return;
         }
-        if ((roomEditMode === "select" || activeTool === "wall") && wp) {
+        // wallSkip mode の stage 1 (= edge 未ピック) でも hoveredEdge を更新して、
+        // ピック対象候補を 2D オーバーレイで強調できるようにする。
+        const wallSkipPicking = roomEditMode === "wallSkip" && !wallSkipDraft;
+        if ((roomEditMode === "select" || activeTool === "wall" || wallSkipPicking) && wp) {
             if (gridSnapInfo) setGridSnapInfo(null);
             const r = getCanvasRect();
             const sx = e.clientX - (r?.left ?? 0), sy = e.clientY - (r?.top ?? 0);
@@ -5821,7 +6344,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         : hoveredEdge ? "pointer"
         : hoveredGrid ? "pointer"
         : activeTool === "wall" ? "crosshair"
-        : roomEditMode === "rectangle" || roomEditMode === "polyline" || roomEditMode === "circle" || roomEditMode === "wallPath" || roomEditMode === "line" || roomEditMode === "arc" || roomEditMode === "arcEdge" || roomEditMode === "trim" ? "crosshair"
+        : roomEditMode === "rectangle" || roomEditMode === "polyline" || roomEditMode === "circle" || roomEditMode === "wallPath" || roomEditMode === "line" || roomEditMode === "arc" || roomEditMode === "arcEdge" || roomEditMode === "trim" || roomEditMode === "wallSkip" ? "crosshair"
         : hoveredPolyId ? "move" : "default";
 
     /**
@@ -5921,6 +6444,36 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             setMouseWorld(null);
             setGridSnapInfo(null);
             setRoomEditMode("select");
+        } else if (roomEditMode === "trim") {
+            // Trim ドラフト中の右クリック: 段階的にキャンセル
+            //   firstPoint あり → firstPoint 解除
+            //   target あり → target 解除
+            //   それ以外 → mode 終了
+            e.preventDefault();
+            if (trimFirstPoint) {
+                setTrimFirstPoint(null);
+            } else if (trimTargetEntityId) {
+                setTrimTargetEntityId(null);
+            } else {
+                setRoomEditMode("select");
+            }
+            setMouseWorld(null);
+            setGridSnapInfo(null);
+        } else if (roomEditMode === "wallSkip") {
+            // wallSkip ドラフト中の右クリック: 段階的にキャンセル。
+            //   stage 3 (t0 あり) → t0 解除 (= 同じ edge で t0 から再ピック)
+            //   stage 2 (draft あり、t0 なし) → edge 解除 (= 別 edge を選び直す)
+            //   stage 1 (draft なし) → mode 終了
+            e.preventDefault();
+            if (wallSkipDraft?.t0 != null) {
+                setWallSkipDraft({ ...wallSkipDraft, t0: null });
+            } else if (wallSkipDraft) {
+                setWallSkipDraft(null);
+            } else {
+                setRoomEditMode("select");
+            }
+            setMouseWorld(null);
+            setGridSnapInfo(null);
         } else if (roomEditMode === "select") {
             // 選択エッジが 1 つだけならコンテキストメニューを表示。
             const edges = sketchSelection.filter(
@@ -5954,14 +6507,17 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         {edgeContextMenu && (() => {
             const menu = edgeContextMenu;
             const close = () => setEdgeContextMenu(null);
+            const sp = elements[menu.spaceId] as SpaceElement | undefined;
+            const polyForMenu = sp?.polygons?.find((p) => p.id === menu.polyId);
+            const skipsForEdge = (polyForMenu?.wallSkips ?? []).filter((s) => s.edgeIdx === menu.edgeIdx);
+            const hasSkipForEdge = skipsForEdge.length > 0;
+
             const startArcEdge = () => {
-                const sp = elements[menu.spaceId] as SpaceElement | undefined;
-                const poly = sp?.polygons?.find((p) => p.id === menu.polyId);
-                if (!poly) { close(); return; }
-                const n = poly.outer.length;
+                if (!polyForMenu) { close(); return; }
+                const n = polyForMenu.outer.length;
                 if (menu.edgeIdx < 0 || menu.edgeIdx >= n) { close(); return; }
-                const a = poly.outer[menu.edgeIdx];
-                const b = poly.outer[(menu.edgeIdx + 1) % n];
+                const a = polyForMenu.outer[menu.edgeIdx];
+                const b = polyForMenu.outer[(menu.edgeIdx + 1) % n];
                 setArcEdgeChord({
                     spaceId: menu.spaceId,
                     polyId: menu.polyId,
@@ -5973,6 +6529,60 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 clearSketchSelection();
                 close();
             };
+
+            // wallSkips を mutate して polygon を更新 → 壁を再生成。明示的なユーザ
+            // アクションなので realtime フラグに関わらず regen を発火させる
+            // (= 壁が消えた / 戻った視覚フィードバックを即座に得られる)。
+            const writeSkips = (next: (skips: WallSkip[]) => WallSkip[]) => {
+                const latest = useAppState.getState().elements[menu.spaceId] as SpaceElement | undefined;
+                if (!latest) return;
+                const newPolys = latest.polygons.map((p) => {
+                    if (p.id !== menu.polyId) return p;
+                    return { ...p, wallSkips: next(p.wallSkips ?? []) };
+                });
+                updateElement(menu.spaceId as ElementId, {
+                    polygons: newPolys,
+                    dirtyFlags: new Set([...(latest.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                } as any);
+                const s = useAppState.getState();
+                regenerateAllWalls({
+                    wallThicknessMm: s.wallThicknessMm,
+                    circleWallAngleDeg: s.circleWallAngleDeg,
+                    wallReferenceMode: s.wallReferenceMode,
+                    seedPolyIds: [menu.polyId],
+                });
+            };
+
+            const fullSkip = () => {
+                writeSkips((skips) => [
+                    ...skips.filter((s) => s.edgeIdx !== menu.edgeIdx),
+                    { edgeIdx: menu.edgeIdx, t0: 0, t1: 1 },
+                ]);
+                clearSketchSelection();
+                close();
+            };
+
+            const startPartialSkip = () => {
+                if (!polyForMenu) { close(); return; }
+                const n = polyForMenu.outer.length;
+                if (menu.edgeIdx < 0 || menu.edgeIdx >= n) { close(); return; }
+                setWallSkipDraft({
+                    spaceId: menu.spaceId,
+                    polyId: menu.polyId,
+                    edgeIdx: menu.edgeIdx,
+                    t0: null,
+                });
+                setRoomEditMode("wallSkip");
+                clearSketchSelection();
+                close();
+            };
+
+            const restoreSkip = () => {
+                writeSkips((skips) => skips.filter((s) => s.edgeIdx !== menu.edgeIdx));
+                clearSketchSelection();
+                close();
+            };
+
             return (
                 <>
                     <div className="fixed inset-0 z-40"
@@ -5985,6 +6595,27 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         >
                             Arc に変換
                         </button>
+                        <div className="border-t border-zinc-700 my-1" />
+                        <button
+                            className="w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-700"
+                            onClick={fullSkip}
+                        >
+                            壁を削除
+                        </button>
+                        <button
+                            className="w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-700"
+                            onClick={startPartialSkip}
+                        >
+                            壁を部分削除…
+                        </button>
+                        {hasSkipForEdge && (
+                            <button
+                                className="w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-700 text-emerald-300"
+                                onClick={restoreSkip}
+                            >
+                                壁を復元
+                            </button>
+                        )}
                     </div>
                 </>
             );

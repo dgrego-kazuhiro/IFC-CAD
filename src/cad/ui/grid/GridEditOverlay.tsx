@@ -5,7 +5,7 @@ import { mat4, vec4 } from "gl-matrix";
 import { useAppState, AppState } from "../../application/AppState";
 import { Camera } from "../../renderer/camera/Camera";
 import { Vec3 } from "../../geometry/math/Vec3";
-import { gridVertices, gridSegments } from "../../model/grid/GridLine";
+import { gridVertices } from "../../model/grid/GridLine";
 
 interface Props {
     getCamera: () => Camera | null;
@@ -66,18 +66,22 @@ export default function GridEditOverlay({ getCamera, getCanvas }: Props) {
     const selectedGridIds = useAppState((s: AppState) => s.selectedGridIds);
     const activeRoomId = useAppState((s: AppState) => s.activeRoomId);
     const activeTool = useAppState((s: AppState) => s.activeTool);
+    const gridlineDrafting = useAppState((s: AppState) => s.gridlineDrafting);
     const moveGridVertex = useAppState((s: AppState) => s.moveGridVertex);
-    const insertGridVertex = useAppState((s: AppState) => s.insertGridVertex);
     const removeGridVertex = useAppState((s: AppState) => s.removeGridVertex);
 
     const [dragState, setDragState] = useState<DragState | null>(null);
     const [, setTick] = useState(0);
 
-    // Only show handles when a grid is selected, we're not in room edit, and
-    // we're in select/gridline mode (avoid interfering with other tools).
+    // 通芯モード (= 編集サブモード = gridlineDrafting OFF) では選択無しでも
+    // **全 grid** にハンドルを出して、クリックして即ドラッグ可能にする。
+    // select モード時は選択された grid のみ (従来挙動)。
+    const inGridlineEditMode = activeTool === "gridline" && !gridlineDrafting;
     const enabled = activeRoomId === null
-        && selectedGridIds.length > 0
-        && (activeTool === "select" || activeTool === "gridline");
+        && (
+            (inGridlineEditMode && grids.length > 0)
+            || (selectedGridIds.length > 0 && (activeTool === "select" || activeTool === "gridline"))
+        );
 
     // Follow the camera every frame
     useEffect(() => {
@@ -125,50 +129,16 @@ export default function GridEditOverlay({ getCamera, getCanvas }: Props) {
             style={{ zIndex: 16, pointerEvents: "none" }}
         >
             {grids.map((g) => {
-                if (!selectedGridIds.includes(g.id) || !g.visible) return null;
+                if (!g.visible) return null;
+                // 通芯編集モードでは全 grid にハンドルを出す。
+                // select モード時は選択中の grid のみ。
+                const showHandles = inGridlineEditMode || selectedGridIds.includes(g.id);
+                if (!showHandles) return null;
                 const verts = gridVertices(g.curve);
                 if (verts.length < 2) return null;
-                const segs = gridSegments(g.curve);
 
                 return (
                     <g key={g.id}>
-                        {/* Segment midpoint insert markers (+) */}
-                        {segs.map((s, i) => {
-                            const mid: Vec3 = [
-                                (s.a[0] + s.b[0]) / 2,
-                                (s.a[1] + s.b[1]) / 2,
-                                (s.a[2] + s.b[2]) / 2,
-                            ];
-                            const p = project(mid, cam, w, h);
-                            if (!p.visible) return null;
-                            return (
-                                <g
-                                    key={`m-${i}`}
-                                    transform={`translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`}
-                                    style={{ pointerEvents: "auto", cursor: "copy" }}
-                                    onPointerDown={(e) => {
-                                        if (e.button !== 0) return;
-                                        e.stopPropagation();
-                                        e.preventDefault();
-                                        const pt = screenToGround(e.clientX, e.clientY, canvas, cam);
-                                        if (!pt) return;
-                                        insertGridVertex(g.id, i, pt);
-                                        setDragState({
-                                            gridId: g.id,
-                                            vertexIndex: i + 1,
-                                            originalPosition: pt,
-                                            moved: false,
-                                        });
-                                    }}
-                                >
-                                    <circle r={7} fill="#22c55e" stroke="#ffffff" strokeWidth={1.2} opacity={0.85} />
-                                    <line x1={-3.5} y1={0} x2={3.5} y2={0} stroke="#ffffff" strokeWidth={1.5} />
-                                    <line x1={0} y1={-3.5} x2={0} y2={3.5} stroke="#ffffff" strokeWidth={1.5} />
-                                    <title>クリックで頂点を挿入</title>
-                                </g>
-                            );
-                        })}
-
                         {/* Vertex handles (drag to move, right-click to delete) */}
                         {verts.map((v, i) => {
                             const p = project(v, cam, w, h);
@@ -199,7 +169,7 @@ export default function GridEditOverlay({ getCamera, getCanvas }: Props) {
                                         if (canDelete) removeGridVertex(g.id, i);
                                     }}
                                 >
-                                    <circle r={r} fill="#facc15" stroke="#1f2937" strokeWidth={1.5} />
+                                    <circle r={r} fill="#f97316" stroke="#1f2937" strokeWidth={1.5} />
                                     <title>
                                         {canDelete
                                             ? "ドラッグで移動 / 右クリックで削除"
