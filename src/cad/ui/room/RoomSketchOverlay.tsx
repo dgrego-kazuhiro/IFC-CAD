@@ -222,6 +222,79 @@ function isArcVertex(outer: Vec2[], i: number): boolean {
  * セットされる。`|bulge| > half` でも同じロジックで「カーソル側を通る major
  * arc」を選ぶ (sweep > π)。
  */
+/**
+ * Sketch entity を (dx, dy) だけ平行移動した新しい entity を返す (= 不変)。
+ *  - line:     p0, p1 を平行移動
+ *  - polyline: 全 points を平行移動
+ *  - circle:   center を平行移動 (radius 不変)
+ *  - arc:      center を平行移動 (radius / aStart / aEnd 不変)
+ *
+ * polygon ドラッグ系で「entity を真実の単一情報源」として直接動かすために
+ * 使う。polygon は entity から再派生されるので、entity を動かせば polygon も
+ * 自動的に追従し、polygon と entity の不一致状態が原理的に発生しない。
+ */
+/**
+ * polyId に紐付く space.entities のスナップショットを集める。
+ *  polyIdByEntity (entityId → polyId 対応表) を逆引き。値は **deep copy**
+ *  なので、後で entity が更新されても snapshot は変わらない。
+ *  poly が entity に裏付けられていない (= legacy 等) なら空配列を返す。
+ */
+function collectPolyEntitiesSnapshot(
+    space: SpaceElement,
+    polyId: string,
+): { entityId: string; snapshot: SketchEntity }[] {
+    const out: { entityId: string; snapshot: SketchEntity }[] = [];
+    const map = space.polyIdByEntity ?? {};
+    const ents = space.entities ?? [];
+    for (const eid in map) {
+        if (map[eid] !== polyId) continue;
+        const ent = ents.find((e) => e.id === eid);
+        if (!ent) continue;
+        // deep clone (= 値だけコピー、参照を切る)
+        out.push({ entityId: eid, snapshot: cloneEntity(ent) });
+    }
+    return out;
+}
+
+function cloneEntity(e: SketchEntity): SketchEntity {
+    if (e.kind === "line") {
+        return { ...e, p0: [e.p0[0], e.p0[1]], p1: [e.p1[0], e.p1[1]] };
+    }
+    if (e.kind === "polyline") {
+        return { ...e, points: e.points.map((p) => [p[0], p[1]] as Vec2) };
+    }
+    if (e.kind === "circle") {
+        return { ...e, center: [e.center[0], e.center[1]] };
+    }
+    if (e.kind === "arc") {
+        return { ...e, center: [e.center[0], e.center[1]] };
+    }
+    return e;
+}
+
+function translateEntity(e: SketchEntity, dx: number, dy: number): SketchEntity {
+    if (e.kind === "line") {
+        return {
+            ...e,
+            p0: [e.p0[0] + dx, e.p0[1] + dy],
+            p1: [e.p1[0] + dx, e.p1[1] + dy],
+        };
+    }
+    if (e.kind === "polyline") {
+        return {
+            ...e,
+            points: e.points.map((p) => [p[0] + dx, p[1] + dy] as Vec2),
+        };
+    }
+    if (e.kind === "circle") {
+        return { ...e, center: [e.center[0] + dx, e.center[1] + dy] };
+    }
+    if (e.kind === "arc") {
+        return { ...e, center: [e.center[0] + dx, e.center[1] + dy] };
+    }
+    return e;
+}
+
 function arcFromChordAndCursor(p0: Vec2, p1: Vec2, cursor: Vec2): {
     center: Vec2; radius: number; aStart: number; aEnd: number;
 } | null {
@@ -273,6 +346,7 @@ interface Props { viewportRef: React.RefObject<ViewportHandle | null>; }
 interface DragPolyState {
     kind: "poly";
     polyId: string;
+    spaceId: string;
     startWorld: [number, number];
     origOuter: Vec2[];
     origHoles: Vec2[][];
@@ -286,6 +360,14 @@ interface DragPolyState {
     // Snapshot of any wall-outline polygons whose inner is this dragged
     // polygon — same translate-by-delta treatment so the outline follows.
     origOutlines: { polyId: string; outer: Vec2[]; holes: Vec2[][] }[];
+    /**
+     * ドラッグされる polygon に紐付く entity のスナップショット。
+     * polyId → polyIdByEntity の逆引きで決まる。**毎フレーム origin から
+     * 累計 delta** で平行移動するため (= incremental に動かすと FP 誤差が
+     * 累積するため)、drag 開始時の値を保存する。空配列なら entity を持たない
+     * polygon (= legacy / outline 等) → polygon 直接更新フォールバックを使う。
+     */
+    origEntities: { entityId: string; snapshot: SketchEntity }[];
     moved: boolean;
 }
 interface DragPolyVertexState {
@@ -307,6 +389,16 @@ interface DragPolyEdgeState {
     wallThickness?: number;
     startWorld: [number, number];
     moved: boolean;
+    /**
+     * polygon の chain が「直線（line / open polyline）+ 弧 1 本」で構成される
+     * 単純な D 形状の場合に、ドラッグ開始時の entity スナップショットを保存。
+     * 直線辺の perp ドラッグで両端が同じ delta だけ動くケースは、updatePolysAndSync
+     * の case A 検知に頼らず、ここに保存した snapshot を perp delta で平行移動して
+     * setSpaceEntities に渡すことで「弧と直線の chain 接続が確実に保たれる」。
+     * line+arc 以外（矩形 / polyline 単独 / 複雑な chain）では undefined を残し、
+     * 従来の polygon 更新経路にフォールバックする。
+     */
+    origEntitiesForTranslate?: { entityId: string; snapshot: SketchEntity }[];
 }
 /**
  * Arc entity 全体を平行移動するドラッグ。
@@ -536,9 +628,12 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const [circleCenter, setCircleCenter] = useState<[number, number] | null>(null);
     // Single-line draft (mode = "line"): first click sets start, second commits.
     const [lineStart, setLineStart] = useState<[number, number] | null>(null);
-    // 3-click arc draft (mode = "arc"): center → start point → end point.
-    const [arcCenter, setArcCenter] = useState<[number, number] | null>(null);
-    const [arcStartPoint, setArcStartPoint] = useState<[number, number] | null>(null);
+    // 3-click arc draft (mode = "arc"): 弦端点 P0 → 弦端点 P1 → bulge カーソル
+    // (= 弧の膨らみ位置)。1 点目と 2 点目で弦 (= ChordEntity の 2 端点) が
+    // 確定し、3 点目で `arcFromChordAndCursor` 経由でカーソル側を通る弧の
+    // 中心 / 半径 / 角度を確定する。
+    const [arcChordP0, setArcChordP0] = useState<[number, number] | null>(null);
+    const [arcChordP1, setArcChordP1] = useState<[number, number] | null>(null);
     // Arc-from-edge draft (mode = "arcEdge"): 既存エッジを chord として固定し、
     // マウスで bulge (= chord 中点からの垂直距離) を決定する。
     type ArcEdgeChord = {
@@ -595,6 +690,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const mouseWorldRef = useRef(mouseWorld); mouseWorldRef.current = mouseWorld;
     const polyDraftPointsRef = useRef(polyDraftPoints); polyDraftPointsRef.current = polyDraftPoints;
     const circleCenterRef = useRef(circleCenter); circleCenterRef.current = circleCenter;
+    const lineStartRef = useRef(lineStart); lineStartRef.current = lineStart;
+    const arcChordP0Ref = useRef(arcChordP0); arcChordP0Ref.current = arcChordP0;
+    const arcChordP1Ref = useRef(arcChordP1); arcChordP1Ref.current = arcChordP1;
     const arcEdgeChordRef = useRef(arcEdgeChord); arcEdgeChordRef.current = arcEdgeChord;
     // Populated by the body below — lets the Enter-key effect (declared before
     // the early return) call the latest closure.
@@ -997,8 +1095,8 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             setCircleCenter(null);
         }
         if (roomEditMode !== "line" && lineStart) setLineStart(null);
-        if (roomEditMode !== "arc" && (arcCenter || arcStartPoint)) {
-            setArcCenter(null); setArcStartPoint(null);
+        if (roomEditMode !== "arc" && (arcChordP0 || arcChordP1)) {
+            setArcChordP0(null); setArcChordP1(null);
         }
         if (roomEditMode !== "arcEdge" && arcEdgeChord) {
             setArcEdgeChord(null);
@@ -1546,6 +1644,8 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             | { kind: "polyline"; points: Vec2[] }
             | { kind: "line"; p0?: Vec2; p1?: Vec2 }
             | { kind: "circle"; center?: Vec2; radius?: number }
+            | { kind: "arc"; cx: number; cy: number;
+                radius?: number; aStart?: number; aEnd?: number }
         >();
         const ents = room.entities ?? [];
         const polyIdByEntity = room.polyIdByEntity ?? {};
@@ -1562,6 +1662,33 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             if (!p) { p = { kind: "line" }; entityUpdates.set(ln.id, p); }
             return p;
         };
+        // Arc 用パッチ: 端点が動いた arc の処理。
+        //  ケース A) 両端点が同じ delta で動く (= polygon 全体平行移動):
+        //           center を delta だけ平行移動。半径 / 角度は不変。
+        //  ケース B) 片端だけ動く (= vertex drag で arc 端点を掴んだ):
+        //           動いた端点 → cursor、反対端点 → 不動を満たす **新しい弧**
+        //           を `arcFromChordAndCursor` で再構成。bulge は元の弧の中心
+        //           側を継承するため、元 center 位置を bulgeSide として渡す。
+        //           これをしないと「arc 全体が平行移動 → 反対端も動く →
+        //           line 端点が剥がれる → 弦が消える」現象になる。
+        type ArcPatch = { kind: "arc"; cx: number; cy: number;
+            radius?: number; aStart?: number; aEnd?: number };
+        const ensureArcPatch = (a: ArcEntity): ArcPatch => {
+            let p = entityUpdates.get(a.id) as ArcPatch | undefined;
+            if (!p) {
+                p = { kind: "arc", cx: a.center[0], cy: a.center[1] };
+                entityUpdates.set(a.id, p);
+            }
+            return p;
+        };
+        // 弧の reshape vs translate を正しく判定するため、先に「動いた頂点
+        // 全部 + その新位置」を集める。同じ arc に対する 2 端点を同フレームで
+        // 評価してから、case A (両端同 delta = translate) / case B (片端だけ
+        // = reshape) を確定する。ループ中に都度 arc を平行移動する旧実装は
+        // 「最後に処理した端点の delta だけが arc 全体に反映」されてしまい、
+        // arc 端点ドラッグで反対端まで動いて弦が剥がれる原因だった。
+        interface MovedVertex { newPos: Vec2; oldPos: Vec2 }
+        const movedByPos: { newPos: Vec2; oldPos: Vec2 }[] = [];
         for (const newPoly of synced) {
             const oldPoly = room.polygons.find((p) => p.id === newPoly.id);
             if (!oldPoly) continue;
@@ -1608,11 +1735,17 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const incOwners = Array.from(new Set(
                     incEdges.map((ei) => newPoly.edgeOwners![ei]).filter(Boolean) as string[],
                 ));
-                // 弧/円 interior: skip (parametric)
+                // 弧/円 interior: 頂点が arc / circle entity 単独所有なら
+                // テッセレーション中間点 (= パラメトリックに再生成される) なので
+                // skip。両端点 (= line 系と接続される共有頂点) はこのブロック
+                // ではなく後段の「arc owner なら center 平行移動」で扱う。
                 if (incOwners.length === 1) {
                     const e = ents.find((x) => x.id === incOwners[0]);
                     if (e && (e.kind === "arc" || e.kind === "circle")) continue;
                 }
+                // この vertex が動いたことを記録 (= 後で arc 端点との位置一致を
+                // 判定して、弧の translate / reshape を一括決定するため)。
+                movedByPos.push({ newPos, oldPos });
                 // Update each non-arc owner's point at this vertex.
                 for (const ow of incOwners) {
                     const e = ents.find((x) => x.id === ow);
@@ -1642,6 +1775,132 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 }
             }
         }
+        // ── Arc 一括処理: ループで集めた movedByPos を arc 端点と突き合わせて
+        //    translate or reshape を確定する。
+        const ARC_TOL = 1e-3;
+        for (const e of ents) {
+            if (e.kind !== "arc") continue;
+            const startPt: Vec2 = [
+                e.center[0] + e.radius * Math.cos(e.aStart),
+                e.center[1] + e.radius * Math.sin(e.aStart),
+            ];
+            const endPt: Vec2 = [
+                e.center[0] + e.radius * Math.cos(e.aEnd),
+                e.center[1] + e.radius * Math.sin(e.aEnd),
+            ];
+            const startMoved = movedByPos.find(
+                (m) => Math.hypot(m.oldPos[0] - startPt[0], m.oldPos[1] - startPt[1]) < ARC_TOL,
+            );
+            const endMoved = movedByPos.find(
+                (m) => Math.hypot(m.oldPos[0] - endPt[0], m.oldPos[1] - endPt[1]) < ARC_TOL,
+            );
+            // 診断ログ: 弧端点と movedByPos の対応が取れているかをダンプ。
+            // user 報告「line drag で弧だけになる」の原因切り分け用。
+            // eslint-disable-next-line no-console
+            console.log(
+                `[arc-handle] arc=${e.id.slice(0, 6)} ` +
+                `startPt=(${startPt[0].toFixed(3)},${startPt[1].toFixed(3)}) ` +
+                `endPt=(${endPt[0].toFixed(3)},${endPt[1].toFixed(3)}) ` +
+                `moved=${movedByPos.length} ` +
+                `startMatch=${startMoved ? "Y" : "N"} endMatch=${endMoved ? "Y" : "N"} ` +
+                (movedByPos.length > 0
+                    ? `firstOld=(${movedByPos[0].oldPos[0].toFixed(3)},${movedByPos[0].oldPos[1].toFixed(3)})`
+                    : ""),
+            );
+            if (!startMoved && !endMoved) continue;
+            // 元の弧の **bulge 比率** (= chord の半長に対する bulge の比)。
+            // この比率を新 chord に合わせて再投影することで、chord 長が
+            // 大きく変わっても弧の「曲がり具合」が原形を保つ (= 1/4 円弧
+            // は 1/4 円弧のまま、半円は半円のまま)。
+            //
+            // 元 chord 半長 half_old = |startPt - endPt| / 2。
+            // 元 bulge_old = (arc midpoint − chord midpoint) · n_old (符号付き)。
+            // 比率 r = bulge_old / half_old を保存し、新 chord 半長 half_new に
+            // 掛けて新 bulge_new = r * half_new を得る。
+            //
+            // Edge case: chord が degenerate (= 両端一致) なら何もしない。
+            const oldChordDx = endPt[0] - startPt[0];
+            const oldChordDy = endPt[1] - startPt[1];
+            const oldChordLen = Math.hypot(oldChordDx, oldChordDy);
+            if (oldChordLen < ARC_TOL) continue;
+            const oldHalf = oldChordLen / 2;
+            const oldUx = oldChordDx / oldChordLen;
+            const oldUy = oldChordDy / oldChordLen;
+            const oldNx = -oldUy; // CCW 90° 回転 (chord 方向 → 法線)
+            const oldNy = oldUx;
+            // 元 arc 中点 (= aStart→aEnd を CCW で進む半分の角度位置)。
+            let oldSweep = e.aEnd - e.aStart;
+            while (oldSweep <= 0) oldSweep += Math.PI * 2;
+            while (oldSweep > Math.PI * 2) oldSweep -= Math.PI * 2;
+            const arcMidAngle = e.aStart + oldSweep / 2;
+            const arcMidX = e.center[0] + e.radius * Math.cos(arcMidAngle);
+            const arcMidY = e.center[1] + e.radius * Math.sin(arcMidAngle);
+            const oldChordMx = (startPt[0] + endPt[0]) / 2;
+            const oldChordMy = (startPt[1] + endPt[1]) / 2;
+            const oldBulge = (arcMidX - oldChordMx) * oldNx
+                           + (arcMidY - oldChordMy) * oldNy;
+            const bulgeRatio = oldBulge / oldHalf;
+            // bulgeSide を **新 chord** に対して再構築する内部ヘルパ。
+            // chordP0 → chordP1 順で渡される (= e.aStart 端点 → e.aEnd 端点)。
+            const computeBulgeSide = (chordP0: Vec2, chordP1: Vec2): Vec2 => {
+                const dx = chordP1[0] - chordP0[0];
+                const dy = chordP1[1] - chordP0[1];
+                const len = Math.hypot(dx, dy) || 1;
+                const ux = dx / len, uy = dy / len;
+                const nx = -uy, ny = ux;
+                const mx = (chordP0[0] + chordP1[0]) / 2;
+                const my = (chordP0[1] + chordP1[1]) / 2;
+                const newBulge = bulgeRatio * (len / 2);
+                return [mx + nx * newBulge, my + ny * newBulge];
+            };
+            // ── ケース A: 両端点が動いて、delta が同じ → translate ──
+            if (startMoved && endMoved) {
+                const dx0 = startMoved.newPos[0] - startMoved.oldPos[0];
+                const dy0 = startMoved.newPos[1] - startMoved.oldPos[1];
+                const dx1 = endMoved.newPos[0] - endMoved.oldPos[0];
+                const dy1 = endMoved.newPos[1] - endMoved.oldPos[1];
+                if (Math.abs(dx0 - dx1) < ARC_TOL && Math.abs(dy0 - dy1) < ARC_TOL) {
+                    const patch = ensureArcPatch(e);
+                    patch.cx = e.center[0] + dx0;
+                    patch.cy = e.center[1] + dy0;
+                    continue;
+                }
+                // 両端動いたが delta が違う → reshape。bulge 比率を新 chord に
+                // 合わせて再投影 (= 弧の「曲がり具合」を保つ)。
+                const newStart = startMoved.newPos;
+                const newEnd = endMoved.newPos;
+                const cursorSide = computeBulgeSide(newStart, newEnd);
+                const arc = arcFromChordAndCursor(newStart, newEnd, cursorSide);
+                if (arc) {
+                    const patch = ensureArcPatch(e);
+                    patch.cx = arc.center[0];
+                    patch.cy = arc.center[1];
+                    patch.radius = arc.radius;
+                    patch.aStart = arc.aStart;
+                    patch.aEnd = arc.aEnd;
+                }
+                continue;
+            }
+            // ── ケース B: 片端だけ動いた → reshape (= もう片端は不動) ──
+            const movedSide = startMoved ?? endMoved!;
+            const movedIsStart = !!startMoved;
+            const newMoved = movedSide.newPos;
+            const fixedEnd = movedIsStart ? endPt : startPt;
+            // arcFromChordAndCursor は chord = aStart→aEnd 順 (= e.aStart 端点
+            // が p0、e.aEnd 端点が p1)。movedIsStart なら新 start = newMoved。
+            const chordP0 = movedIsStart ? newMoved : fixedEnd;
+            const chordP1 = movedIsStart ? fixedEnd : newMoved;
+            const cursorSide = computeBulgeSide(chordP0, chordP1);
+            const arc = arcFromChordAndCursor(chordP0, chordP1, cursorSide);
+            if (arc) {
+                const patch = ensureArcPatch(e);
+                patch.cx = arc.center[0];
+                patch.cy = arc.center[1];
+                patch.radius = arc.radius;
+                patch.aStart = arc.aStart;
+                patch.aEnd = arc.aEnd;
+            }
+        }
         if (entityUpdates.size > 0) {
             // Use setSpaceEntities so polygon is re-derived from updated entities.
             // This keeps polygon.outer and entity.points in sync (= chain
@@ -1664,6 +1923,15 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         ...e,
                         ...(p.center ? { center: p.center } : {}),
                         ...(p.radius !== undefined ? { radius: p.radius } : {}),
+                    };
+                }
+                if (p.kind === "arc" && e.kind === "arc") {
+                    return {
+                        ...e,
+                        center: [p.cx, p.cy],
+                        ...(p.radius !== undefined ? { radius: p.radius } : {}),
+                        ...(p.aStart !== undefined ? { aStart: p.aStart } : {}),
+                        ...(p.aEnd !== undefined ? { aEnd: p.aEnd } : {}),
                     };
                 }
                 return e;
@@ -2136,14 +2404,43 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 }
 
                 // Outline edges in muted slate so the active room visually wins.
+                // Arc / Circle 由来 edge は分割線ではなく弧として滑らかに描画。
                 const inactiveStroke: RGBA = rgba(100, 116, 139, 0.65);
                 const polyEdgeList = polygonEdges(poly);
-                for (const [ai, bi] of polyEdgeList) {
+                const passiveEntById = new Map<string, SketchEntity>();
+                for (const en of otherRoom.entities ?? []) passiveEntById.set(en.id, en);
+                for (let pei = 0; pei < polyEdgeList.length; pei++) {
+                    const [ai, bi] = polyEdgeList[pei];
                     const a = poly.outer[ai], b = poly.outer[bi];
-                    lines.push({
-                        ax: a[0], az: a[1], bx: b[0], bz: b[1],
-                        color: inactiveStroke, width: 1.2,
-                    });
+                    const ownerId = poly.edgeOwners?.[pei];
+                    const owner = ownerId ? passiveEntById.get(ownerId) : undefined;
+                    if (owner && (owner.kind === "arc" || owner.kind === "circle")) {
+                        const cx = owner.center[0], cy = owner.center[1];
+                        const r = owner.radius;
+                        const ang0 = Math.atan2(a[1] - cy, a[0] - cx);
+                        const ang1 = Math.atan2(b[1] - cy, b[0] - cx);
+                        let sweep = ang1 - ang0;
+                        while (sweep <= -Math.PI) sweep += Math.PI * 2;
+                        while (sweep > Math.PI) sweep -= Math.PI * 2;
+                        const SUB = 10;
+                        let prevX = a[0], prevY = a[1];
+                        for (let k = 1; k <= SUB; k++) {
+                            const t = k / SUB;
+                            const ang = ang0 + sweep * t;
+                            const nx = cx + r * Math.cos(ang);
+                            const ny = cy + r * Math.sin(ang);
+                            lines.push({
+                                ax: prevX, az: prevY, bx: nx, bz: ny,
+                                color: inactiveStroke, width: 1.2,
+                            });
+                            prevX = nx; prevY = ny;
+                        }
+                    } else {
+                        lines.push({
+                            ax: a[0], az: a[1], bx: b[0], bz: b[1],
+                            color: inactiveStroke, width: 1.2,
+                        });
+                    }
                 }
                 for (const h of poly.holes ?? []) {
                     if (h.length < 2) continue;
@@ -2359,8 +2656,16 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 };
 
                 // Outer edges (explicit edge list — may be open / non-cyclic)
+                // Arc / Circle entity 由来のエッジは「分割線」(= 多数の chord
+                // 線分の集まり) ではなく、エンティティのパラメトリック形式
+                // (= center / radius / aStart / aEnd) を使って **滑らかな弧**
+                // として描画する。各 polygon edge をその chord 部分に対応する
+                // 角度範囲で 10 分割し、円周上のサブ点を結ぶ細かい線分に展開
+                // することで、視覚的に分割の継ぎ目を消す。
                 const polyEdgeList = polygonEdges(poly);
                 const n = poly.outer.length;
+                const entById = new Map<string, SketchEntity>();
+                for (const en of rm.entities ?? []) entById.set(en.id, en);
                 for (let i = 0; i < polyEdgeList.length; i++) {
                     const [ai, bi] = polyEdgeList[i];
                     const a = poly.outer[ai];
@@ -2372,7 +2677,34 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     let width = sw;
                     if (selE) { col = C_HL_ORANGE; width = sw + 1.5; }
                     else if (hovEd) { col = C_EDGE_HOV; width = sw + 1; }
-                    lines.push({ ax: a[0], az: a[1], bx: b[0], bz: b[1], color: col, width });
+                    // Arc / Circle 所有 edge: 端点 a, b を arc.center 基準で
+                    // 角度に変換し、その範囲を細分化して滑らかな弧として描画。
+                    const ownerId = poly.edgeOwners?.[i];
+                    const owner = ownerId ? entById.get(ownerId) : undefined;
+                    if (owner && (owner.kind === "arc" || owner.kind === "circle")) {
+                        const cx = owner.center[0];
+                        const cy = owner.center[1];
+                        const r = owner.kind === "arc" ? owner.radius : owner.radius;
+                        const ang0 = Math.atan2(a[1] - cy, a[0] - cx);
+                        const ang1 = Math.atan2(b[1] - cy, b[0] - cx);
+                        // CCW 方向に短い側 (= chord セグメントが対応する arc 弧)
+                        // を選ぶ。差を [0, 2π) に正規化して、π を超えたら逆向き。
+                        let sweep = ang1 - ang0;
+                        while (sweep <= -Math.PI) sweep += Math.PI * 2;
+                        while (sweep > Math.PI) sweep -= Math.PI * 2;
+                        const SUB = 10; // edge 1 本あたり 10 細分
+                        let prevX = a[0], prevY = a[1];
+                        for (let k = 1; k <= SUB; k++) {
+                            const t = k / SUB;
+                            const ang = ang0 + sweep * t;
+                            const nx = cx + r * Math.cos(ang);
+                            const ny = cy + r * Math.sin(ang);
+                            lines.push({ ax: prevX, az: prevY, bx: nx, bz: ny, color: col, width });
+                            prevX = nx; prevY = ny;
+                        }
+                    } else {
+                        lines.push({ ax: a[0], az: a[1], bx: b[0], bz: b[1], color: col, width });
+                    }
                 }
                 // Holes (outline only, no per-vertex constraint targets)
                 for (const h of poly.holes ?? []) {
@@ -2592,6 +2924,85 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 });
                 markers.push({
                     wx: ch.p1[0], wz: ch.p1[1], radius: 4, shape: "circle",
+                    fill: C_TEMP, stroke: C_WHITE, strokeWidth: 1.2,
+                });
+            }
+        }
+
+        // Line draft (while drawing). 1 点目クリック後、カーソルまでの直線を
+        // 破線でプレビュー。確定すると LineEntity として commit される。
+        if (mode === "line") {
+            const ls = lineStartRef.current;
+            if (ls && mw) {
+                lines.push({
+                    ax: ls[0], az: ls[1], bx: mw[0], bz: mw[1],
+                    color: C_TEMP, width: 1.5, dash: 6, dashRatio: 0.55,
+                });
+                markers.push({
+                    wx: ls[0], wz: ls[1], radius: 4, shape: "circle",
+                    fill: C_TEMP, stroke: C_WHITE, strokeWidth: 1.2,
+                });
+            }
+        }
+
+        // Arc draft (3 クリック制 = 弦 P0 → 弦 P1 → bulge カーソル)。
+        //   step 1 → step 2: P0 → cursor の破線 (= 弦候補)。
+        //   step 2 → step 3: P0—P1 の弦実線 + arcFromChordAndCursor の弧プレビュー。
+        if (mode === "arc") {
+            const p0 = arcChordP0Ref.current;
+            const p1 = arcChordP1Ref.current;
+            if (p0 && mw) {
+                if (!p1) {
+                    // step 1 → step 2: P0 → cursor を弦候補として破線で見せる。
+                    lines.push({
+                        ax: p0[0], az: p0[1], bx: mw[0], bz: mw[1],
+                        color: C_TEMP, width: 1, dash: 6, dashRatio: 0.55,
+                    });
+                } else {
+                    // step 2 → step 3: 弦確定。P0—P1 を実線、cursor 側を通る弧を実線で描く。
+                    lines.push({
+                        ax: p0[0], az: p0[1], bx: p1[0], bz: p1[1],
+                        color: C_TEMP, width: 1.5,
+                    });
+                    const arc = arcFromChordAndCursor(p0, p1, [mw[0], mw[1]]);
+                    if (arc) {
+                        let sweep = arc.aEnd - arc.aStart;
+                        while (sweep <= 0) sweep += Math.PI * 2;
+                        while (sweep > Math.PI * 2) sweep -= Math.PI * 2;
+                        const M = Math.max(16, Math.ceil((sweep * arc.radius) / 0.05));
+                        let prev: Vec2 = [
+                            arc.center[0] + arc.radius * Math.cos(arc.aStart),
+                            arc.center[1] + arc.radius * Math.sin(arc.aStart),
+                        ];
+                        for (let i = 1; i <= M; i++) {
+                            const a = arc.aStart + sweep * (i / M);
+                            const next: Vec2 = [
+                                arc.center[0] + arc.radius * Math.cos(a),
+                                arc.center[1] + arc.radius * Math.sin(a),
+                            ];
+                            lines.push({
+                                ax: prev[0], az: prev[1], bx: next[0], bz: next[1],
+                                color: C_TEMP, width: 1.5,
+                            });
+                            prev = next;
+                        }
+                    }
+                    // 弦中点 → cursor の補助線 (= bulge を視覚化)。
+                    const mx = (p0[0] + p1[0]) / 2;
+                    const my = (p0[1] + p1[1]) / 2;
+                    lines.push({
+                        ax: mx, az: my, bx: mw[0], bz: mw[1],
+                        color: C_TEMP, width: 1, dash: 6, dashRatio: 0.4,
+                    });
+                    // 弦端点マーカ
+                    markers.push({
+                        wx: p1[0], wz: p1[1], radius: 4, shape: "circle",
+                        fill: C_TEMP, stroke: C_WHITE, strokeWidth: 1.2,
+                    });
+                }
+                // P0 マーカ (常に出す)
+                markers.push({
+                    wx: p0[0], wz: p0[1], radius: 4, shape: "circle",
                     fill: C_TEMP, stroke: C_WHITE, strokeWidth: 1.2,
                 });
             }
@@ -4073,41 +4484,36 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             return;
         }
 
-        // Arc entity: 3 clicks (center → start point → end point).
-        // First click: center. Second: a point on the arc (sets radius and
-        // start angle). Third: end angle (radius is fixed by the start click;
-        // end snaps onto the radius circle for a clean arc).
+        // Arc entity: 3 クリック (弦 P0 → 弦 P1 → bulge カーソル)。
+        // 1 点目・2 点目で弦の両端 (= 弧の両端点) を確定。3 点目はカーソルが
+        // 弦のどちら側にあるかで「カーソル側を通る弧」を構築する
+        // (= `arcFromChordAndCursor` ヘルパが中心 / 半径 / aStart / aEnd を導出)。
+        // 既存の arcEdge モード (= 既存エッジを chord として円弧化) と同じ式。
         if (roomEditMode === "arc") {
             const snapped = applyDrawSnap(wp).p;
-            if (!arcCenter) { setArcCenter(snapped); setMouseWorld(snapped); return; }
-            if (!arcStartPoint) {
-                const r = Math.hypot(snapped[0] - arcCenter[0], snapped[1] - arcCenter[1]);
-                if (r < 1e-6) return; // ignore degenerate
-                setArcStartPoint(snapped);
+            if (!arcChordP0) {
+                setArcChordP0(snapped); setMouseWorld(snapped); return;
+            }
+            if (!arcChordP1) {
+                const chord = Math.hypot(snapped[0] - arcChordP0[0], snapped[1] - arcChordP0[1]);
+                if (chord < 1e-6) return; // ignore degenerate (重複クリック)
+                setArcChordP1(snapped);
                 setMouseWorld(snapped);
                 return;
             }
-            const r = Math.hypot(arcStartPoint[0] - arcCenter[0], arcStartPoint[1] - arcCenter[1]);
-            const aStart = Math.atan2(arcStartPoint[1] - arcCenter[1], arcStartPoint[0] - arcCenter[0]);
-            const aEnd = Math.atan2(snapped[1] - arcCenter[1], snapped[0] - arcCenter[0]);
-            // sweep ≈ 0 → degenerate (use ε); ≈ 2π → full circle (commit as Circle)
-            const sweep = wrap2pi(aEnd - aStart);
-            if (sweep < 1e-6) {
-                // commit as full circle instead
-                const entity: CircleEntity = {
-                    id: generateId(), kind: "circle",
-                    center: [arcCenter[0], arcCenter[1]], radius: r,
-                };
-                commitClosedEntity(entity);
-            } else {
+            // 3 点目: カーソルで bulge を決める。
+            const arc = arcFromChordAndCursor(arcChordP0, arcChordP1, snapped);
+            if (arc) {
                 const entity: ArcEntity = {
                     id: generateId(), kind: "arc",
-                    center: [arcCenter[0], arcCenter[1]], radius: r,
-                    aStart, aEnd,
+                    center: [arc.center[0], arc.center[1]],
+                    radius: arc.radius,
+                    aStart: arc.aStart,
+                    aEnd: arc.aEnd,
                 };
                 commitOpenEntity(entity);
             }
-            setArcCenter(null); setArcStartPoint(null); setMouseWorld(null); setGridSnapInfo(null);
+            setArcChordP0(null); setArcChordP1(null); setMouseWorld(null); setGridSnapInfo(null);
             setRoomEditMode("select");
             return;
         }
@@ -4311,6 +4717,35 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const normal: [number, number] = [-ez / len, ex / len];
                 setSelection([`poly:${edge.polyId}`]);
                 setLastDraggedPolyId(null);
+                // ── line+arc D 形状の判定と entity snapshot 取得 ────────────────
+                // polygon の chain が「直線系 1 本 + 弧 1 本」で構成される閉
+                // チェイン (= D 形状) で、ドラッグ対象が **直線辺** の場合、
+                // 両 entity を perp delta で一括平行移動 → setSpaceEntities で
+                // 再派生 → chain 接続が必ず保たれる (= 「直線が消える」を回避)。
+                //
+                // 弧辺ドラッグは startEntityArcDrag (line 4705) で先に分岐済み。
+                // 矩形 / 多複合 chain では polyEntities.length !== 2 で除外。
+                let origEntitiesForTranslate:
+                    | { entityId: string; snapshot: SketchEntity }[]
+                    | undefined;
+                if (activeRoomId) {
+                    const ownerId = poly.edgeOwners?.[edge.edgeIdx];
+                    const owner = ownerId
+                        ? (room.entities ?? []).find((e) => e.id === ownerId)
+                        : undefined;
+                    if (owner && (owner.kind === "line" || owner.kind === "polyline")) {
+                        const polyEntities = collectPolyEntitiesSnapshot(room, edge.polyId);
+                        if (polyEntities.length === 2) {
+                            const hasArc = polyEntities.some((p) => p.snapshot.kind === "arc");
+                            const hasLineish = polyEntities.some(
+                                (p) => p.snapshot.kind === "line" || p.snapshot.kind === "polyline",
+                            );
+                            if (hasArc && hasLineish) {
+                                origEntitiesForTranslate = polyEntities;
+                            }
+                        }
+                    }
+                }
                 setDragState({
                     kind: "polyEdge",
                     polyId: edge.polyId,
@@ -4321,6 +4756,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     wallThickness: poly.wallThickness,
                     startWorld: wp,
                     moved: false,
+                    origEntitiesForTranslate,
                 });
                 return;
             }
@@ -4433,9 +4869,16 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     }
                 }
 
+                // Capture entities backing this polygon (= polyIdByEntity reverse).
+                // 各 entity の **値を deep copy** してスナップショットを作る。
+                // ドラッグ中は origEntities を真実とし、毎フレーム total delta で
+                // 平行移動した結果を setSpaceEntities に書く。re-derive で polygon
+                // outer は自動更新される。
+                const origEntities = collectPolyEntitiesSnapshot(room, ph);
                 setDragState({
                     kind: "poly",
                     polyId: ph,
+                    spaceId: activeRoomId as string,
                     startWorld: wp,
                     origOuter: poly.outer.map(p => [p[0], p[1]] as Vec2),
                     origHoles: (poly.holes ?? []).map(h => h.map(p => [p[0], p[1]] as Vec2)),
@@ -4446,6 +4889,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     origWallAxes,
                     origConcentric,
                     origOutlines,
+                    origEntities,
                     moved: false,
                 });
                 return;
@@ -4502,9 +4946,14 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     activeRoomIdRef.current = hitOtherRoomId;
                     setSelection([`poly:${hitOtherPoly.id}`]);
                     setLastDraggedPolyId(null);
+                    const otherSpace = elements[hitOtherRoomId] as SpaceElement | undefined;
+                    const otherOrigEntities = otherSpace
+                        ? collectPolyEntitiesSnapshot(otherSpace, hitOtherPoly.id)
+                        : [];
                     setDragState({
                         kind: "poly",
                         polyId: hitOtherPoly.id,
+                        spaceId: hitOtherRoomId as string,
                         startWorld: wp,
                         origOuter: hitOtherPoly.outer.map(p => [p[0], p[1]] as Vec2),
                         origHoles: (hitOtherPoly.holes ?? []).map(h => h.map(p => [p[0], p[1]] as Vec2)),
@@ -4516,6 +4965,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         origWallAxes: otherWallAxes,
                         origConcentric: [],
                         origOutlines: [],
+                        origEntities: otherOrigEntities,
                         moved: false,
                     });
                     return;
@@ -4568,20 +5018,64 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             if (rectStart) setMouseWorld(s.p);
             return;
         }
+        // Line (= 単一直線, 2点) と Arc (= 3点指定の弧) でも snap プレビューを
+        // 出す。click 時は applyDrawSnap が走るので結果としてはスナップしている
+        // が、移動中に snap target が見えないとユーザは「スナップしていない」
+        // と感じる。同じ applyDrawSnap でカーソル位置を補正しつつ
+        // gridSnapInfo を立てて視覚フィードバックを出す。
+        if ((roomEditMode === "line" || roomEditMode === "arc") && wp) {
+            const s = applyDrawSnap(wp);
+            setGridSnapInfo(s.info);
+            setMouseWorld(s.p);
+            return;
+        }
         if (dragState && wp) {
             // ドラッグは実体 polygon が必要 → pending 中はそもそも到達しないが
             // TS narrow のためにガード。
             if (!activeRoomId) return;
             if (!dragState.moved) setDragState({ ...dragState, moved: true });
             if (dragState.kind === "entityArc") {
-                // 弧全体を平行移動: arc.center を動かし、隣接 polyline / line の
-                // 端点は **新しい chord 端点に直接スナップ** させて chain 接続が
-                // 切れないようにする。`orig + delta` だと事前に entity と chord
-                // の間に FP ドリフトがあるとドラッグ後も乖離が残り、polyline と
-                // 弧が分離してしまう (= ユーザ報告の不整合)。
                 const d = dragState;
                 const s = applyGridSnap(wp);
                 setGridSnapInfo(s.info);
+                // ── 弧が他の entity (line / polyline) と chord で連結している
+                //    場合は **chord を固定して半径だけ変える** モード (FreeCAD の
+                //    arc rim drag と同じ)。chord は origAdjacentPoints の orig
+                //    位置 (= drag 開始時の line 端点) を使うので drag 中は不動。
+                //    cursor 位置を通る新しい弧を `arcFromChordAndCursor` で計算し、
+                //    弧 entity の center / radius / aStart / aEnd を更新する。
+                //    隣接 line / polyline は更新しない (chord 固定なので)。
+                if (d.origAdjacentPoints.length >= 2) {
+                    const adjStart = d.origAdjacentPoints.find((a) => a.matchesArcStart);
+                    const adjEnd = d.origAdjacentPoints.find((a) => !a.matchesArcStart);
+                    if (adjStart && adjEnd) {
+                        const arcParams = arcFromChordAndCursor(
+                            adjStart.orig as Vec2,
+                            adjEnd.orig as Vec2,
+                            s.p,
+                        );
+                        if (arcParams) {
+                            setSpaceEntities(d.spaceId as ElementId, (entities) =>
+                                entities.map((e) => {
+                                    if (e.id === d.entityId && e.kind === "arc") {
+                                        return {
+                                            ...e,
+                                            center: arcParams.center,
+                                            radius: arcParams.radius,
+                                            aStart: arcParams.aStart,
+                                            aEnd: arcParams.aEnd,
+                                        };
+                                    }
+                                    return e;
+                                }),
+                            );
+                        }
+                        return;
+                    }
+                }
+                // ── chord 連結が無い (= 独立した弧 entity) の場合は従来通り
+                //    平行移動。隣接 polyline / line の端点も新 chord 端点に
+                //    スナップさせて chain 接続を維持する。
                 const dx = s.p[0] - d.startWorld[0];
                 const dz = s.p[1] - d.startWorld[1];
                 setSpaceEntities(d.spaceId as ElementId, (entities) => {
@@ -4916,16 +5410,53 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         });
                     }
                 }
+                // ── Entity-driven path: 真実の単一情報源 (= entity) を直接
+                //    動かす。setSpaceEntities が re-derive を走らせるので polygon
+                //    outer は entity から自動派生される。「polygon を先に動かして
+                //    entity を逆引き同期」していた旧 updatePolysAndSync 経路は、
+                //    arc / circle のパラメトリック表現と相性が悪く、line+arc
+                //    チェインが drag 中に切れる原因だった。
+                //
+                //    entity を持たない polygon (= origEntities が空; legacy /
+                //    outline polygon 等) はフォールバックで従来の polygon 直接
+                //    更新に落とす。
+                const dragSpaceId = dpoly.spaceId as ElementId;
+                const useEntityPath = dpoly.origEntities.length > 0;
+                if (useEntityPath) {
+                    setSpaceEntities(dragSpaceId, (entities) =>
+                        entities.map((e) => {
+                            const orig = dpoly.origEntities.find((o) => o.entityId === e.id);
+                            if (!orig) return e;
+                            return translateEntity(orig.snapshot, dx, dz);
+                        }),
+                    );
+                }
+                // FreeCAD `MoveParameters` 風の **多点ピン** を solver に渡す。
+                // poly drag は全頂点を delta 平行移動した位置にピン留め。
+                // solver は他の自由頂点を H/V/Distance などで reflow する。
+                // entity 経路で polygon は既に translated 状態だが、solver が
+                // 拘束違反を検出したらピンを唯一の真実として再解決する。
+                const pins: import("../../application/AppState").SolverDragPin[] =
+                    dpoly.origOuter.map((pt, i) => ({
+                        spaceId: dragSpaceId,
+                        polyId: dpoly.polyId,
+                        vertexIdx: i,
+                        x: pt[0] + dx,
+                        y: pt[1] + dz,
+                    }));
+                setSolverDragHint(pins);
+                // 派生でない部分 (= 同心円 partner / outline / 別 polygon 由来の
+                // Coincident link / 別 polygon が entity を持たないケース) は
+                // 従来通り polygon 直接更新で処理する。entity を持つ polygon は
+                // 上で更新済みなので skip する。
                 const newPolys = room.polygons.map(p => {
                     if (p.id === dpoly.polyId) {
+                        if (useEntityPath) return p; // 上で entity 経由更新済み
                         const next: RoomPolygon = {
                             ...p,
                             outer: dpoly.origOuter.map(pt => [pt[0] + dx, pt[1] + dz] as Vec2),
                             holes: dpoly.origHoles.map(h => h.map(pt => [pt[0] + dx, pt[1] + dz] as Vec2)),
                         };
-                        // Translate parametric shape from its drag-start snapshot
-                        // (NOT p.shape which has already been updated by prior
-                        // frames — that would compound and drift).
                         if (p.shape?.type === "circle" && dpoly.origShapeCenter && dpoly.origShapeRadius !== undefined) {
                             next.shape = {
                                 type: "circle",
@@ -4969,9 +5500,6 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                             const linksHere = coincidentLinks.filter((l) => l.otherPolyId === p.id);
                             if (linksHere.length === 0) return p;
                             const newOuter: Vec2[] = p.outer.map((pt) => [pt[0], pt[1]] as Vec2);
-                            // Pin the partner's coincident vertices to the dragged
-                            // polygon's current corresponding positions, then run
-                            // local propagation from each pinned vertex.
                             for (const link of linksHere) {
                                 const srcPt = draggedOuter[link.dragVertexIdx];
                                 if (!srcPt) continue;
@@ -4990,13 +5518,36 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         });
                     }
                 }
-                // Route through updatePolysAndSync so entity points / circle
-                // entity center are synced from polygon updates. Without this,
-                // dragging a circle moves polygon.shape.center but the circle
-                // entity stays put — and any later setSpaceEntities (= radius
-                // edit, constraint, etc.) re-derives polygon from the stale
-                // entity, snapping the circle back to its original position.
-                updatePolysAndSync(reshapedPolys);
+                // entity 経路を使った場合: dragSpace の polygon は setSpaceEntities
+                // が re-derive 済みなので updatePolysAndSync を呼ぶ必要なし。
+                // ただし outline / concentric partner / coincident 先などは
+                // polygon 直接更新したので、それらだけを別途反映する。
+                // entity 経路を使わない (フォールバック) 場合は従来通り全部
+                // updatePolysAndSync に流す。
+                if (!useEntityPath) {
+                    updatePolysAndSync(reshapedPolys);
+                } else {
+                    // 直接更新が必要だった polygon (= entity 由来でない) のみ書き戻す
+                    const directPolys: RoomPolygon[] = [];
+                    for (const p of reshapedPolys) {
+                        // 自身 (entity 経路で更新済み) は skip
+                        if (p.id === dpoly.polyId) continue;
+                        // 元の polygon と outer 参照が同じなら変更なし
+                        const old = room.polygons.find((q) => q.id === p.id);
+                        if (old && p === old) continue;
+                        directPolys.push(p);
+                    }
+                    if (directPolys.length > 0) {
+                        const idSet = new Set(directPolys.map((p) => p.id));
+                        const merged = room.polygons.map((p) =>
+                            idSet.has(p.id) ? directPolys.find((q) => q.id === p.id)! : p,
+                        );
+                        updateElement(dragSpaceId, {
+                            polygons: merged,
+                            dirtyFlags: new Set([...(room.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                        } as any);
+                    }
+                }
                 // Walls are also re-synced inside updatePolysAndSync via
                 // computeMiteredWallAxes; but we still translate the recorded
                 // origWallAxes directly to keep the per-frame axis identical
@@ -5034,6 +5585,20 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     d.origOuter[j][0] + d.normal[0] * perp,
                     d.origOuter[j][1] + d.normal[1] * perp,
                 ];
+                // FreeCAD `MoveParameters` 風の **2 ピン** を solver に渡す:
+                // ドラッグ辺の両端点をそれぞれ perp 移動先に固定。残りの
+                // 頂点は solver が H/V/Distance を満たすよう reflow する。
+                // updatePolysAndSync 側で propagateSimpleConstraints も走る
+                // ので、軽量な拘束 (= H/V/Coincident) は同フレームで解決し、
+                // それ以外 (= 距離拘束など) を solver が後追いで解く。
+                if (activeRoomId) {
+                    setSolverDragHint([
+                        { spaceId: activeRoomId, polyId: d.polyId, vertexIdx: i,
+                          x: targetI[0], y: targetI[1] },
+                        { spaceId: activeRoomId, polyId: d.polyId, vertexIdx: j,
+                          x: targetJ[0], y: targetJ[1] },
+                    ]);
+                }
                 // Outer-edge drag: reverse-map through negative mitering to
                 // the inner, same pattern as the outer-vertex case.
                 const innerId = dragPoly.wallOutlineOf;
@@ -5063,6 +5628,43 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     return;
                 }
 
+                // ── line+arc D 形状の entity-translate パス ────────────────
+                // 直線辺の perp ドラッグでは線と弧を **同じ delta で平行移動** すれば
+                // chain 接続が保たれる (= setSpaceEntities 側で polygon が再派生
+                // される)。updatePolysAndSync の delta 検知（case A）は polygon outer
+                // と entity の整合に依存するため、そこに依存せず entity を直接
+                // 翻訳する経路を選ぶ。これで「直線が消える」現象を確実に回避。
+                if (d.origEntitiesForTranslate && activeRoomId) {
+                    // D 形状の直線辺ドラッグは **自由 2D 平行移動** 扱い (= 全体が
+                    // カーソルに追従)。perp 制限は矩形などの単一辺ドラッグ用なので
+                    // 「線+弧」が一体の図形では perp 制限を外して直感的な操作にする。
+                    const tdx = sp[0] - d.startWorld[0];
+                    const tdy = sp[1] - d.startWorld[1];
+                    // eslint-disable-next-line no-console
+                    console.log(`[polyEdge/D-translate] tdx=${tdx.toFixed(4)} tdy=${tdy.toFixed(4)} entities=${d.origEntitiesForTranslate.map((o) => `${o.snapshot.kind}:${o.entityId.slice(0,6)}`).join(",")}`);
+                    setSpaceEntities(activeRoomId, (entities) =>
+                        entities.map((e) => {
+                            const orig = d.origEntitiesForTranslate!.find((o) => o.entityId === e.id);
+                            if (!orig) return e;
+                            const translated = translateEntity(orig.snapshot, tdx, tdy);
+                            // 各 entity が translate されたかログ出力
+                            if (translated.kind === "line") {
+                                // eslint-disable-next-line no-console
+                                console.log(`  line ${e.id.slice(0,6)} p0=(${translated.p0[0].toFixed(3)},${translated.p0[1].toFixed(3)}) p1=(${translated.p1[0].toFixed(3)},${translated.p1[1].toFixed(3)})`);
+                            } else if (translated.kind === "arc") {
+                                const startPt = [translated.center[0] + translated.radius * Math.cos(translated.aStart), translated.center[1] + translated.radius * Math.sin(translated.aStart)];
+                                const endPt = [translated.center[0] + translated.radius * Math.cos(translated.aEnd), translated.center[1] + translated.radius * Math.sin(translated.aEnd)];
+                                // eslint-disable-next-line no-console
+                                console.log(`  arc  ${e.id.slice(0,6)} center=(${translated.center[0].toFixed(3)},${translated.center[1].toFixed(3)}) start=(${startPt[0].toFixed(3)},${startPt[1].toFixed(3)}) end=(${endPt[0].toFixed(3)},${endPt[1].toFixed(3)})`);
+                            } else if (translated.kind === "polyline") {
+                                // eslint-disable-next-line no-console
+                                console.log(`  polyline ${e.id.slice(0,6)} pts=[${translated.points.map(p=>`(${p[0].toFixed(3)},${p[1].toFixed(3)})`).join(",")}]`);
+                            }
+                            return translated;
+                        }),
+                    );
+                    return;
+                }
                 // Use current state for the other vertices so solver adjustments
                 // from previous frames aren't overwritten (avoids shaking).
                 const currentPoly = room.polygons.find((p) => p.id === d.polyId);

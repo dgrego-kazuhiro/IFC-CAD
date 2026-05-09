@@ -28,6 +28,8 @@ export default function CadShell() {
     const pendingRoomLevelId = useAppState((state: AppState) => state.pendingRoomLevelId);
     const setActiveRoom = useAppState((state: AppState) => state.setActiveRoom);
     const setPendingRoomLevel = useAppState((state: AppState) => state.setPendingRoomLevel);
+    const viewMode = useAppState((state: AppState) => state.viewMode);
+    const setViewMode = useAppState((state: AppState) => state.setViewMode);
     const selectedGridIds = useAppState((state: AppState) => state.selectedGridIds);
     const selection = useAppState((state: AppState) => state.selection);
     const sketchSelection = useAppState((state: AppState) => state.sketchSelection);
@@ -194,7 +196,13 @@ export default function CadShell() {
                         title="現在のシーンを IFC2X3 ファイル (.ifc) として書き出し"
                     >Export IFC</button>
                 </div>
-                <div className="ml-auto flex gap-2 text-sm">
+                <div className="ml-auto flex gap-2 text-sm items-center">
+                    {/* 2D 限定ツール群 (作図系) + Select。3D ビューでは作図
+                        位置の解像度が荒くなるため隠す。3D 切替時に setViewMode
+                        が活性ツールを select へ戻すので、3D で Select ボタン
+                        を出す意味は薄い (= Door/Window はトグルで select に
+                        戻れるし、Escape でも戻る)。Door / Window は 3D 専用。 */}
+                    {viewMode === "2D" && (<>
                     <button
                         className={`px-3 py-1 rounded border ${activeTool === "select" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
                         onClick={() => setActiveTool("select")}
@@ -242,6 +250,10 @@ export default function CadShell() {
                         onClick={() => setActiveTool(activeTool === "gridline" ? "select" : "gridline")}
                         title="通芯 (グリッドライン) ツール"
                     >Grid</button>
+                    </>)}
+                    {/* Door / Window は 3D ビュー専用 (壁面の高さ位置を見ながら
+                        配置する必要があるため)。 */}
+                    {viewMode === "3D" && (<>
                     <button
                         className={`px-3 py-1 rounded border ${activeTool === "door" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
                         onClick={() => setActiveTool(activeTool === "door" ? "select" : "door")}
@@ -252,6 +264,23 @@ export default function CadShell() {
                         onClick={() => setActiveTool(activeTool === "window" ? "select" : "window")}
                         title="窓配置ツール (壁にホバーしてクリックで配置)"
                     >Window</button>
+                    </>)}
+                    {/* 2D / 3D ビュー切替 — ツールバー右端に **固定** 配置。
+                        ツール群は viewMode で増減するので、トグルを左側に置くと
+                        切替時にトグル自身が左右に動いてしまう (ユーザ報告)。
+                        トグルを最後に置けば右端に張り付き、ツール側だけが伸縮する。 */}
+                    <div className="flex rounded border border-zinc-700 overflow-hidden ml-2">
+                        <button
+                            className={`px-2 py-1 text-xs ${viewMode === "2D" ? "bg-zinc-600 text-white" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"}`}
+                            onClick={() => setViewMode("2D")}
+                            title="2D (top-down) ビュー: 作図 / 配置作業向き"
+                        >2D</button>
+                        <button
+                            className={`px-2 py-1 text-xs ${viewMode === "3D" ? "bg-zinc-600 text-white" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"}`}
+                            onClick={() => setViewMode("3D")}
+                            title="3D (perspective) ビュー: モデル確認・Door/Window 配置"
+                        >3D</button>
+                    </div>
                 </div>
             </div>
             <div className="flex-1 flex min-h-0">

@@ -122,8 +122,13 @@ export function runSketchSolver(): void {
 async function solveOnce(): Promise<void> {
     const state = useAppState.getState();
     const constraints = Object.values(state.constraints);
-    const dragHint = state.solverDragHint;
-    if (constraints.length === 0) return;
+    // 複数ピン対応 (= FreeCAD MoveParameters 配列相当)。drag handler が
+    // setSolverDragHint([pin1, pin2, ...]) でセット。ピンが指す頂点は
+    // ソルバ内で fixed=true として push され、他の頂点は拘束を満たすよう
+    // reflow する。
+    const dragHints = state.solverDragHint;
+    // Drag 中でも拘束が無ければソルブする意味は無い。早期 return。
+    if (constraints.length === 0 && dragHints.length === 0) return;
 
     // Collect all polygons (non-circle), circles, and wall axes targeted by
     // any constraint.
@@ -237,11 +242,10 @@ async function solveOnce(): Promise<void> {
         const cached = computedAxesByPoly.get(key);
         if (cached) return cached;
         const effective: Vec2[] = poly.outer.map((v, i) => {
-            if (dragHint &&
-                dragHint.spaceId === spaceId &&
-                dragHint.polyId === poly.id &&
-                dragHint.vertexIdx === i
-            ) return [dragHint.x, dragHint.y];
+            const pin = dragHints.find((p) =>
+                p.spaceId === spaceId && p.polyId === poly.id && p.vertexIdx === i,
+            );
+            if (pin) return [pin.x, pin.y];
             return [v[0], v[1]];
         });
         let cx = 0, cy = 0;
@@ -262,41 +266,38 @@ async function solveOnce(): Promise<void> {
         const primitives: any[] = [];
 
         // ── Push polygons as N points + N lines (no implicit constraints) ──
-        // If a drag hint is set, the matching vertex is pushed as `fixed: true`
-        // at the drag-target xy. The solver then keeps that vertex anchored and
-        // adjusts the other vertices around it (SolidWorks-style drag feel).
-        // If the dragged vertex participates in a constraint that cannot be
-        // satisfied while it's pinned (PointOnCircle / Tangent / PointOnGrid
-        // etc.), fall back to using the cursor as the *initial guess* rather
-        // than a fixed pin. The solver then snaps the point onto the curve.
-        const dragVertexHasCurveConstraint = (() => {
-            if (!dragHint) return false;
-            // 「ドラッグ点を fixed pin にしてしまうと拘束と矛盾する」種類の
-            // 拘束があれば、ドラッグ点を free にしてカーソルは初期推定値として
-            // 使う (= 解の近傍を案内するだけ)。これを行わないと例えば PerpDistance
-            // 拘束がかかった頂点を線越しにドラッグした時、距離拘束と pin 位置の
-            // 両方を満たそうとして solver が暴れて矩形がペシャンコに崩れる。
-            const conflictKinds = new Set([
-                "PointOnCircle", "PointOnGrid",
-                "PerpDistance", "Length", "CircleRadius", "CircleDiameter",
-                "ArcRadius", "ArcDiameter",
-            ]);
+        // 各ピン (= dragHints[i]) について「ピンを fixed=true にすると拘束と
+        // 矛盾するか」を判定。conflict なら fixed では無く initial guess (=
+        // 始点だけカーソル位置) として使い、solver にカーブ上に snap させる。
+        // FreeCAD の `dragVertexHasCurveConstraint` と同じ目的。
+        const conflictKinds = new Set([
+            "PointOnCircle", "PointOnGrid",
+            "PerpDistance", "Length", "CircleRadius", "CircleDiameter",
+            "ArcRadius", "ArcDiameter",
+        ]);
+        const pinHasCurveConstraint = (pin: typeof dragHints[number]): boolean => {
             for (const c of constraints) {
                 if (!conflictKinds.has(c.type)) continue;
                 for (const t of c.targets) {
                     if (t.kind === "SketchPoint"
-                        && t.spaceId === dragHint.spaceId
-                        && t.polyId === dragHint.polyId
-                        && t.vertexIdx === dragHint.vertexIdx) return true;
+                        && t.spaceId === pin.spaceId
+                        && t.polyId === pin.polyId
+                        && t.vertexIdx === pin.vertexIdx) return true;
                 }
             }
             return false;
-        })();
+        };
+        // (spaceId, polyId, vertexIdx) → pin の高速 lookup。複数ピンを多用
+        // するので毎回線形検索しない。
+        const pinByVertex = new Map<string, typeof dragHints[number]>();
+        for (const p of dragHints) {
+            pinByVertex.set(`${p.spaceId}:${p.polyId}:${p.vertexIdx}`, p);
+        }
+        const pinKey = (spaceId: string, polyId: string, vIdx: number) =>
+            `${spaceId}:${polyId}:${vIdx}`;
 
         // Derive an outline polygon's outer from its inner (with any dragHint
-        // on the inner applied). Returns null when the inner is missing or
-        // not wall-capable — caller then falls back to the outline's stored
-        // outer (rare; stale data).
+        // pin on the inner applied). 複数ピン対応。
         const deriveOutlineOuter = (spaceId: string, outlinePoly: RoomPolygon): Vec2[] | null => {
             const innerId = outlinePoly.wallOutlineOf;
             if (!innerId) return null;
@@ -305,11 +306,8 @@ async function solveOnce(): Promise<void> {
             const inner = sp.polygons?.find((p) => p.id === innerId);
             if (!inner || inner.wallThickness == null || inner.outer.length < 3) return null;
             const innerEffective: Vec2[] = inner.outer.map((v, i) => {
-                if (dragHint &&
-                    dragHint.spaceId === spaceId &&
-                    dragHint.polyId === inner.id &&
-                    dragHint.vertexIdx === i
-                ) return [dragHint.x, dragHint.y];
+                const pin = pinByVertex.get(pinKey(spaceId, inner.id, i));
+                if (pin) return [pin.x, pin.y];
                 return [v[0], v[1]];
             });
             let cx = 0, cy = 0;
@@ -347,20 +345,48 @@ async function solveOnce(): Promise<void> {
                 // 保たれる (弧自体は ArcEntity の center / radius / aStart / aEnd
                 // でパラメトリックに表現され、setSpaceEntities 経由で再テッセレ
                 // ートされるのが本来の真実)。
+                //
+                // Drag pin は **fixed:true で hard-pin しない**。FreeCAD `initMove`
+                // と同様、cursor 用 fixed point + temporary P2PCoincident のペアで
+                // 表現する (= soft pin)。理由: ユーザ拘束 (Length / H / V / Distance
+                // など) と矛盾する位置にカーソルが動いた場合、hard-pin だと他頂点が
+                // 拘束を満たそうと暴走する。soft pin なら solver が least-squares で
+                // 「カーソル追従と既存拘束のバランス点」を求めるため形状が壊れない。
                 const isArcInterior = isArcInteriorVertex(entry.poly, i, spEntities);
-                const isDragMatch =
-                    dragHint != null &&
-                    dragHint.spaceId === entry.spaceId &&
-                    dragHint.polyId === entry.poly.id &&
-                    dragHint.vertexIdx === i;
-                const isDragPin = isDragMatch && !dragVertexHasCurveConstraint;
+                const pin = pinByVertex.get(pinKey(entry.spaceId, entry.poly.id, i));
+                const pinHasCurve = pin ? pinHasCurveConstraint(pin) : false;
+                const isDragPin = pin != null && !pinHasCurve;
                 primitives.push({
                     type: "point",
                     id: String(pid),
-                    x: isDragMatch ? dragHint.x : outer[i][0],
-                    y: isDragMatch ? dragHint.y : outer[i][1],
-                    fixed: isArcInterior || isDragPin,
+                    // 初期座標も pin 位置にしておくと solver が pin 周辺から探索を
+                    // 始めるので収束が早い (= FreeCAD の MoveParameters 同様)。
+                    x: pin ? pin.x : outer[i][0],
+                    y: pin ? pin.y : outer[i][1],
+                    fixed: isArcInterior, // arc interior のみ hard-pin
                 });
+                if (isDragPin && pin) {
+                    // FreeCAD `MoveParameters` 風: cursor 位置に fixed point を置き、
+                    // ポリゴン頂点との P2PCoincident (temporary) で「カーソルに追従
+                    // すべし」を表現する。temporary フラグは driving 拘束として
+                    // 通常拘束と等価扱いだが、scale や clean-up 用のタグとして
+                    // planegcs で扱われる。
+                    const cursorOID = idAlloc.next();
+                    primitives.push({
+                        type: "point",
+                        id: String(cursorOID),
+                        x: pin.x,
+                        y: pin.y,
+                        fixed: true,
+                    });
+                    primitives.push({
+                        type: "p2p_coincident",
+                        id: String(idAlloc.next()),
+                        p1_id: String(pid),
+                        p2_id: String(cursorOID),
+                        temporary: true,
+                    });
+                }
             }
             const lIds: OID[] = [];
             const polyEdgeList = polygonEdges(entry.poly);
@@ -630,8 +656,15 @@ async function solveOnce(): Promise<void> {
             //   - 元 polygon の幅・高さの 5 倍を超える膨張は reject
             //   - 全頂点の絶対座標が 1000m を超えるのは reject (= 室内寸法で
             //     ありえない位置)
+            //   - 元の幅・高さが COLLAPSE_RATIO 倍未満まで縮退するのも reject
+            //     (= 位置拘束が無いポリゴンに H/V/Parallel/Perp 等の方向系
+            //     拘束だけが効いた状態で、ソルバが自由度を消費して縮退解
+            //     [= 矩形が線分や点に潰れた形] に収束するのを防ぐ。
+            //     例: 隣接していた部屋同士のリンクが解放された後、片方の部屋
+            //     に方向拘束しか残らないケース)
             const RUNAWAY_RATIO = 5.0;
             const RUNAWAY_ABS_M = 1000;
+            const COLLAPSE_RATIO = 0.05; // 5% 未満まで縮んだら縮退とみなす
 
             for (const [key, entry] of polys) {
                 const ids = polyIds.get(key);
@@ -651,10 +684,12 @@ async function solveOnce(): Promise<void> {
                     }
                 }
                 if (!changed) continue;
-                // 暴走検知: 解が NaN/Inf を含む、元の AABB の RUNAWAY_RATIO 倍を
-                // 超えて膨張、絶対座標が RUNAWAY_ABS_M を超える場合は writeback
-                // を skip して元の polygon を温存する (= 矛盾 / 過剰拘束による
-                // 暴走から保護)。
+                // 暴走/縮退検知: 解が NaN/Inf を含む、元の AABB の RUNAWAY_RATIO
+                // 倍を超える膨張、絶対座標が RUNAWAY_ABS_M を超える、または
+                // 元の幅・高さの COLLAPSE_RATIO 倍未満まで縮んだ場合は
+                // writeback を skip。元 polygon の幅と高さの両方が 0 に近い
+                // (= 元から細長い線分等) なら collapse 判定をスキップする
+                // (誤判定を避ける)。
                 const oldAabb = aabbOf(entry.poly.outer);
                 const newAabb = aabbOf(solved);
                 const oldExtent = Math.max(oldAabb.w, oldAabb.h, 0.1);
@@ -664,14 +699,23 @@ async function solveOnce(): Promise<void> {
                     !Number.isFinite(newAabb.absMax) ||
                     newAabb.absMax > RUNAWAY_ABS_M ||
                     newExtent > oldExtent * RUNAWAY_RATIO;
-                if (runaway) {
+                const SIG_DIM_M = 1e-3; // 1mm。これより薄いのは元から線分扱い
+                const oldHasW = oldAabb.w > SIG_DIM_M;
+                const oldHasH = oldAabb.h > SIG_DIM_M;
+                const collapsedW = oldHasW && newAabb.w < oldAabb.w * COLLAPSE_RATIO;
+                const collapsedH = oldHasH && newAabb.h < oldAabb.h * COLLAPSE_RATIO;
+                const collapsed = collapsedW || collapsedH;
+                if (runaway || collapsed) {
                     // eslint-disable-next-line no-console
                     console.warn(
-                        `[SketchSolver] runaway solution rejected for poly ` +
-                        `${entry.poly.id.slice(0, 6)}: ` +
-                        `oldExtent=${oldExtent.toFixed(2)} → newExtent=${newExtent.toFixed(2)} ` +
-                        `absMax=${newAabb.absMax.toFixed(2)}m. ` +
-                        `直近で追加した拘束が過剰 / 矛盾している可能性があります。`,
+                        `[SketchSolver] ${collapsed ? "collapsed" : "runaway"} ` +
+                        `solution rejected for poly ${entry.poly.id.slice(0, 6)}: ` +
+                        `oldAABB=${oldAabb.w.toFixed(2)}×${oldAabb.h.toFixed(2)} → ` +
+                        `newAABB=${newAabb.w.toFixed(2)}×${newAabb.h.toFixed(2)} ` +
+                        `absMax=${newAabb.absMax.toFixed(2)}m。` +
+                        (collapsed
+                            ? "位置拘束 (Distance/PerpDistance/Coincident 等) が無いと、方向系拘束だけでは ソルバが縮退解に収束することがあります。"
+                            : "直近で追加した拘束が過剰 / 矛盾している可能性があります。"),
                     );
                     continue;
                 }

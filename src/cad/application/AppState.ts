@@ -69,14 +69,30 @@ export function sketchSelectionKey(s: SketchSelectionItem): string {
     return `o`;
 }
 
-/** 拘束ソルバへのドラッグヒント。SketchSolver がこの頂点を fixed として push する。 */
-export interface SolverDragHint {
+/**
+ * 拘束ソルバへのドラッグピン (= FreeCAD `MoveParameters` 相当)。
+ * SketchSolver がこの頂点を **fixed** としてカーソル位置にピン留めし、
+ * 他の頂点は拘束を満たすよう reflow する。
+ *
+ * 配列で複数ピンを許す:
+ *  - 単点ドラッグ (= polyVertex):     1 ピン
+ *  - 辺ドラッグ (= polyEdge):         2 ピン (辺両端を perp 位置に)
+ *  - ポリゴン全体平行移動 (= poly):    全頂点をそれぞれの新位置にピン
+ *
+ * ピンによってソルバが拘束を満たす唯一の解を返すため、drag handler 側は
+ * ジオメトリを直接書き込まず、ピンと現在のカーソル位置だけ伝える設計。
+ * 複数ピンが拘束矛盾を生む場合は solver が失敗 → polygon の元位置維持。
+ */
+export interface SolverDragPin {
     spaceId: ElementId;
     polyId: string;
     vertexIdx: number;
     x: number;
     y: number;
 }
+
+/** 後方互換のため alias を残す (= 単点ピンは Pin[] の長さ 1 と等価)。 */
+export type SolverDragHint = SolverDragPin;
 
 export interface LevelData {
     id: ElementId;
@@ -102,6 +118,9 @@ export type ColumnSubMode = "add" | "edit";
 
 /** Top-level design mode (per docs/specification/new.md §8). */
 export type DesignMode = "freeZoning" | "jpResidentialGrid";
+
+/** ビュー切替: 2D = ortho top-down (作図中心)、3D = perspective (Door/Window 配置・確認)。 */
+export type ViewMode = "2D" | "3D";
 
 /** Primary / secondary residential grid spacing, in metres. */
 export const RESIDENTIAL_GRID_PRIMARY_M = 0.910;
@@ -141,6 +160,11 @@ export interface AppState {
      *                       and mouse / vertex motion snaps to it.
      */
     designMode: DesignMode;
+
+    /** ビューモード (2D / 3D)。各モードで使えるツールが切り替わる:
+     *  - 2D (既定): Select + 作図系 (Room / Column / Beam / Slab / Gridline / Door / Window)
+     *  - 3D: Select + Door / Window のみ (3D 視点での開口配置・確認用) */
+    viewMode: ViewMode;
 
     // 通芯 (Grid) — building-level reference elements (per spec §4)
     grids: GridLine[];
@@ -191,11 +215,12 @@ export interface AppState {
     sketchSelection: SketchSelectionItem[];
     selectedConstraintId: string | null;
     /**
-     * 拘束ソルバへのドラッグヒント。指定された頂点を fixed として push し、
-     * その位置を中心に他の頂点が動くようにする (SolidWorks 風挙動)。
-     * pointerMove で更新し、pointerUp で null クリアする。
+     * 拘束ソルバへのドラッグピン (= FreeCAD MoveParameters 相当)。配列の
+     * 各要素は「この頂点をこの位置に固定して欲しい」という solver への
+     * 希望値。pointerMove で更新し、pointerUp で空配列クリアする。
+     * 空配列 (= []) は「ドラッグ中ではない」を表す。
      */
-    solverDragHint: SolverDragHint | null;
+    solverDragHint: SolverDragPin[];
 
     // Actions
     addElement: (element: BaseElement) => void;
@@ -233,6 +258,7 @@ export interface AppState {
 
     // Design mode action
     setDesignMode: (mode: DesignMode) => void;
+    setViewMode: (mode: ViewMode) => void;
 
     // 通芯 actions
     addGrid: (start: Vec3, end: Vec3, kind?: "Primary" | "Auxiliary") => string;
@@ -260,7 +286,9 @@ export interface AppState {
     toggleSketchSelection: (item: SketchSelectionItem, additive: boolean) => void;
     clearSketchSelection: () => void;
     setSelectedConstraintId: (id: string | null) => void;
-    setSolverDragHint: (hint: SolverDragHint | null) => void;
+    /** Drag ピンを設定 (= FreeCAD `initMove` + `moveGeometries` 相当)。
+     *  null / 空配列 → drag 終了 (= ピン解除)。null クリアで再ソルブが走る。 */
+    setSolverDragHint: (hint: SolverDragPin[] | SolverDragPin | null) => void;
     setSelectedGridIds: (ids: string[]) => void;
     // §6.2 連続作成: clone the most recent grid offset perpendicular to its direction
     offsetLastGrid: (distance: number, kind?: "Primary" | "Auxiliary") => void;
@@ -322,6 +350,7 @@ export const useAppState = create<AppState>((set, get) => ({
     beamSubMode: "add",
     columnSubMode: "add",
     designMode: "freeZoning",
+    viewMode: "2D",
     grids: [],
     gridNaming: DEFAULT_GRID_NAMING,
     gridlineDrafting: false,
@@ -330,7 +359,7 @@ export const useAppState = create<AppState>((set, get) => ({
     constraints: {},
     sketchSelection: [],
     selectedConstraintId: null,
-    solverDragHint: null,
+    solverDragHint: [],
     types: seedStandardTypes(),
     activeTypeIdByCategory: { ...DEFAULT_TYPE_BY_CATEGORY },
 
@@ -411,6 +440,14 @@ export const useAppState = create<AppState>((set, get) => ({
             return { elements: { ...state.elements, [spaceId]: updated } };
         });
         // 拘束ソルバはエンティティ変更にも反応する想定 (vertex 移動など)。
+        // ただし **drag 中** (= solverDragHint にピンが入っている) は solver
+        // 起動を skip する。理由: drag handler は同フレームで polygon outer +
+        // entity + wall axis を一斉更新しており、ここで async ソルバが間に
+        // 入ると polygon と entity / wall axis が drift して「サイズ大⇆小」の
+        // 振動になる (= ユーザ報告)。drag END の `setSolverDragHint(null)`
+        // でピンが空になった時に最終ソルブを走らせる。
+        const latest = get();
+        if (latest.solverDragHint.length > 0) return;
         const mod = require('../constraint/SketchSolver') as typeof import('../constraint/SketchSolver');
         mod.runSketchSolver();
     },
@@ -461,6 +498,40 @@ export const useAppState = create<AppState>((set, get) => ({
     setColumnSubMode: (mode) => set({ columnSubMode: mode }),
 
     setDesignMode: (mode) => set({ designMode: mode }),
+    setViewMode: (mode) => set((state) => {
+        // 各モードで使えないツールが有効なら select に戻す。
+        //   2D (作図): Column / Beam / Slab / Gridline / Room
+        //   3D (確認・開口配置): Door / Window
+        // 例: 3D 切替時に Column が active → select に戻す。2D 切替時に
+        // Door が active → select に戻す。
+        const tools2DOnly = new Set([
+            "column", "beam", "slab", "gridline", "wall",
+        ]);
+        const tools3DOnly = new Set(["door", "window"]);
+        let nextTool = state.activeTool;
+        let clearRoom = false;
+        if (mode === "3D") {
+            if (tools2DOnly.has(state.activeTool)) nextTool = "select";
+            // Room mode は 2D 専用なので 3D 切替時に解除。
+            if (state.activeRoomId !== null || state.pendingRoomLevelId !== null) {
+                clearRoom = true;
+            }
+        } else {
+            if (tools3DOnly.has(state.activeTool)) nextTool = "select";
+        }
+        if (nextTool === state.activeTool && !clearRoom) {
+            return { viewMode: mode };
+        }
+        return {
+            viewMode: mode,
+            activeTool: nextTool,
+            ...(clearRoom ? {
+                activeRoomId: null,
+                pendingRoomLevelId: null,
+                roomEditMode: "select" as const,
+            } : {}),
+        };
+    }),
 
     addGrid: (start, end, kind = "Primary") => {
         const id = generateId();
@@ -606,11 +677,21 @@ export const useAppState = create<AppState>((set, get) => ({
     clearSketchSelection: () => set({ sketchSelection: [] }),
     setSelectedConstraintId: (id) => set({ selectedConstraintId: id }),
     setSolverDragHint: (hint) => {
-        set({ solverDragHint: hint });
-        // When the drag hint is cleared (pointer release), re-run the solver
-        // without the pin so constraints like PointOnCircle / Tangent can
-        // finally be enforced (during drag the pinned vertex would conflict).
-        if (hint === null) {
+        // Normalize: null → [], 単点 → [pin], 既に配列ならそのまま。
+        const pins: SolverDragPin[] = hint === null
+            ? []
+            : Array.isArray(hint) ? hint : [hint];
+        set({ solverDragHint: pins });
+        // ドラッグ中 (= pins 非空) は solver を回さない。
+        //  - drag handler は同フレームで polygon outer + entity + wall axis を
+        //    一斉更新しており、ここで async ソルバが間に入ると 2D polygon と
+        //    3D wall axis の sync が壊れる (= フリッカー)。
+        //  - また solver writeback の arc reshape 経路 (SketchSolver.ts 1098+)
+        //    は polygon outer の変化を起点に arc.aStart/aEnd を再計算するため、
+        //    drag 中の中間状態に対して走らせると弧パラメータが破壊され「弧が
+        //    円になる」「直線が消える」という症状を引き起こす。
+        // drag END (= pins 空) で最終確定 solve を一度だけ走らせる。
+        if (pins.length === 0) {
             const mod = require('../constraint/SketchSolver') as typeof import('../constraint/SketchSolver');
             mod.runSketchSolver();
         }

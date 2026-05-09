@@ -105,8 +105,8 @@ export default function RoomEditPanel() {
             setWallReferenceMode(mode);
             const newLocationLine: WallElement["locationLine"] =
                 mode === "Interior" ? "FinishInterior" :
-                mode === "Exterior" ? "FinishExterior" :
-                "Center";
+                    mode === "Exterior" ? "FinishExterior" :
+                        "Center";
 
             const seedPolyIds: string[] = [];
             for (const poly of room.polygons ?? []) {
@@ -119,10 +119,10 @@ export default function RoomEditPanel() {
                     const T = w.thickness;
                     let inner: number, outer: number;
                     switch (mode) {
-                        case "Interior": inner = 0;     outer = T;     break;
-                        case "Exterior": inner = T;     outer = 0;     break;
+                        case "Interior": inner = 0; outer = T; break;
+                        case "Exterior": inner = T; outer = 0; break;
                         case "Center":
-                        default:         inner = T / 2; outer = T / 2; break;
+                        default: inner = T / 2; outer = T / 2; break;
                     }
                     updateElement(wid, {
                         innerThickness: inner,
@@ -176,7 +176,7 @@ export default function RoomEditPanel() {
     // Delete / Backspace handler registered at top level (above the early
     // returns) so the hook order remains stable across renders. The actual
     // behavior is routed through a ref filled in below.
-    const deleteHandlerRef = React.useRef<() => void>(() => {});
+    const deleteHandlerRef = React.useRef<() => void>(() => { });
     React.useEffect(() => {
         if (!activeRoomId) return;
         const onKey = (e: KeyboardEvent) => {
@@ -429,9 +429,8 @@ export default function RoomEditPanel() {
             groupWallId.set(root, cmd.getElementId());
         }
         // eslint-disable-next-line no-console
-        console.log(`[Walls] groups=${groupRepresentative.size} edges=${
-            works.reduce((s, w) => s + w.workingOuter.length, 0)
-        }${skippedOpen.length ? ` (skipped open: ${skippedOpen.join(",")})` : ""}`);
+        console.log(`[Walls] groups=${groupRepresentative.size} edges=${works.reduce((s, w) => s + w.workingOuter.length, 0)
+            }${skippedOpen.length ? ` (skipped open: ${skippedOpen.join(",")})` : ""}`);
 
         // 5) Compose updated polygons. Selected polygons get wallIds from the
         //    group map (so shared edges point at the same wall id).
@@ -533,8 +532,8 @@ export default function RoomEditPanel() {
         }
         // eslint-disable-next-line no-console
         console.log(
-            `[handleDeletePolys] selected=[${[...selectedPolyIds].map(s => s.slice(0,6)).join(",")}] ` +
-            `expanded=[${[...expanded].map(s => s.slice(0,6)).join(",")}]`,
+            `[handleDeletePolys] selected=[${[...selectedPolyIds].map(s => s.slice(0, 6)).join(",")}] ` +
+            `expanded=[${[...expanded].map(s => s.slice(0, 6)).join(",")}]`,
         );
         // Remove walls that ONLY belong to the polygons being deleted.
         const toDelete = new Set<string>();
@@ -576,8 +575,8 @@ export default function RoomEditPanel() {
         }
         // eslint-disable-next-line no-console
         console.log(
-            `[handleDeletePolys] removing entities=[${[...entityIdsToRemove].map(s => s.slice(0,6)).join(",")}] ` +
-            `walls=[${[...toDelete].map(s => s.slice(0,6)).join(",")}]`,
+            `[handleDeletePolys] removing entities=[${[...entityIdsToRemove].map(s => s.slice(0, 6)).join(",")}] ` +
+            `walls=[${[...toDelete].map(s => s.slice(0, 6)).join(",")}]`,
         );
         if (entityIdsToRemove.size > 0) {
             // setSpaceEntities が polygons を自動再導出してくれるので、
@@ -630,7 +629,7 @@ export default function RoomEditPanel() {
             if (!w || w.type !== "Wall") continue;
             return w.locationLine === "FinishInterior" ? "Interior"
                 : w.locationLine === "FinishExterior" ? "Exterior"
-                : "Center";
+                    : "Center";
         }
         return wallReferenceMode;
     })();
@@ -881,10 +880,9 @@ export default function RoomEditPanel() {
     };
 
     const btnClass = (active: boolean) =>
-        `px-3 py-2 rounded text-xs font-medium flex items-center gap-1.5 transition-colors ${
-            active
-                ? "bg-blue-600 text-white shadow-md"
-                : "bg-zinc-700 text-zinc-200 hover:bg-zinc-600"
+        `px-3 py-2 rounded text-xs font-medium flex items-center gap-1.5 transition-colors ${active
+            ? "bg-blue-600 text-white shadow-md"
+            : "bg-zinc-700 text-zinc-200 hover:bg-zinc-600"
         }`;
 
     const disabledBtnClass =
@@ -901,6 +899,7 @@ export default function RoomEditPanel() {
                 <MousePointer2 size={14} />
                 Select
             </button>
+
             <button
                 className={btnClass(roomEditMode === "rectangle")}
                 onClick={() => setRoomEditMode("rectangle")}
@@ -909,22 +908,7 @@ export default function RoomEditPanel() {
                 <RectangleHorizontal size={14} />
                 Rectangle
             </button>
-            <button
-                className={btnClass(roomEditMode === "polyline")}
-                onClick={() => setRoomEditMode("polyline")}
-                title="Draw closed polygon (Enter / double-click / close-click to finalize)"
-            >
-                <Spline size={14} />
-                Polyline
-            </button>
-            <button
-                className={btnClass(roomEditMode === "wallPath")}
-                onClick={() => setRoomEditMode("wallPath")}
-                title="単独壁ポリライン (Enter / 右クリック / ダブルクリックで確定、閉じない)"
-            >
-                <Minus size={14} />
-                Wall Path
-            </button>
+
             <button
                 className={btnClass(roomEditMode === "circle")}
                 onClick={() => setRoomEditMode("circle")}
@@ -933,6 +917,26 @@ export default function RoomEditPanel() {
                 <Circle size={14} />
                 Circle
             </button>
+
+            <button
+                className={btnClass(roomEditMode === "polyline")}
+                onClick={() => setRoomEditMode("polyline")}
+                title="Draw closed polygon (Enter / double-click / close-click to finalize)"
+            >
+                <Spline size={14} />
+                Polyline
+            </button>
+
+            <button
+                className={btnClass(roomEditMode === "wallPath")}
+                onClick={() => setRoomEditMode("wallPath")}
+                title="単独壁ポリライン (Enter / 右クリック / ダブルクリックで確定、閉じない)"
+            >
+                <Minus size={14} />
+                Wall Path
+            </button>
+
+            
             <button
                 className={btnClass(roomEditMode === "line")}
                 onClick={() => setRoomEditMode("line")}
@@ -941,6 +945,7 @@ export default function RoomEditPanel() {
                 <Slash size={14} />
                 Line
             </button>
+            
             <button
                 className={btnClass(roomEditMode === "arc")}
                 onClick={() => setRoomEditMode("arc")}
@@ -949,6 +954,7 @@ export default function RoomEditPanel() {
                 <Spline size={14} />
                 Arc
             </button>
+
             <button
                 className={btnClass(roomEditMode === "trim")}
                 onClick={() => setRoomEditMode("trim")}
@@ -957,6 +963,7 @@ export default function RoomEditPanel() {
                 <Scissors size={14} />
                 Trim
             </button>
+            
             <div className="w-px h-6 bg-zinc-600 mx-1" />
             {/* WallType ピッカー — 部屋から派生して生成される壁の Type を選ぶ。
                 Type を切替えると下の厚さ入力欄も Type デフォルトへ追従する。 */}
@@ -1006,9 +1013,9 @@ export default function RoomEditPanel() {
                     title={
                         selectedEdges.length > 0
                             ? `選択エッジ ${selectedEdges.length} 本のみ基準線を切替 (= per-edge)。`
-                        : activeRoomId
-                            ? "選択中の部屋の全壁を新基準線で再生成 + 既定値も更新 (= bulk)。1本だけ変えたい場合はエッジを選択してから切替"
-                            : "新規作成壁の既定基準線"
+                            : activeRoomId
+                                ? "選択中の部屋の全壁を新基準線で再生成 + 既定値も更新 (= bulk)。1本だけ変えたい場合はエッジを選択してから切替"
+                                : "新規作成壁の既定基準線"
                     }
                 >
                     <option value="Center">壁芯</option>

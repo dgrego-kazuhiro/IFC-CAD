@@ -730,6 +730,48 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
     const prevWallIds = new Set<string>();
     for (const w of works) {
         const wallIds = w.poly.wallIds ?? [];
+        // wallIds は **pre-collapse** の poly.outer に対応するインデックス
+        // (= 前回 regen の breakpoint も含む)。一方 §1 cluster / §7 lookup は
+        // **post-collapse** の workingEdges インデックス (= 0..workingOuter.length-1)
+        // を使う。同じ polyId / 同じ「論理 edge」でも index がずれるので、
+        // ここで pre→post マッピングを作って post-collapse index で
+        // prevWallTypeByEdge を keying する。
+        //
+        // マッピング: pre-edge i (= polygon.outer[i] → outer[(i+1)%n]) の
+        // 中点が、post-collapse working のどの edge ライン上にあるか。
+        // collinear に潰された breakpoint も「親 edge」上にあるので一意に決まる。
+        const preToPostEdge = new Map<number, number>();
+        const preOuter = w.poly.outer;
+        const preN = preOuter.length;
+        const wEdges = w.workingEdges;
+        const wOuter = w.workingOuter;
+        if (preN > 0 && wEdges.length > 0) {
+            const COLLINEAR_TOL = 1e-3; // 1 mm
+            for (let preEi = 0; preEi < preN; preEi++) {
+                const pa = preOuter[preEi];
+                const pb = preOuter[(preEi + 1) % preN];
+                const mid: Vec2 = [(pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2];
+                let bestEi = -1;
+                let bestDist = Infinity;
+                for (let ei = 0; ei < wEdges.length; ei++) {
+                    const [ai, bi] = wEdges[ei];
+                    const wa = wOuter[ai];
+                    const wb = wOuter[bi];
+                    const dx = wb[0] - wa[0], dy = wb[1] - wa[1];
+                    const lenSq = dx * dx + dy * dy;
+                    if (lenSq < 1e-12) continue;
+                    let t = ((mid[0] - wa[0]) * dx + (mid[1] - wa[1]) * dy) / lenSq;
+                    t = Math.max(0, Math.min(1, t));
+                    const px = wa[0] + dx * t;
+                    const py = wa[1] + dy * t;
+                    const d = Math.hypot(mid[0] - px, mid[1] - py);
+                    if (d < bestDist) { bestDist = d; bestEi = ei; }
+                }
+                if (bestEi >= 0 && bestDist < COLLINEAR_TOL) {
+                    preToPostEdge.set(preEi, bestEi);
+                }
+            }
+        }
         for (let edgeIdx = 0; edgeIdx < wallIds.length; edgeIdx++) {
             const wid = wallIds[edgeIdx];
             if (!wid) continue;
@@ -739,21 +781,41 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
                 const t = wallEl.thickness;
                 const innerT = wallEl.innerThickness ?? t / 2;
                 const outerT = wallEl.outerThickness ?? t / 2;
+                // post-collapse edge index に正規化。マッピングが取れない
+                // (= 異常: pre-edge が working line から外れている) 場合は
+                // フォールバックで pre-index を使う (= 旧挙動と同等)。
+                const postEi = preToPostEdge.get(edgeIdx) ?? edgeIdx;
                 if (wallEl.typeId) {
-                    prevWallTypeByEdge.set(prevEdgeKey(w.poly.id, edgeIdx), {
+                    // 同じ post-edge に複数の pre-edge が紐付く場合 (= 共有
+                    // 壁を含む sub-segment が collapse で merge した) は、
+                    // **isShared を優先** して prevInfo を確定する。共有
+                    // でない sub-segment の prevInfo に上書きされて
+                    // しまうと、step 4 detach 後に top wall が shared
+                    // wall の locationLine を継承してしまうバグになる。
+                    const existing = prevWallTypeByEdge.get(prevEdgeKey(w.poly.id, postEi));
+                    const candidate: PrevWallInfo = {
                         typeId: wallEl.typeId,
                         overrides: wallEl.overrides,
                         thickness: t,
                         innerThickness: innerT,
                         outerThickness: outerT,
                         locationLine: wallEl.locationLine,
-                    });
+                    };
+                    // 採用ルール: existing が無ければ採用。あれば、現候補の
+                    // wid が **shared でない** (= 単独所有) ものを優先。
+                    // shared 壁は §6.7 で他部屋から伝搬された情報を持つこと
+                    // があり、collapse 後の post-edge 本来の所有者の方が
+                    // 信頼できる。
+                    if (!existing || !wallEl.isShared) {
+                        prevWallTypeByEdge.set(prevEdgeKey(w.poly.id, postEi), candidate);
+                    }
                 }
                 // per-edge 厚さマップを構築。Type 違いで thickness が違っても、
                 // JunctionGraph は各 ve 自身の inner/outer offset で miter / Clipper
                 // diff を行うので、隣接壁が違う厚さでも接合面が自然に閉じる。
+                // edgeThicknessMap も post-collapse index で keying。
                 edgeThicknessMap.set(
-                    makeEdgeThicknessKey(w.poly.id, edgeIdx),
+                    makeEdgeThicknessKey(w.poly.id, postEi),
                     { inner: innerT, outer: outerT },
                 );
             }
@@ -1537,6 +1599,21 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
             polygons: updatedPolys,
             dirtyFlags: new Set([...space.dirtyFlags, "Geometry", "Mesh", "Render"]),
         } as any);
+        // 診断: 各部屋の polygon 最終状態をダンプ。Room 1 が崩れた症状の
+        // 切り分け用。post-collapse 後の outer / wallIds の長さが一致して
+        // いるか、wallIds に空文字が残っていないかを確認する。
+        for (const p of updatedPolys) {
+            if (p.wallOutlineOf) continue;
+            const wallIdsLen = (p.wallIds ?? []).length;
+            const wpeLen = (p.wallsPerEdge ?? []).length;
+            const filled = (p.wallIds ?? []).filter(Boolean).length;
+            // eslint-disable-next-line no-console
+            console.log(
+                `[wallRegen/§9] poly=${p.id.slice(0, 6)} room=${(rid as string).slice(0, 6)} ` +
+                `outer=${p.outer.length} wallIds=${wallIdsLen}(filled=${filled}) ` +
+                `wallsPerEdge=${wpeLen} thickness=${p.wallThickness}`,
+            );
+        }
     }
 
     // ── 10. Re-add Horizontal / Vertical on modified polys ───────────

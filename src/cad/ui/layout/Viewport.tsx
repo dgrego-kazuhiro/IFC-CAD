@@ -706,12 +706,12 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         };
     }, []);
 
+    // ビュー切替はユーザの 2D/3D トグル (= viewMode) が主。Room mode は
+    // 作図中心なので強制的に 2D へ寄せる (3D で sketch overlay を出すと
+    // 視差で snap が極めて使いにくい)。
+    const viewMode = useAppState((s) => s.viewMode);
     const useOrtho =
-        activeTool === "wall" ||
-        activeTool === "gridline" ||
-        activeTool === "slab" ||
-        activeTool === "beam" ||
-        activeTool === "column" ||
+        viewMode === "2D" ||
         activeRoomId !== null ||
         pendingRoomLevelId !== null;
 

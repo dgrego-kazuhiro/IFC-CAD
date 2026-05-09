@@ -148,7 +148,7 @@ export function loadScene(): boolean {
         selectedGridIds: [],
         sketchSelection: [],
         selectedConstraintId: null,
-        solverDragHint: null,
+        solverDragHint: [],
         activeTool: "select",
     });
     return true;
@@ -174,7 +174,7 @@ export function clearScene(): void {
         selectedGridIds: [],
         sketchSelection: [],
         selectedConstraintId: null,
-        solverDragHint: null,
+        solverDragHint: [],
         activeTool: "select",
     });
 }
