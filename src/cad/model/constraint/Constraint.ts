@@ -27,7 +27,10 @@ export type ConstraintType =
     | "EqualRadius"
     // 弧 (ArcEntity) / 円 (CircleEntity) 自体の半径・直径拘束 (entity 直接参照)
     | "ArcRadius"
-    | "ArcDiameter";
+    | "ArcDiameter"
+    // 2 点間の水平 (X 軸) / 垂直 (Z 軸) 距離
+    | "HorizDistance"
+    | "VertDistance";
 
 // 拘束対象 = ポリゴン外周の頂点 or 辺、もしくは参照系（通芯・柱・円）。
 // 穴 (holes) の頂点・辺は対象外。
@@ -50,7 +53,13 @@ export type ConstraintTarget =
      *  端点 距離などに使う。 */
     | { kind: "GridPoint"; gridId: string; vertexIdx: number }
     /** 原点 (0,0)。固定 fixed point として GCS に push される。 */
-    | { kind: "Origin" };
+    | { kind: "Origin" }
+    /** 柱フットプリントの頂点 (固定参照点)。部屋頂点・壁端点との
+     *  Coincident / Length 拘束などで使う。 */
+    | { kind: "ColumnVertex"; columnId: ElementId; vertexIdx: number }
+    /** 柱フットプリントの辺 (固定参照線)。Parallel / Perpendicular /
+     *  PerpDistance 拘束などで使う。 */
+    | { kind: "ColumnEdge"; columnId: ElementId; edgeIdx: number };
 
 export interface Constraint {
     id: string;

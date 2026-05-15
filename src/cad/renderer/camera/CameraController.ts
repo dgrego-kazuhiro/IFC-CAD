@@ -56,7 +56,13 @@ export class CameraController {
         this.lastMouseY = e.clientY;
 
         if (e.buttons === 1) { // Left click orbit
-            this.orbit(dx * 0.01, dy * 0.01);
+            // 2D モード (= OrthographicCamera) では視点回転を許可しない。
+            // top-down 固定で作図する想定なので、回転すると平面位置が
+            // ズレて作業にならない。pan / zoom は引き続き有効。
+            // 判別は "zoom" プロパティの有無で行う (ortho 固有のプロパティ)。
+            if (!("zoom" in this.camera)) {
+                this.orbit(dx * 0.01, dy * 0.01);
+            }
         } else if (e.buttons === 2 || e.buttons === 4) { // Right or middle click pan
             this.pan(dx, dy);
         }

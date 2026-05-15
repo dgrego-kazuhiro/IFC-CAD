@@ -69,6 +69,16 @@ export interface UnifiedSnapOptions {
     /** Exclude these wall ids from wall endpoint / wall axis snap. Used to
      *  avoid snapping to the wall currently being drawn. */
     excludeWallIds?: Set<string>;
+    /**
+     * 編集中のレベル ID。指定すると Wall axis スナップに次の挙動を追加する:
+     *   - **他レベルの壁** (= wall.baseLevelId !== currentLevelId) を、
+     *     room-linked であっても axis スナップ対象に含める。
+     *     部屋編集中、他階の壁を「参照線」として描画している間に
+     *     その線へスナップしたいユースケース。
+     *   - 同レベルの壁は従来通り (= room-linked なら除外)。Polygon edge
+     *     スナップ (RoomEdge pass) と被るため。
+     */
+    currentLevelId?: string;
 }
 
 function projectOnSegment(
@@ -301,7 +311,19 @@ export function unifiedSnap(
         if (bestEdge) return { point: bestEdge.point, kind: "RoomEdge" };
     }
 
-    // 6. Grid intersection via BVH (O(1)), falls back to snapToGrids below.
+    // 6a. 世界原点 (0,0) — snapBVH 経路と関係なく常に固定参照点として吸着。
+    //     freeZoning モード (= 通芯ゼロ) でも原点に揃えやすくするため。
+    //     `SnapBVH.fromGrids` も Origin を内包しているが、呼び出し側で BVH を
+    //     渡さない経路 (Viewport の unifiedSnap 直呼び等) でもヒットするよう
+    //     明示的にチェックする。kind は既存 GridIntersection を再利用する。
+    if (Math.hypot(cursor[0], cursor[2]) <= tolerance) {
+        return {
+            point: [0, cursor[1], 0],
+            kind: "GridIntersection",
+        };
+    }
+
+    // 6b. Grid intersection via BVH (O(1)), falls back to snapToGrids below.
     if (options.snapBVH) {
         const hit = options.snapBVH.nearestWithin(cursor[0], cursor[2], tolerance);
         if (hit) {
@@ -327,14 +349,31 @@ export function unifiedSnap(
     }
 
     // 8. Standalone wall centerline projection
-    if (enableElementSnaps) {
+    //
+    // **Inclusion logic** (per options):
+    //   - Legacy: enableElementSnaps && !roomLinked
+    //     → 単独壁配置で room-linked walls を除外する従来動作。
+    //   - currentLevelId が指定されたら、wall.baseLevelId !== currentLevelId
+    //     の壁を **room-linked であっても** 含める (= 他階壁を参照線として
+    //     スナップするため)。
+    //   - 上記 2 条件は OR で評価。
+    if (enableElementSnaps || options.currentLevelId !== undefined) {
         let best: { dist: number; point: Vec3; id: string } | null = null;
         for (const id in elements) {
             const el = elements[id];
             if (!el || el.type !== "Wall") continue;
             if (exclude?.has(id)) continue;
-            if (roomLinkedWallIds.has(id)) continue;
             const w = el as WallElement;
+            // 他レベル壁判定 (currentLevelId 指定時のみ意味あり)
+            const isOtherLevel = options.currentLevelId !== undefined
+                && w.baseLevelId !== undefined
+                && w.baseLevelId !== options.currentLevelId;
+            // include 判定:
+            //  legacy: enableElementSnaps && !room-linked
+            //  level:  currentLevelId 指定 && 他レベル
+            const includeLegacy = enableElementSnaps && !roomLinkedWallIds.has(id);
+            const includeLevel = isOtherLevel;
+            if (!includeLegacy && !includeLevel) continue;
             const proj = projectOnSegment(cursor, w.axis[0], w.axis[1]);
             if (proj.dist <= tolerance && (!best || proj.dist < best.dist)) {
                 best = { dist: proj.dist, point: proj.point, id: id as string };

@@ -15,6 +15,7 @@ import { SpaceElement, RoomPolygon, polygonEdges } from "../model/elements/Space
 import { Constraint, ConstraintTarget } from "../model/constraint/Constraint";
 import { GridLine, gridVertices } from "../model/grid/GridLine";
 import { ColumnElement } from "../model/elements/ColumnElement";
+import { columnFootprint2D } from "../mesh/builders/ColumnMeshBuilder";
 import { WallElement } from "../model/elements/WallElement";
 import { Vec2 } from "../geometry/math/Vec2";
 import { Vec3 } from "../geometry/math/Vec3";
@@ -22,6 +23,10 @@ import { computeMiteredCorners, computeMiteredWallAxes, syncWallsToPolygonOuter 
 import { GcsBackend } from "./GcsBackend";
 import { triggerWallRegenIfEnabled } from "../ui/room/wallRegenerate";
 import type { SketchEntity, ArcEntity, PolylineEntity, LineEntity } from "../model/sketch/SketchEntity";
+
+const ROOM_SHAPE_DEBUG = true;
+const fmtPt = (p: Vec2) => `(${p[0].toFixed(3)},${p[1].toFixed(3)})`;
+const fmtRing = (pts: Vec2[]) => `[${pts.map(fmtPt).join(" ")}]`;
 
 /**
  * 弧 / 円エンティティの「途中点」(= 弧をテッセレートして生まれた polygon
@@ -95,6 +100,16 @@ const MAX_SOLVE_ITERATIONS = 5;
  */
 export function runSketchSolver(): void {
     if (solvingDepth > 0) return;
+    // Drag 中、もしくは多段階の polygon/constraint 更新の途中 (= solverDragHint
+    // にダミーピンを入れて抑制している) は走らせない。setSpaceEntities /
+    // updateElement(polygons) 側でも同じチェックをしているが、addConstraint /
+    // removeConstraint は直接ここを呼ぶため、この層で一律に抑制する。
+    const dragHints = useAppState.getState().solverDragHint;
+    if (dragHints.length > 0) {
+        // 抑制中でも次のクリアでまとめて 1 回走らせるために pending を立てる。
+        if (running) pendingResolveRequested = true;
+        return;
+    }
     if (running) {
         pendingResolveRequested = true;
         return;
@@ -102,9 +117,25 @@ export function runSketchSolver(): void {
     running = true;
     void (async () => {
         try {
+            // ─── 初回 solveOnce 直前で drag が始まっていたら走らせない ───
+            // 距離拘束追加直後 (= addConstraint → runSketchSolver) の async solve が
+            // 立ち上がる前にユーザがドラッグ開始するケース。dragHints が set されて
+            // いるなら、この一連の solver イテレーションを完全に skip して mouseup
+            // 側に委ねる。これがないと WASM solver が drag 中ずっと回り続け、
+            // フレームレートが大幅に低下する (= ユーザ報告「距離拘束を付けると
+            // 全体のドラッグが非常に遅くなる」の原因)。
+            if (useAppState.getState().solverDragHint.length > 0) {
+                pendingResolveRequested = true;
+                return;
+            }
             await solveOnce();
             let iter = 1;
             while ((pendingResolveRequested || arcRederiveRequested) && iter < MAX_SOLVE_ITERATIONS) {
+                // 各イテレーション前に dragHints を再チェック。drag が始まったら
+                // ループ脱出し、solver を停止させる。drag フレームごとの updateElement
+                // が pending を立て続ける限り、このループは無限に WASM solver を
+                // 起動して drag を妨害してしまう。
+                if (useAppState.getState().solverDragHint.length > 0) break;
                 pendingResolveRequested = false;
                 arcRederiveRequested = false;
                 await solveOnce();
@@ -204,7 +235,8 @@ async function solveOnce(): Promise<void> {
     // 何れかを参照する拘束があるかをチェック。
     const hasNonRoomTarget = constraints.some((c) =>
         c.targets.some((t) =>
-            t.kind === "Column" || t.kind === "Grid"
+            t.kind === "Column" || t.kind === "ColumnVertex" || t.kind === "ColumnEdge"
+            || t.kind === "Grid"
             || t.kind === "GridPoint" || t.kind === "Origin"));
     if (
         polys.size === 0 && circles.size === 0 && walls.size === 0
@@ -266,27 +298,7 @@ async function solveOnce(): Promise<void> {
         const primitives: any[] = [];
 
         // ── Push polygons as N points + N lines (no implicit constraints) ──
-        // 各ピン (= dragHints[i]) について「ピンを fixed=true にすると拘束と
-        // 矛盾するか」を判定。conflict なら fixed では無く initial guess (=
-        // 始点だけカーソル位置) として使い、solver にカーブ上に snap させる。
-        // FreeCAD の `dragVertexHasCurveConstraint` と同じ目的。
-        const conflictKinds = new Set([
-            "PointOnCircle", "PointOnGrid",
-            "PerpDistance", "Length", "CircleRadius", "CircleDiameter",
-            "ArcRadius", "ArcDiameter",
-        ]);
-        const pinHasCurveConstraint = (pin: typeof dragHints[number]): boolean => {
-            for (const c of constraints) {
-                if (!conflictKinds.has(c.type)) continue;
-                for (const t of c.targets) {
-                    if (t.kind === "SketchPoint"
-                        && t.spaceId === pin.spaceId
-                        && t.polyId === pin.polyId
-                        && t.vertexIdx === pin.vertexIdx) return true;
-                }
-            }
-            return false;
-        };
+        // ドラッグピンは hard pin (fixed: true) で表現する (parametric-cad と同じ)。
         // (spaceId, polyId, vertexIdx) → pin の高速 lookup。複数ピンを多用
         // するので毎回線形検索しない。
         const pinByVertex = new Map<string, typeof dragHints[number]>();
@@ -346,47 +358,20 @@ async function solveOnce(): Promise<void> {
                 // でパラメトリックに表現され、setSpaceEntities 経由で再テッセレ
                 // ートされるのが本来の真実)。
                 //
-                // Drag pin は **fixed:true で hard-pin しない**。FreeCAD `initMove`
-                // と同様、cursor 用 fixed point + temporary P2PCoincident のペアで
-                // 表現する (= soft pin)。理由: ユーザ拘束 (Length / H / V / Distance
-                // など) と矛盾する位置にカーソルが動いた場合、hard-pin だと他頂点が
-                // 拘束を満たそうと暴走する。soft pin なら solver が least-squares で
-                // 「カーソル追従と既存拘束のバランス点」を求めるため形状が壊れない。
+                // Drag pin は hard pin (= fixed: true)。parametric-cad と同じ。
+                // 曲線上拘束 (PointOnCircle / PointOnGrid 等) を持つ頂点で
+                // カーソルが拘束を破ると solver が status != 0 で失敗 → writeback
+                // しない (= polygon は前フレームのまま) ので暴走はしない。
                 const isArcInterior = isArcInteriorVertex(entry.poly, i, spEntities);
                 const pin = pinByVertex.get(pinKey(entry.spaceId, entry.poly.id, i));
-                const pinHasCurve = pin ? pinHasCurveConstraint(pin) : false;
-                const isDragPin = pin != null && !pinHasCurve;
+                const isDragPin = pin != null;
                 primitives.push({
                     type: "point",
                     id: String(pid),
-                    // 初期座標も pin 位置にしておくと solver が pin 周辺から探索を
-                    // 始めるので収束が早い (= FreeCAD の MoveParameters 同様)。
                     x: pin ? pin.x : outer[i][0],
                     y: pin ? pin.y : outer[i][1],
-                    fixed: isArcInterior, // arc interior のみ hard-pin
+                    fixed: isArcInterior || isDragPin,
                 });
-                if (isDragPin && pin) {
-                    // FreeCAD `MoveParameters` 風: cursor 位置に fixed point を置き、
-                    // ポリゴン頂点との P2PCoincident (temporary) で「カーソルに追従
-                    // すべし」を表現する。temporary フラグは driving 拘束として
-                    // 通常拘束と等価扱いだが、scale や clean-up 用のタグとして
-                    // planegcs で扱われる。
-                    const cursorOID = idAlloc.next();
-                    primitives.push({
-                        type: "point",
-                        id: String(cursorOID),
-                        x: pin.x,
-                        y: pin.y,
-                        fixed: true,
-                    });
-                    primitives.push({
-                        type: "p2p_coincident",
-                        id: String(idAlloc.next()),
-                        p1_id: String(pid),
-                        p2_id: String(cursorOID),
-                        temporary: true,
-                    });
-                }
             }
             const lIds: OID[] = [];
             const polyEdgeList = polygonEdges(entry.poly);
@@ -509,21 +494,70 @@ async function solveOnce(): Promise<void> {
         // GridPoint / Origin は **fixed** (= 動かない参照点)。
         // pointIdFor 経由で Length 等の点拘束に使う。
         const columnPointIds = new Map<string, OID>();
+        const columnVertexPointIds = new Map<string, OID>();
         const gridPointIds = new Map<string, OID>();
         let originPointId: OID | null = null;
         for (const c of constraints) {
             for (const t of c.targets) {
+                if (t.kind === "ColumnVertex") {
+                    const col = state.elements[t.columnId as string] as ColumnElement | undefined;
+                    if (!col || !col.basePoint) continue;
+                    // Push vertex as fixed reference point (deduplicated)
+                    const key = `${t.columnId}:${t.vertexIdx}`;
+                    if (!columnVertexPointIds.has(key)) {
+                        const fp = columnFootprint2D(col);
+                        if (t.vertexIdx >= 0 && t.vertexIdx < fp.length) {
+                            const v = fp[t.vertexIdx];
+                            const pid = idAlloc.next();
+                            primitives.push({ type: "point", id: String(pid), x: v[0], y: v[1], fixed: true });
+                            columnVertexPointIds.set(key, pid);
+                        }
+                    }
+                    // Push column center as free point — grid constraints remap to center with offset
+                    if (!columnPointIds.has(t.columnId as string)) {
+                        const cpid = idAlloc.next();
+                        const isBeingDragged = state.draggingColumnId === (t.columnId as string);
+                        primitives.push({
+                            type: "point",
+                            id: String(cpid),
+                            x: col.basePoint[0],
+                            y: col.basePoint[2],
+                            fixed: isBeingDragged,
+                        });
+                        columnPointIds.set(t.columnId as string, cpid);
+                    }
+                    continue;
+                }
+                if (t.kind === "ColumnEdge") {
+                    // Push column center as free point — collinear/parallel constraints remap to center
+                    const col = state.elements[t.columnId as string] as ColumnElement | undefined;
+                    if (!col || !col.basePoint) continue;
+                    if (!columnPointIds.has(t.columnId as string)) {
+                        const cpid = idAlloc.next();
+                        const isBeingDragged = state.draggingColumnId === (t.columnId as string);
+                        primitives.push({
+                            type: "point",
+                            id: String(cpid),
+                            x: col.basePoint[0],
+                            y: col.basePoint[2],
+                            fixed: isBeingDragged,
+                        });
+                        columnPointIds.set(t.columnId as string, cpid);
+                    }
+                    continue;
+                }
                 if (t.kind === "Column") {
                     if (columnPointIds.has(t.columnId as string)) continue;
                     const col = state.elements[t.columnId as string] as ColumnElement | undefined;
                     if (!col || !col.basePoint) continue;
                     const pid = idAlloc.next();
+                    const isBeingDragged = state.draggingColumnId === (t.columnId as string);
                     primitives.push({
                         type: "point",
                         id: String(pid),
                         x: col.basePoint[0],
                         y: col.basePoint[2],
-                        fixed: false,
+                        fixed: isBeingDragged,
                     });
                     columnPointIds.set(t.columnId as string, pid);
                 } else if (t.kind === "GridPoint") {
@@ -544,6 +578,12 @@ async function solveOnce(): Promise<void> {
                     }
                 }
             }
+        }
+
+        // ドラッグ中の柱が拘束に含まれない場合、柱-柱の拘束系に固定アンカーが無く
+        // 不定系になる → 他の拘束柱が漂流する。ドラッグ柱が拘束に無ければ skip。
+        if (state.draggingColumnId != null && !columnPointIds.has(state.draggingColumnId)) {
+            return;
         }
 
         // ── Translate and push user constraints ──
@@ -576,7 +616,7 @@ async function solveOnce(): Promise<void> {
             if (isLegacyOutlineLink(c)) continue;
             const gcsPrimitives = translateConstraint(
                 c, polyIds, circleIds, wallIds, idAlloc, state.grids, state.elements as any,
-                arcEntityIds, columnPointIds, gridPointIds, originPointId,
+                arcEntityIds, columnPointIds, gridPointIds, originPointId, columnVertexPointIds,
             );
             for (const p of gcsPrimitives) primitives.push(p);
         }
@@ -619,8 +659,6 @@ async function solveOnce(): Promise<void> {
 
         wrapper.apply_solution();
 
-        // eslint-disable-next-line no-console
-        console.log(`[SketchSolver] solve status=${status} constraints=${constraints.length} polys=${polys.size}`);
 
         // ── Read back polygon outer vertices + circle shapes ──
         solvingDepth++;
@@ -718,6 +756,16 @@ async function solveOnce(): Promise<void> {
                             : "直近で追加した拘束が過剰 / 矛盾している可能性があります。"),
                     );
                     continue;
+                }
+                if (ROOM_SHAPE_DEBUG) {
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `[room-debug] solver dirty space=${entry.spaceId.slice(0, 6)} poly=${entry.poly.id.slice(0, 6)} `
+                        + `old=${entry.poly.outer.length}v${fmtRing(entry.poly.outer)} `
+                        + `solved=${solved.length}v${fmtRing(solved)} `
+                        + `oldAABB=${oldAabb.w.toFixed(3)}x${oldAabb.h.toFixed(3)} `
+                        + `newAABB=${newAabb.w.toFixed(3)}x${newAabb.h.toFixed(3)}`,
+                    );
                 }
                 dirty(entry.spaceId, entry.poly.id, { outer: solved });
             }
@@ -925,39 +973,17 @@ async function solveOnce(): Promise<void> {
                 });
             }
 
-            // ── 弧を含む polygon 用の解書き戻しパス ────────────────────────
-            // 弧 / 円エンティティが含まれる polygon は、ソルバ解 (= polygon.outer
+            // ── 全 polygon 用の解書き戻しパス (entity 経由) ────────────────
+            // 設計原則: entity が真値、polygon は派生物。ソルバ解 (= polygon.outer
             // の各頂点位置) を **エンティティ側** に伝播 → 続く setSpaceEntities
-            // で polygon を再派生する。これにより:
-            //   - 弧 interior 頂点は entity.center / radius / aStart / aEnd から
-            //     クリーンに再テッセレートされ、ソルバが残しがちなドリフトが消える
-            //     (= 「弧が分割されたまま位置だけずれる」現象を防ぐ)
-            //   - chord 端点 (= polyline / line と弧の接続点) は polyline.points /
-            //     line.p0/p1 と弧 entity の chord をともに更新するので chain 検出が
-            //     必ず再接続する
-            // 含まない polygon は従来どおりの直接書き戻し。
-            const arcAffectedSpaces = new Set<string>();
+            // で polygon を再派生する。フロー:
+            //   ソルバ解 → entity 更新 → derive → JunctionSplit → wallRegen
+            // 旧来は弧含む space だけ entity 経路、それ以外は polygon 直接書き戻し
+            // にしていたが、後者が「entity と polygon が乖離する」唯一の経路だった
+            // ため、全 space を entity 経路に統一する。
             for (const [spaceId, bucket] of perSpaceUpdates) {
                 const latest = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
                 if (!latest) continue;
-                const ents = latest.entities ?? [];
-                for (const polyId of bucket.keys()) {
-                    const poly = latest.polygons.find((p) => p.id === polyId);
-                    if (!poly?.edgeOwners) continue;
-                    if (poly.edgeOwners.some((o) => {
-                        const e = ents.find((x) => x.id === o);
-                        return e && e.kind === "arc";
-                    })) {
-                        arcAffectedSpaces.add(spaceId);
-                        break;
-                    }
-                }
-            }
-
-            for (const spaceId of arcAffectedSpaces) {
-                const bucket = perSpaceUpdates.get(spaceId);
-                const latest = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
-                if (!bucket || !latest) continue;
 
                 type EntityPatch =
                     | { kind: "polyline"; points: Vec2[] }
@@ -1201,54 +1227,39 @@ async function solveOnce(): Promise<void> {
                 }
             }
 
-            // Apply batched updates — re-read space each time so we see prior
-            // updates from this same batch. Each polygon that owns walls gets
-            // its wall axes re-synced from the post-solve outer ring, so the
-            // solver moving the inner ring (e.g. via PointOnGrid snapping)
-            // cannot strand walls at stale offsets. Works for any vertex count.
-            //
-            // NOTE: 全壁生成 (regenerateAllWalls) はソルバ実行中にも非同期で
-            // ポリゴンの outer を分割 (頂点を増やす) ことがある。ソルバの解は
-            // 解開始時点の頂点数前提なので、長さが変わった polygon については
-            // 解のみを書き戻すと wallIds 等と長さがズレて壊れる。安全側で
-            // 長さ不一致のときは patch を捨て、最新ポリゴンをそのまま残す。
-            for (const [spaceId, bucket] of perSpaceUpdates) {
-                // 弧含み space は上で setSpaceEntities 経由で再派生済み。
-                if (arcAffectedSpaces.has(spaceId)) continue;
+            // ── Outline polygon の再派生 ───────────────────────────────
+            // entity を経由した setSpaceEntities ではアウトライン (= wallOutlineOf 付き)
+            // は derive 対象外なので、内側 polygon が動いた space については
+            // ここでアウトライン outer を再計算する。
+            for (const [spaceId] of perSpaceUpdates) {
                 const latest = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
                 if (!latest) continue;
-                let newPolys = latest.polygons.map((p) => {
-                    const patch = bucket.get(p.id);
-                    if (!patch) return p;
-                    if (patch.outer && patch.outer.length !== p.outer.length) {
-                        // eslint-disable-next-line no-console
-                        console.warn(
-                            `[SketchSolver] outer length mismatch on poly ${p.id.slice(0, 6)} ` +
-                            `(solved=${patch.outer.length}, current=${p.outer.length}); skipping writeback`,
-                        );
-                        return p;
-                    }
-                    return { ...p, ...patch };
-                });
-                // Re-derive outline polygons from their (now-updated) inner
-                // so the outer outline tracks solver-driven inner motion.
-                newPolys = newPolys.map((p) => {
+                let touched = false;
+                const newPolys = (latest.polygons ?? []).map((p) => {
                     if (!p.wallOutlineOf) return p;
-                    const inner = newPolys.find((q) => q.id === p.wallOutlineOf);
+                    const inner = (latest.polygons ?? []).find((q) => q.id === p.wallOutlineOf);
                     if (!inner || inner.wallThickness == null || inner.outer.length < 3) return p;
                     let cx = 0, cy = 0;
                     for (const v of inner.outer) { cx += v[0]; cy += v[1]; }
                     cx /= inner.outer.length; cy /= inner.outer.length;
                     const derived = computeMiteredCorners(inner.outer, [cx, cy], inner.wallThickness);
+                    touched = true;
                     return { ...p, outer: derived };
                 });
-                useAppState.getState().updateElement(spaceId, {
-                    polygons: newPolys,
-                    dirtyFlags: new Set([...latest.dirtyFlags, "Geometry", "Mesh", "Render"]),
-                } as any);
+                if (touched) {
+                    useAppState.getState().updateElement(spaceId, {
+                        polygons: newPolys,
+                        dirtyFlags: new Set([...latest.dirtyFlags, "Geometry", "Mesh", "Render"]),
+                    } as any);
+                }
+            }
 
+            // ── 壁 axis 同期 (= 再派生後の polygon outer に追従させる) ─────
+            for (const [spaceId, bucket] of perSpaceUpdates) {
+                const post = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+                if (!post) continue;
                 for (const polyId of bucket.keys()) {
-                    const updated = newPolys.find((p) => p.id === polyId);
+                    const updated = (post.polygons ?? []).find((p) => p.id === polyId);
                     if (!updated || !updated.wallIds || updated.wallThickness == null) continue;
                     syncWallsToPolygonOuter(
                         updated.outer,
@@ -1257,7 +1268,6 @@ async function solveOnce(): Promise<void> {
                         (wallId, axis) => {
                             const w = useAppState.getState().elements[wallId] as WallElement | undefined;
                             if (!w || w.type !== "Wall") return;
-                            // Preserve Y component from the existing axis.
                             const next: [Vec3, Vec3] = [
                                 [axis[0][0], w.axis[0][1], axis[0][2]],
                                 [axis[1][0], w.axis[1][1], axis[1][2]],
@@ -1281,17 +1291,14 @@ async function solveOnce(): Promise<void> {
             // (拘束は通常 m オーダーで距離指定するので暴走しにくい想定)。
             let anyColumnMoved = false;
             for (const [columnId, pid] of columnPointIds) {
+                // ドラッグ中の柱は pointer move で位置を管理 — solver writeback は
+                // スキップしないと solver の古いスナップショット値でドラッグが上書きされる。
+                if (state.draggingColumnId === columnId) continue;
                 const latest = useAppState.getState().elements[columnId] as ColumnElement | undefined;
                 if (!latest || latest.type !== "Column") continue;
                 const prim = wrapper.sketch_index.get_primitive_or_fail(String(pid)) as any;
                 const newX = prim.x as number;
                 const newZ = prim.y as number;
-                // eslint-disable-next-line no-console
-                console.log(
-                    `[SketchSolver/columnWriteback] col=${columnId.slice(0,6)} ` +
-                    `old=(${latest.basePoint[0].toFixed(3)},${latest.basePoint[2].toFixed(3)}) ` +
-                    `new=(${Number.isFinite(newX) ? newX.toFixed(3) : newX},${Number.isFinite(newZ) ? newZ.toFixed(3) : newZ})`,
-                );
                 if (!Number.isFinite(newX) || !Number.isFinite(newZ)) continue;
                 const drift = Math.abs(newX - latest.basePoint[0]) + Math.abs(newZ - latest.basePoint[2]);
                 if (drift < 1e-6) continue;
@@ -1359,6 +1366,7 @@ function translateConstraint(
     columnPointIds?: Map<string, OID>,
     gridPointIds?: Map<string, OID>,
     originPointId?: OID | null,
+    columnVertexPointIds?: Map<string, OID>,
 ): any[] {
     const out: any[] = [];
 
@@ -1408,6 +1416,9 @@ function translateConstraint(
         }
         if (t.kind === "Column") {
             return columnPointIds?.get(t.columnId as string) ?? null;
+        }
+        if (t.kind === "ColumnVertex") {
+            return columnVertexPointIds?.get(`${t.columnId}:${t.vertexIdx}`) ?? null;
         }
         if (t.kind === "GridPoint") {
             return gridPointIds?.get(`${t.gridId}:${t.vertexIdx}`) ?? null;
@@ -1461,6 +1472,22 @@ function translateConstraint(
             out.push({ type: "line",  id: String(lineId), p1_id: String(aId), p2_id: String(bId) });
             return { line: lineId, p1: aId, p2: bId };
         }
+        if (t.kind === "ColumnEdge") {
+            const col = elements[t.columnId as string] as ColumnElement | undefined;
+            if (!col || !col.basePoint) return null;
+            const fp = columnFootprint2D(col);
+            const n = fp.length;
+            if (n < 2 || t.edgeIdx < 0 || t.edgeIdx >= n) return null;
+            const a = fp[t.edgeIdx];
+            const b = fp[(t.edgeIdx + 1) % n];
+            const aId = idAlloc.next();
+            const bId = idAlloc.next();
+            const lineId = idAlloc.next();
+            out.push({ type: "point", id: String(aId), x: a[0], y: a[1], fixed: true });
+            out.push({ type: "point", id: String(bId), x: b[0], y: b[1], fixed: true });
+            out.push({ type: "line",  id: String(lineId), p1_id: String(aId), p2_id: String(bId) });
+            return { line: lineId, p1: aId, p2: bId };
+        }
         return null;
     };
     const circleIdFor = (t: ConstraintTarget): CircleIds | null => {
@@ -1468,10 +1495,6 @@ function translateConstraint(
         return circleIds.get(`${t.spaceId}:${t.polyId}`) ?? null;
     };
 
-    // eslint-disable-next-line no-console
-    console.log("[translateConstraint]", c.type,
-        "targets=", c.targets.map((t) => t.kind),
-        "value=", c.value);
     switch (c.type) {
         case "Horizontal": {
             const edge = c.targets[0];
@@ -1489,9 +1512,11 @@ function translateConstraint(
         }
         case "Length": {
             if (c.value === undefined) return out;
-            // パターン1: targets[0] が edge → 既存の長さ拘束。
+            // パターン1: 単一 edge の長さ拘束 (SketchEdge / WallAxis / ColumnEdge)。
+            // targets.length === 1 の時だけ適用。Grid や Column が混在する
+            // 多目的 Length (パターン3/4) はここで break させない。
             const edge = c.targets[0];
-            const eIds = edgeIdsFor(edge);
+            const eIds = c.targets.length === 1 ? edgeIdsFor(edge) : null;
             if (eIds) {
                 out.push({
                     type: "p2p_distance",
@@ -1505,16 +1530,34 @@ function translateConstraint(
             // パターン3: 通芯 + 点 → 通芯線への垂直距離 (= PerpDistance 相当)。
             // 軸平行通芯は coordinate_x / coordinate_y で点座標を直接固定し、
             // 斜め通芯は p2l_distance フォールバック。
+            // ColumnVertex の場合は column center へリマップし、オフセット分を調整する。
             const gridTargets = c.targets.filter((t) => t.kind === "Grid");
             const pointKindsSet = new Set([
-                "SketchPoint", "WallAxisPoint", "Column", "GridPoint", "Origin",
+                "SketchPoint", "WallAxisPoint", "Column", "ColumnVertex", "GridPoint", "Origin",
             ]);
             const pointTargets = c.targets.filter((t) => pointKindsSet.has(t.kind));
             if (gridTargets.length === 1 && pointTargets.length === 1) {
                 const ln = gridTargets[0];
                 const pt = pointTargets[0];
-                const pid = pointIdFor(pt);
-                if (pid == null) break;
+                // ColumnVertex → column center にリマップし、頂点オフセットを計算
+                let pid3: number | null;
+                let vOffX = 0, vOffZ = 0;
+                if (pt.kind === "ColumnVertex") {
+                    const col3 = elements[(pt as any).columnId as string] as ColumnElement | undefined;
+                    if (!col3 || !col3.basePoint) break;
+                    pid3 = columnPointIds?.get((pt as any).columnId as string) ?? null;
+                    if (pid3 != null) {
+                        const fp3 = columnFootprint2D(col3);
+                        const vi3 = (pt as any).vertexIdx as number;
+                        if (vi3 >= 0 && vi3 < fp3.length) {
+                            vOffX = fp3[vi3][0] - col3.basePoint[0];
+                            vOffZ = fp3[vi3][1] - col3.basePoint[2];
+                        }
+                    }
+                } else {
+                    pid3 = pointIdFor(pt);
+                }
+                if (pid3 == null) break;
                 if (ln.kind !== "Grid") break;
                 const grid = grids.find((g) => g.id === ln.gridId);
                 const verts = grid ? gridVertices(grid.curve) : [];
@@ -1550,6 +1593,13 @@ function translateConstraint(
                         if (!col || !col.basePoint) return null;
                         return [col.basePoint[0], col.basePoint[2]];
                     }
+                    if (target.kind === "ColumnVertex") {
+                        const col = elements[target.columnId as string] as ColumnElement | undefined;
+                        if (!col || !col.basePoint) return null;
+                        const fp = columnFootprint2D(col);
+                        if (target.vertexIdx < 0 || target.vertexIdx >= fp.length) return null;
+                        return [fp[target.vertexIdx][0], fp[target.vertexIdx][1]];
+                    }
                     if (target.kind === "GridPoint") {
                         const g = grids.find((gg) => gg.id === target.gridId);
                         if (!g) return null;
@@ -1567,8 +1617,8 @@ function translateConstraint(
                     out.push({
                         type: "coordinate_x",
                         id: String(idAlloc.next()),
-                        p_id: String(pid),
-                        x: G + sign * c.value,
+                        p_id: String(pid3),
+                        x: G + sign * c.value - vOffX,
                     });
                     break;
                 }
@@ -1578,8 +1628,8 @@ function translateConstraint(
                     out.push({
                         type: "coordinate_y",
                         id: String(idAlloc.next()),
-                        p_id: String(pid),
-                        y: G + sign * c.value,
+                        p_id: String(pid3),
+                        y: G + sign * c.value - vOffZ,
                     });
                     break;
                 }
@@ -1594,13 +1644,14 @@ function translateConstraint(
                 const ga = idAlloc.next();
                 const gb = idAlloc.next();
                 const gl = idAlloc.next();
-                out.push({ type: "point", id: String(ga), x: aa[0], y: aa[2], fixed: true });
-                out.push({ type: "point", id: String(gb), x: bb[0], y: bb[2], fixed: true });
+                // ColumnVertex の場合は通芯線をオフセット分シフト
+                out.push({ type: "point", id: String(ga), x: aa[0] - vOffX, y: aa[2] - vOffZ, fixed: true });
+                out.push({ type: "point", id: String(gb), x: bb[0] - vOffX, y: bb[2] - vOffZ, fixed: true });
                 out.push({ type: "line",  id: String(gl), p1_id: String(ga), p2_id: String(gb) });
                 out.push({
                     type: "p2l_distance",
                     id: String(idAlloc.next()),
-                    p_id: String(pid),
+                    p_id: String(pid3),
                     l_id: String(gl),
                     distance: c.value,
                 });
@@ -1697,6 +1748,40 @@ function translateConstraint(
             // Two edges share the same infinite line. Expressed as: both
             // endpoints of edge B lie on edge A's line.
             if (c.targets.length < 2) return out;
+
+            // Special case: Grid + ColumnEdge — remap to column center constrained
+            // to grid lines shifted by -vertex_offset (so vertex lands on original grid).
+            const gridTgtC = c.targets.find((t) => t.kind === "Grid");
+            const colEdgeTgt = c.targets.find((t) => t.kind === "ColumnEdge");
+            if (gridTgtC && colEdgeTgt && gridTgtC.kind === "Grid" && colEdgeTgt.kind === "ColumnEdge") {
+                const col = elements[colEdgeTgt.columnId as string] as ColumnElement | undefined;
+                if (!col || !col.basePoint) return out;
+                const centerId = columnPointIds?.get(colEdgeTgt.columnId as string);
+                if (centerId == null) return out;
+                const fp = columnFootprint2D(col);
+                const n = fp.length;
+                if (n < 2 || colEdgeTgt.edgeIdx < 0 || colEdgeTgt.edgeIdx >= n) return out;
+                const grid = grids.find((g) => g.id === gridTgtC.gridId);
+                const gverts = grid ? gridVertices(grid.curve) : [];
+                if (gverts.length < 2) return out;
+                const ga = gverts[0], gb = gverts[gverts.length - 1];
+                // Push point_on_line_pl for each of the two edge endpoint offsets.
+                // The grid line is shifted by -offset so that column center on the
+                // shifted line is equivalent to the edge endpoint on the original line.
+                for (const vi of [colEdgeTgt.edgeIdx, (colEdgeTgt.edgeIdx + 1) % n]) {
+                    const ox = fp[vi][0] - col.basePoint[0];
+                    const oz = fp[vi][1] - col.basePoint[2];
+                    const pa = idAlloc.next();
+                    const pb = idAlloc.next();
+                    const pl = idAlloc.next();
+                    out.push({ type: "point", id: String(pa), x: ga[0] - ox, y: ga[2] - oz, fixed: true });
+                    out.push({ type: "point", id: String(pb), x: gb[0] - ox, y: gb[2] - oz, fixed: true });
+                    out.push({ type: "line",  id: String(pl), p1_id: String(pa), p2_id: String(pb) });
+                    out.push({ type: "point_on_line_pl", id: String(idAlloc.next()), p_id: String(centerId), l_id: String(pl) });
+                }
+                break;
+            }
+
             const a = edgeIdsFor(c.targets[0]);
             const b = edgeIdsFor(c.targets[1]);
             if (!a || !b) return out;
@@ -1716,13 +1801,15 @@ function translateConstraint(
         }
         case "PerpDistance": {
             // Perpendicular distance from a point to a line (= edge / wall axis /
-            // 通芯線)。点側は SketchPoint / WallAxisPoint / Column / GridPoint /
-            // Origin、線側は SketchEdge / WallAxis / Grid を受け付ける。
+            // 通芯線 / 柱辺)。点側は SketchPoint / WallAxisPoint / Column / ColumnVertex /
+            // GridPoint / Origin、線側は SketchEdge / WallAxis / Grid / ColumnEdge を受け付ける。
+            // ColumnVertex の場合は column center (free point) へリマップし、
+            // 距離値をオフセット分だけ調整する。
             if (c.targets.length < 2 || c.value === undefined) return out;
             const pointKinds = new Set([
-                "SketchPoint", "WallAxisPoint", "Column", "GridPoint", "Origin",
+                "SketchPoint", "WallAxisPoint", "Column", "ColumnVertex", "GridPoint", "Origin",
             ]);
-            const lineKinds = new Set(["SketchEdge", "WallAxis", "Grid"]);
+            const lineKinds = new Set(["SketchEdge", "WallAxis", "Grid", "ColumnEdge"]);
             const pt = c.targets.find((t) => pointKinds.has(t.kind));
             const ln = c.targets.find((t) => lineKinds.has(t.kind));
             // 点側の現ワールド座標 (xz 平面) — 線の向き決定に使う。
@@ -1750,6 +1837,13 @@ function translateConstraint(
                     if (!col || !col.basePoint) return null;
                     return [col.basePoint[0], col.basePoint[2]];
                 }
+                if (target.kind === "ColumnVertex") {
+                    const col = elements[target.columnId as string] as ColumnElement | undefined;
+                    if (!col || !col.basePoint) return null;
+                    const fp = columnFootprint2D(col);
+                    if (target.vertexIdx < 0 || target.vertexIdx >= fp.length) return null;
+                    return [fp[target.vertexIdx][0], fp[target.vertexIdx][1]];
+                }
                 if (target.kind === "GridPoint") {
                     const g = grids.find((gg) => gg.id === target.gridId);
                     if (!g) return null;
@@ -1760,32 +1854,37 @@ function translateConstraint(
                 if (target.kind === "Origin") return [0, 0];
                 return null;
             };
-            // eslint-disable-next-line no-console
-            console.log("[SketchSolver/PerpDistance]",
-                "targets=", c.targets.map((t) => t.kind),
-                "pt=", pt?.kind, "ln=", ln?.kind, "value=", c.value);
             if (!pt || !ln) return out;
-            const pid = pointIdFor(pt);
-            // eslint-disable-next-line no-console
-            console.log("  pid=", pid,
-                "columnPointIds.size=", columnPointIds?.size ?? "undef",
-                "ln.kind=", ln.kind);
+            // ColumnVertex → column center にリマップし、頂点オフセットを計算
+            let pid: number | null;
+            let vertexOffsetX = 0, vertexOffsetZ = 0;
+            if (pt.kind === "ColumnVertex") {
+                const col = elements[(pt as any).columnId as string] as ColumnElement | undefined;
+                if (!col || !col.basePoint) return out;
+                pid = columnPointIds?.get((pt as any).columnId as string) ?? null;
+                if (pid != null) {
+                    const fp = columnFootprint2D(col);
+                    const vi = (pt as any).vertexIdx as number;
+                    if (vi >= 0 && vi < fp.length) {
+                        vertexOffsetX = fp[vi][0] - col.basePoint[0];
+                        vertexOffsetZ = fp[vi][1] - col.basePoint[2];
+                    }
+                }
+            } else {
+                pid = pointIdFor(pt);
+            }
             if (pid == null) return out;
             // 線 ID の解決:
-            //   SketchEdge / WallAxis → 既存 edgeIdsFor (.line) を使う
-            //   Grid                → grid.start/end を fixed point として push
-            //                          + line を即席で作る
+            //   SketchEdge / WallAxis / ColumnEdge → 既存 edgeIdsFor (.line) を使う
+            //   Grid                               → grid.start/end を fixed point として push
+            //                                        + line を即席で作る
             let lineId: number | null = null;
-            if (ln.kind === "SketchEdge" || ln.kind === "WallAxis") {
+            if (ln.kind === "SketchEdge" || ln.kind === "WallAxis" || ln.kind === "ColumnEdge") {
                 const eids = edgeIdsFor(ln);
                 lineId = eids?.line ?? null;
             } else if (ln.kind === "Grid") {
                 const grid = grids.find((g) => g.id === ln.gridId);
                 const verts = grid ? gridVertices(grid.curve) : [];
-                // eslint-disable-next-line no-console
-                console.log("  Grid lookup gridId=", ln.gridId,
-                    "grid=", grid ? grid.curve.type : "null",
-                    "verts.length=", verts.length);
                 if (verts.length >= 2) {
                     const a = verts[0];
                     const b = verts[verts.length - 1];
@@ -1804,6 +1903,7 @@ function translateConstraint(
                     // を避けるため、coordinate_x / coordinate_y で点座標を直接
                     // 固定する。値の符号は点の現在側に合わせて決める (= 線越しに
                     // 反転しないので矩形が潰れない)。
+                    // ColumnVertex の場合は vertexOffset でシフト済みの座標を使う。
                     if (isVertical && pw) {
                         // 縦の通芯: 点の x を G ± D に固定
                         const G = a[0];
@@ -1812,11 +1912,8 @@ function translateConstraint(
                             type: "coordinate_x",
                             id: String(idAlloc.next()),
                             p_id: String(pid),
-                            x: G + sign * c.value,
+                            x: G + sign * c.value - vertexOffsetX,
                         });
-                        // eslint-disable-next-line no-console
-                        console.log("  → coordinate_x p_id=", pid,
-                            "x=", G + sign * c.value, "side=", sign);
                         break;
                     }
                     if (isHorizontal && pw) {
@@ -1827,17 +1924,12 @@ function translateConstraint(
                             type: "coordinate_y",
                             id: String(idAlloc.next()),
                             p_id: String(pid),
-                            y: G + sign * c.value,
+                            y: G + sign * c.value - vertexOffsetZ,
                         });
-                        // eslint-disable-next-line no-console
-                        console.log("  → coordinate_y p_id=", pid,
-                            "y=", G + sign * c.value, "side=", sign);
                         break;
                     }
-                    // 斜めの通芯: p2l_distance フォールバック (= 符号無し距離)。
-                    // 点の現在側に応じて線端点 a↔b の向きを反転し、
-                    // p2l_distance が符号付きで実装されている場合に矩形が
-                    // 反対側へ反転して潰れるのを防ぐ。
+                    // 斜め通芯: p2l_distance フォールバック (= 符号無し距離)。
+                    // ColumnVertex の場合は通芯線をオフセット分シフトして使う。
                     let aa = a, bb = b;
                     if (pw) {
                         const dx = pw[0] - a[0], dz = pw[1] - a[2];
@@ -1848,14 +1940,13 @@ function translateConstraint(
                     const ga = idAlloc.next();
                     const gb = idAlloc.next();
                     const gl = idAlloc.next();
-                    out.push({ type: "point", id: String(ga), x: aa[0], y: aa[2], fixed: true });
-                    out.push({ type: "point", id: String(gb), x: bb[0], y: bb[2], fixed: true });
+                    // ColumnVertex の場合は通芯線をオフセット分シフト
+                    out.push({ type: "point", id: String(ga), x: aa[0] - vertexOffsetX, y: aa[2] - vertexOffsetZ, fixed: true });
+                    out.push({ type: "point", id: String(gb), x: bb[0] - vertexOffsetX, y: bb[2] - vertexOffsetZ, fixed: true });
                     out.push({ type: "line",  id: String(gl), p1_id: String(ga), p2_id: String(gb) });
                     lineId = gl;
                 }
             }
-            // eslint-disable-next-line no-console
-            console.log("  lineId=", lineId);
             if (lineId == null) return out;
             out.push({
                 type: "p2l_distance",
@@ -1896,13 +1987,36 @@ function translateConstraint(
             break;
         }
         case "PointOnGrid": {
-            const pt = c.targets.find((t) => t.kind === "SketchPoint");
+            // SketchPoint に加え Column / ColumnVertex / WallAxisPoint / GridPoint / Origin も受け付ける。
+            // ColumnVertex の場合は column center へリマップし、通芯をオフセット分シフトする。
+            const pointKindsForOnGrid = new Set(["SketchPoint", "Column", "ColumnVertex", "WallAxisPoint", "GridPoint", "Origin"]);
+            const pt = c.targets.find((t) => pointKindsForOnGrid.has(t.kind));
             const gridTgt = c.targets.find((t) => t.kind === "Grid");
-            if (!pt || pt.kind !== "SketchPoint" || !gridTgt || gridTgt.kind !== "Grid") return out;
-            const pid = pointIdFor(pt);
-            if (pid == null) return out;
+            if (!pt || !gridTgt || gridTgt.kind !== "Grid") return out;
             const grid = grids.find((g) => g.id === gridTgt.gridId);
             if (!grid || grid.curve.type !== "Line") return out;
+
+            if (pt.kind === "ColumnVertex") {
+                const col = elements[(pt as any).columnId as string] as ColumnElement | undefined;
+                if (!col || !col.basePoint) return out;
+                const centerId = columnPointIds?.get((pt as any).columnId as string);
+                if (centerId == null) return out;
+                const fp = columnFootprint2D(col);
+                const vi = (pt as any).vertexIdx as number;
+                if (vi < 0 || vi >= fp.length) return out;
+                const ox = fp[vi][0] - col.basePoint[0];
+                const oz = fp[vi][1] - col.basePoint[2];
+                // Shift grid by -offset: center on shifted line ≡ vertex on original
+                const ga = idAlloc.next(), gb = idAlloc.next(), gl = idAlloc.next();
+                out.push({ type: "point", id: String(ga), x: grid.curve.start[0] - ox, y: grid.curve.start[2] - oz, fixed: true });
+                out.push({ type: "point", id: String(gb), x: grid.curve.end[0] - ox,   y: grid.curve.end[2] - oz,   fixed: true });
+                out.push({ type: "line",  id: String(gl), p1_id: String(ga), p2_id: String(gb) });
+                out.push({ type: "point_on_line_pl", id: String(idAlloc.next()), p_id: String(centerId), l_id: String(gl) });
+                break;
+            }
+
+            const pid = pointIdFor(pt);
+            if (pid == null) return out;
             // Push the grid as two fixed points + a line, then point_on_line
             const ga = idAlloc.next();
             const gb = idAlloc.next();
@@ -1977,6 +2091,74 @@ function translateConstraint(
                 id: String(idAlloc.next()),
                 c_id: String(ids.circle),
                 diameter: c.value,
+            });
+            break;
+        }
+        case "HorizDistance": {
+            // 2 点間の水平 (world X / planegcs x) 距離。
+            // c.value は符号付き: targets[0].x - targets[1].x の符号を作成時に固定。
+            // ColumnVertex の場合は column center へリマップし、頂点 X オフセット分を調整する。
+            if (c.value == null || c.targets.length < 2) return out;
+            const resolveHorizPoint = (t: ConstraintTarget): { id: OID; offsetX: number } | null => {
+                if (t.kind === "ColumnVertex") {
+                    const col = elements[(t as any).columnId as string] as ColumnElement | undefined;
+                    if (!col || !col.basePoint) return null;
+                    const cid = columnPointIds?.get((t as any).columnId as string);
+                    if (cid == null) return null;
+                    const fp = columnFootprint2D(col);
+                    const vi = (t as any).vertexIdx as number;
+                    const ox = (vi >= 0 && vi < fp.length) ? fp[vi][0] - col.basePoint[0] : 0;
+                    return { id: cid, offsetX: ox };
+                }
+                const id = pointIdFor(t);
+                return id != null ? { id, offsetX: 0 } : null;
+            };
+            const rA = resolveHorizPoint(c.targets[0]);
+            const rB = resolveHorizPoint(c.targets[1]);
+            if (!rA || !rB) return out;
+            // (centerA.x + offsetA.x) - (centerB.x + offsetB.x) = c.value
+            // → centerA.x - centerB.x = c.value - offsetA.x + offsetB.x
+            const adjustedValue = c.value - rA.offsetX + rB.offsetX;
+            const [first, second] = (adjustedValue >= 0) ? [rA.id, rB.id] : [rB.id, rA.id];
+            out.push({
+                type: "difference",
+                id: String(idAlloc.next()),
+                param1: { o_id: String(first), prop: "x" },
+                param2: { o_id: String(second), prop: "x" },
+                difference: Math.abs(adjustedValue),
+            });
+            break;
+        }
+        case "VertDistance": {
+            // 2 点間の垂直 (world Z / planegcs y) 距離。
+            // c.value は符号付き: targets[0].z - targets[1].z の符号を作成時に固定。
+            // ColumnVertex の場合は column center へリマップし、頂点 Z オフセット分を調整する。
+            if (c.value == null || c.targets.length < 2) return out;
+            const resolveVertPoint = (t: ConstraintTarget): { id: OID; offsetZ: number } | null => {
+                if (t.kind === "ColumnVertex") {
+                    const col = elements[(t as any).columnId as string] as ColumnElement | undefined;
+                    if (!col || !col.basePoint) return null;
+                    const cid = columnPointIds?.get((t as any).columnId as string);
+                    if (cid == null) return null;
+                    const fp = columnFootprint2D(col);
+                    const vi = (t as any).vertexIdx as number;
+                    const oz = (vi >= 0 && vi < fp.length) ? fp[vi][1] - col.basePoint[2] : 0;
+                    return { id: cid, offsetZ: oz };
+                }
+                const id = pointIdFor(t);
+                return id != null ? { id, offsetZ: 0 } : null;
+            };
+            const rA = resolveVertPoint(c.targets[0]);
+            const rB = resolveVertPoint(c.targets[1]);
+            if (!rA || !rB) return out;
+            const adjustedValue = c.value - rA.offsetZ + rB.offsetZ;
+            const [first, second] = (adjustedValue >= 0) ? [rA.id, rB.id] : [rB.id, rA.id];
+            out.push({
+                type: "difference",
+                id: String(idAlloc.next()),
+                param1: { o_id: String(first), prop: "y" },
+                param2: { o_id: String(second), prop: "y" },
+                difference: Math.abs(adjustedValue),
             });
             break;
         }

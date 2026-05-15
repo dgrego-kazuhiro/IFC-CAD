@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(NODE_OPTIONS=\"--max-old-space-size=4096\" npx next build)"
+      "Bash(NODE_OPTIONS=\"--max-old-space-size=4096\" npx next build)",
+      "Bash(awk -F: '$2 > 6300 && $2 < 6350 {print}')"
     ]
   }
 }

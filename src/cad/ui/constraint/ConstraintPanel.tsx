@@ -75,6 +75,8 @@ function itemLabel(item: SketchSelectionItem, labelMap: Map<string, string>): st
     else if (item.kind === "entityEdge") k = `ee:${item.entityId}:${item.edgeIdx ?? 0}`;
     else if (item.kind === "entity") k = `en:${item.entityId}`;
     else if (item.kind === "column") k = `col:${item.columnId}`;
+    else if (item.kind === "columnVertex") return `柱頂点 ${item.vertexIdx + 1}`;
+    else if (item.kind === "columnEdge") return `柱辺 ${item.edgeIdx + 1}`;
     else if (item.kind === "gridPoint") k = `gp:${item.gridId}:${item.vertexIdx}`;
     else if (item.kind === "gridLine") k = `gl:${item.gridId}`;
     else k = `o`;
@@ -98,7 +100,7 @@ export default function ConstraintPanel() {
     const [radiusValue, setRadiusValue] = useState<string>("");
     const [diameterValue, setDiameterValue] = useState<string>("");
     const [perpDistValue, setPerpDistValue] = useState<string>("");
-    const [arcRadiusValue, setArcRadiusValue] = useState("1.0");
+    const [arcRadiusValue, setArcRadiusValue] = useState("1000");
     const [arcDiameterValue, setArcDiameterValue] = useState("");
 
     const room = activeRoomId ? (elements[activeRoomId as string] as SpaceElement | undefined) : undefined;
@@ -116,6 +118,17 @@ export default function ConstraintPanel() {
         (s): s is Extract<SketchSelectionItem, { kind: "entity" }> => s.kind === "entity",
     );
 
+    // 柱頂点・辺の選択。edgeLikeSel / pointLikeSel より先に宣言が必要。
+    const columnSel = selection.filter(
+        (s): s is Extract<SketchSelectionItem, { kind: "column" }> => s.kind === "column",
+    );
+    const columnVertexSel = selection.filter(
+        (s): s is Extract<SketchSelectionItem, { kind: "columnVertex" }> => s.kind === "columnVertex",
+    );
+    const columnEdgeSel = selection.filter(
+        (s): s is Extract<SketchSelectionItem, { kind: "columnEdge" }> => s.kind === "columnEdge",
+    );
+
     // Unified "edge-like" selection view so edge-type constraints (Horizontal,
     // Length, Parallel, etc.) accept both room polygon edges and standalone
     // wall axes in the same action. Position-preserving union: edges first,
@@ -125,7 +138,7 @@ export default function ConstraintPanel() {
     const gridLineSel = selection.filter(
         (s): s is Extract<SketchSelectionItem, { kind: "gridLine" }> => s.kind === "gridLine",
     );
-    const edgeLikeSel: SketchSelectionItem[] = [...edgeSel, ...wallAxisSel, ...gridLineSel];
+    const edgeLikeSel: SketchSelectionItem[] = [...edgeSel, ...wallAxisSel, ...gridLineSel, ...columnEdgeSel];
     const toEdgeTarget = (s: SketchSelectionItem): ConstraintTarget | null => {
         if (s.kind === "edge") {
             return { kind: "SketchEdge", spaceId: s.spaceId, polyId: s.polyId, edgeIdx: s.edgeIdx };
@@ -136,15 +149,14 @@ export default function ConstraintPanel() {
         if (s.kind === "gridLine") {
             return { kind: "Grid", gridId: s.gridId };
         }
+        if (s.kind === "columnEdge") {
+            return { kind: "ColumnEdge", columnId: s.columnId, edgeIdx: s.edgeIdx };
+        }
         return null;
     };
 
     // Unified "point-like" view — polygon vertices + wall axis endpoints +
-    // 部屋外の点参照 (column / gridPoint / origin)。Length / Coincident 等の
-    // 拘束で 2 点を結ぶ時、部屋を介さずに distance 拘束をかけられる。
-    const columnSel = selection.filter(
-        (s): s is Extract<SketchSelectionItem, { kind: "column" }> => s.kind === "column",
-    );
+    // 部屋外の点参照 (column / columnVertex / gridPoint / origin)。
     const gridPointSel = selection.filter(
         (s): s is Extract<SketchSelectionItem, { kind: "gridPoint" }> => s.kind === "gridPoint",
     );
@@ -152,7 +164,7 @@ export default function ConstraintPanel() {
         (s): s is Extract<SketchSelectionItem, { kind: "origin" }> => s.kind === "origin",
     );
     const pointLikeSel: SketchSelectionItem[] = [
-        ...pointSel, ...wallPointSel, ...columnSel, ...gridPointSel, ...originSel,
+        ...pointSel, ...wallPointSel, ...columnSel, ...columnVertexSel, ...gridPointSel, ...originSel,
     ];
     const toPointTarget = (s: SketchSelectionItem): ConstraintTarget | null => {
         if (s.kind === "point") {
@@ -163,6 +175,9 @@ export default function ConstraintPanel() {
         }
         if (s.kind === "column") {
             return { kind: "Column", columnId: s.columnId };
+        }
+        if (s.kind === "columnVertex") {
+            return { kind: "ColumnVertex", columnId: s.columnId, vertexIdx: s.vertexIdx };
         }
         if (s.kind === "gridPoint") {
             return { kind: "GridPoint", gridId: s.gridId, vertexIdx: s.vertexIdx };
@@ -180,6 +195,64 @@ export default function ConstraintPanel() {
         id: generateConstraintId(), type, targets, value,
     });
 
+    // 選択アイテムのワールド X / Z を返す (HorizDistance / VertDistance の符号判定用)。
+    const getSelWorldX = (s: SketchSelectionItem): number => {
+        if (s.kind === "column") {
+            const col = elements[s.columnId as string] as any;
+            return col?.basePoint?.[0] ?? 0;
+        }
+        if (s.kind === "columnVertex") {
+            const col = elements[s.columnId as string] as any;
+            if (!col?.basePoint) return 0;
+            const { columnFootprint2D } = require("../../mesh/builders/ColumnMeshBuilder");
+            const fp = columnFootprint2D(col);
+            return fp[s.vertexIdx]?.[0] ?? 0;
+        }
+        if (s.kind === "point") {
+            const sp = elements[s.spaceId as string] as any;
+            const poly = (sp?.polygons ?? []).find((p: any) => p.id === s.polyId);
+            return poly?.outer?.[s.vertexIdx]?.[0] ?? 0;
+        }
+        if (s.kind === "wallPoint") {
+            const w = elements[s.wallId as string] as any;
+            return w?.axis?.[s.endIdx]?.[0] ?? 0;
+        }
+        if (s.kind === "gridPoint") {
+            const g = grids.find((gg) => gg.id === s.gridId);
+            const { gridVertices } = require("../../model/grid/GridLine");
+            return gridVertices(g?.curve)?.[s.vertexIdx]?.[0] ?? 0;
+        }
+        return 0;
+    };
+    const getSelWorldZ = (s: SketchSelectionItem): number => {
+        if (s.kind === "column") {
+            const col = elements[s.columnId as string] as any;
+            return col?.basePoint?.[2] ?? 0;
+        }
+        if (s.kind === "columnVertex") {
+            const col = elements[s.columnId as string] as any;
+            if (!col?.basePoint) return 0;
+            const { columnFootprint2D } = require("../../mesh/builders/ColumnMeshBuilder");
+            const fp = columnFootprint2D(col);
+            return fp[s.vertexIdx]?.[1] ?? 0;
+        }
+        if (s.kind === "point") {
+            const sp = elements[s.spaceId as string] as any;
+            const poly = (sp?.polygons ?? []).find((p: any) => p.id === s.polyId);
+            return poly?.outer?.[s.vertexIdx]?.[1] ?? 0;
+        }
+        if (s.kind === "wallPoint") {
+            const w = elements[s.wallId as string] as any;
+            return w?.axis?.[s.endIdx]?.[2] ?? 0;
+        }
+        if (s.kind === "gridPoint") {
+            const g = grids.find((gg) => gg.id === s.gridId);
+            const { gridVertices } = require("../../model/grid/GridLine");
+            return gridVertices(g?.curve)?.[s.vertexIdx]?.[2] ?? 0;
+        }
+        return 0;
+    };
+
     // ── Constraint actions ──
     const addHorizontal = () => {
         for (const s of edgeLikeSel) {
@@ -193,9 +266,16 @@ export default function ConstraintPanel() {
             if (t) add(mkC("Vertical", [t]));
         }
     };
+    // 拘束値の入力単位は mm (= 画面上の寸法表示と統一)。内部 (solver / element)
+    // は m なので、parseFloat した値を 1/1000 して保存する。
+    const parseLengthMm = (raw: string): number | null => {
+        const mm = parseFloat(raw);
+        if (!Number.isFinite(mm) || mm <= 0) return null;
+        return mm / 1000;
+    };
     const addLength = () => {
-        const v = parseFloat(lengthValue);
-        if (!Number.isFinite(v) || v <= 0) return;
+        const v = parseLengthMm(lengthValue);
+        if (v == null) return;
         for (const s of edgeLikeSel) {
             const t = toEdgeTarget(s);
             if (t) add(mkC("Length", [t], v));
@@ -203,18 +283,45 @@ export default function ConstraintPanel() {
     };
     /** 2 点間の距離拘束 (= 部屋外でも使える Column / GridPoint / Origin 含む)。 */
     const addP2PLength = () => {
-        const v = parseFloat(lengthValue);
-        if (!Number.isFinite(v) || v <= 0) return;
+        const v = parseLengthMm(lengthValue);
+        if (v == null) return;
         if (pointLikeSel.length < 2) return;
         const t0 = toPointTarget(pointLikeSel[0]);
         const t1 = toPointTarget(pointLikeSel[1]);
         if (!t0 || !t1) return;
         add(mkC("Length", [t0, t1], v));
     };
+    /** 2 点間の水平距離 (X 軸方向)。value の符号 = targets[0].x - targets[1].x の向き。 */
+    const addHorizDistance = () => {
+        const v = parseLengthMm(lengthValue);
+        if (v == null) return;
+        if (pointLikeSel.length < 2) return;
+        const t0 = toPointTarget(pointLikeSel[0]);
+        const t1 = toPointTarget(pointLikeSel[1]);
+        if (!t0 || !t1) return;
+        // 符号を作成時に固定 → ソルバが毎回向きを判定しなくて済む = ドラッグ中の反転なし。
+        const x0 = getSelWorldX(pointLikeSel[0]);
+        const x1 = getSelWorldX(pointLikeSel[1]);
+        const signedV = x0 >= x1 ? v : -v;
+        add(mkC("HorizDistance", [t0, t1], signedV));
+    };
+    /** 2 点間の垂直距離 (Z 軸方向)。value の符号 = targets[0].z - targets[1].z の向き。 */
+    const addVertDistance = () => {
+        const v = parseLengthMm(lengthValue);
+        if (v == null) return;
+        if (pointLikeSel.length < 2) return;
+        const t0 = toPointTarget(pointLikeSel[0]);
+        const t1 = toPointTarget(pointLikeSel[1]);
+        if (!t0 || !t1) return;
+        const z0 = getSelWorldZ(pointLikeSel[0]);
+        const z1 = getSelWorldZ(pointLikeSel[1]);
+        const signedV = z0 >= z1 ? v : -v;
+        add(mkC("VertDistance", [t0, t1], signedV));
+    };
     /** 通芯 + 点 の Length 拘束 (= 通芯線への垂直距離、軸平行通芯では X/Y 直接固定)。 */
     const addGridPointLength = () => {
-        const v = parseFloat(lengthValue);
-        if (!Number.isFinite(v) || v <= 0) return;
+        const v = parseLengthMm(lengthValue);
+        if (v == null) return;
         if (gridLineSel.length !== 1 || pointLikeSel.length !== 1) return;
         const tg = toEdgeTarget(gridLineSel[0]);
         const tp = toPointTarget(pointLikeSel[0]);
@@ -223,31 +330,38 @@ export default function ConstraintPanel() {
     };
     /** 通芯 + 通芯 の Length 拘束 (= 平行通芯間の距離)。 */
     const addGridGridLength = () => {
-        const v = parseFloat(lengthValue);
-        if (!Number.isFinite(v) || v <= 0) return;
+        const v = parseLengthMm(lengthValue);
+        if (v == null) return;
         if (gridLineSel.length < 2) return;
         const t0 = toEdgeTarget(gridLineSel[0]);
         const t1 = toEdgeTarget(gridLineSel[1]);
         if (!t0 || !t1) return;
         add(mkC("Length", [t0, t1], v));
     };
+    // N 辺以上の Parallel / Perpendicular / Collinear は **連鎖** で表現する。
+    // 例: Parallel(e0,e1,e2,e3) → (e0,e1), (e0,e2), (e0,e3) の 3 本に分解。
+    // これで全辺が共通基準 e0 と平行 = 互いに平行になり、ソルバが理解できる
+    // 2-target 拘束だけで構成できる。
     const addParallel = () => {
         if (edgeLikeSel.length < 2) return;
-        const t0 = toEdgeTarget(edgeLikeSel[0]);
-        const t1 = toEdgeTarget(edgeLikeSel[1]);
-        if (!t0 || !t1) return;
-        add(mkC("Parallel", [t0, t1]));
+        const targets = edgeLikeSel.map(toEdgeTarget).filter((t): t is NonNullable<typeof t> => !!t);
+        if (targets.length < 2) return;
+        for (let i = 1; i < targets.length; i++) {
+            add(mkC("Parallel", [targets[0], targets[i]]));
+        }
     };
     const addPerpendicular = () => {
-        if (edgeLikeSel.length < 2) return;
+        // Perpendicular は意味的に「2 辺が直交」なので 2 本のみ対応。
+        if (edgeLikeSel.length !== 2) return;
         const t0 = toEdgeTarget(edgeLikeSel[0]);
         const t1 = toEdgeTarget(edgeLikeSel[1]);
         if (!t0 || !t1) return;
         add(mkC("Perpendicular", [t0, t1]));
     };
     const addPerpDistance = () => {
-        const v = parseFloat(perpDistValue);
-        if (!Number.isFinite(v) || v < 0) return;
+        const mm = parseFloat(perpDistValue);
+        if (!Number.isFinite(mm) || mm < 0) return;
+        const v = mm / 1000;
         // ── Case A: 1点 + 1線 → 1 本の PerpDistance ───────────────────
         if (pointLikeSel.length === 1 && edgeLikeSel.length === 1) {
             const et = toEdgeTarget(edgeLikeSel[0]);
@@ -343,14 +457,12 @@ export default function ConstraintPanel() {
     };
     const addCollinear = () => {
         if (edgeLikeSel.length < 2) return;
-        const a = edgeLikeSel[0], b = edgeLikeSel[1];
+        const a = edgeLikeSel[0];
         const tA = toEdgeTarget(a);
-        const tB = toEdgeTarget(b);
-        if (!tA || !tB) return;
+        if (!tA) return;
 
-        // Pre-alignment: project B's endpoints onto A's infinite line. Only
-        // applies to polygon-edge B — wall-axis B endpoints are moved by the
-        // solver instead.
+        // 基準辺 A の無限直線情報。後続の辺の頂点を A の直線上に射影してから
+        // Collinear を追加することで、solver の初期残差を小さくして暴れを防ぐ。
         const polyAInfo: { aStart: Vec2; aEnd: Vec2 } | null = (() => {
             if (a.kind === "edge") {
                 const space = elements[a.spaceId as string] as SpaceElement | undefined;
@@ -369,32 +481,41 @@ export default function ConstraintPanel() {
             }
             return null;
         })();
-        if (polyAInfo && b.kind === "edge") {
-            const spaceB = elements[b.spaceId as string] as SpaceElement | undefined;
-            const polyB = spaceB?.polygons?.find((p) => p.id === b.polyId);
-            if (polyB && polyB.shape?.type !== "circle") {
-                const nB = polyB.outer.length;
-                const dxa = polyAInfo.aEnd[0] - polyAInfo.aStart[0];
-                const dya = polyAInfo.aEnd[1] - polyAInfo.aStart[1];
-                const lenA = Math.hypot(dxa, dya);
-                if (lenA > 1e-9) {
-                    const ux = dxa / lenA, uy = dya / lenA;
-                    const project = (p: Vec2): Vec2 => {
-                        const t = (p[0] - polyAInfo.aStart[0]) * ux + (p[1] - polyAInfo.aStart[1]) * uy;
-                        return [polyAInfo.aStart[0] + ux * t, polyAInfo.aStart[1] + uy * t];
-                    };
+        const projectOntoA = polyAInfo && (() => {
+            const dxa = polyAInfo.aEnd[0] - polyAInfo.aStart[0];
+            const dya = polyAInfo.aEnd[1] - polyAInfo.aStart[1];
+            const lenA = Math.hypot(dxa, dya);
+            if (lenA < 1e-9) return null;
+            const ux = dxa / lenA, uy = dya / lenA;
+            return (p: Vec2): Vec2 => {
+                const t = (p[0] - polyAInfo.aStart[0]) * ux + (p[1] - polyAInfo.aStart[1]) * uy;
+                return [polyAInfo.aStart[0] + ux * t, polyAInfo.aStart[1] + uy * t];
+            };
+        })();
+
+        // 全 ≥ 2 辺について、A と (e1), A と (e2), ... の連鎖で Collinear を追加。
+        // 連鎖により transitively 全辺が同一直線上 (= 互いに collinear) になる。
+        for (let i = 1; i < edgeLikeSel.length; i++) {
+            const b = edgeLikeSel[i];
+            const tB = toEdgeTarget(b);
+            if (!tB) continue;
+            // Pre-alignment: project B's endpoints onto A's infinite line.
+            if (projectOntoA && b.kind === "edge") {
+                const spaceB = elements[b.spaceId as string] as SpaceElement | undefined;
+                const polyB = spaceB?.polygons?.find((p) => p.id === b.polyId);
+                if (polyB && polyB.shape?.type !== "circle") {
+                    const nB = polyB.outer.length;
                     const bStartIdx = b.edgeIdx;
                     const bEndIdx = (b.edgeIdx + 1) % nB;
-                    const newOuter = polyB.outer.map((p, i) => {
-                        if (i === bStartIdx || i === bEndIdx) return project(p);
+                    const newOuter = polyB.outer.map((p, idx) => {
+                        if (idx === bStartIdx || idx === bEndIdx) return projectOntoA(p);
                         return p;
                     });
                     patchPoly(b.spaceId as string, b.polyId, { outer: newOuter });
                 }
             }
+            add(mkC("Collinear", [tA, tB]));
         }
-
-        add(mkC("Collinear", [tA, tB]));
     };
     const addAngle = () => {
         if (edgeLikeSel.length < 2) return;
@@ -539,16 +660,16 @@ export default function ConstraintPanel() {
         }
     };
     const addCircleRadius = () => {
-        const v = parseFloat(radiusValue);
-        if (!Number.isFinite(v) || v <= 0) return;
+        const v = parseLengthMm(radiusValue);
+        if (v == null) return;
         for (const c of circleSel) {
             dropExistingRadiusForCircle(c.spaceId as string, c.polyId);
             add(mkC("CircleRadius", [{ kind: "SketchCircle", spaceId: c.spaceId, polyId: c.polyId }], v));
         }
     };
     const addCircleDiameter = () => {
-        const v = parseFloat(diameterValue);
-        if (!Number.isFinite(v) || v <= 0) return;
+        const v = parseLengthMm(diameterValue);
+        if (v == null) return;
         for (const c of circleSel) {
             dropExistingRadiusForCircle(c.spaceId as string, c.polyId);
             add(mkC("CircleDiameter", [{ kind: "SketchCircle", spaceId: c.spaceId, polyId: c.polyId }], v));
@@ -756,6 +877,8 @@ export default function ConstraintPanel() {
         const wallPointKeys = new Set(wallPointSel.map((s) => `${s.wallId}:${s.endIdx}`));
         const entityKeys = new Set<string>(arcEntitySel.map((a) => `${a.spaceId}:${a.entityId}`));
         const columnKeys = new Set(columnSel.map((s) => s.columnId as string));
+        const columnVertexKeys = new Set(columnVertexSel.map((s) => `${s.columnId}:${s.vertexIdx}`));
+        const columnEdgeKeys = new Set(columnEdgeSel.map((s) => `${s.columnId}:${s.edgeIdx}`));
         const gridPointKeys = new Set(gridPointSel.map((s) => `${s.gridId}:${s.vertexIdx}`));
         const gridLineKeys = new Set(gridLineSel.map((s) => s.gridId));
         const hasOriginSel = originSel.length > 0;
@@ -783,6 +906,12 @@ export default function ConstraintPanel() {
                 if (t.kind === "Column" && columnKeys.has(t.columnId as string)) {
                     if (!seen.has(c.id)) { seen.add(c.id); out.push(c); }
                 }
+                if (t.kind === "ColumnVertex" && columnVertexKeys.has(`${t.columnId}:${t.vertexIdx}`)) {
+                    if (!seen.has(c.id)) { seen.add(c.id); out.push(c); }
+                }
+                if (t.kind === "ColumnEdge" && columnEdgeKeys.has(`${t.columnId}:${t.edgeIdx}`)) {
+                    if (!seen.has(c.id)) { seen.add(c.id); out.push(c); }
+                }
                 if (t.kind === "GridPoint" && gridPointKeys.has(`${t.gridId}:${t.vertexIdx}`)) {
                     if (!seen.has(c.id)) { seen.add(c.id); out.push(c); }
                 }
@@ -803,8 +932,8 @@ export default function ConstraintPanel() {
     // 値を変更したとき重複登録されないよう、対象 entity に対する既存の
     // ArcRadius / ArcDiameter は事前に削除する (= 値の上書きとして振る舞う)。
     const addArcRadius = () => {
-        const v = parseFloat(arcRadiusValue);
-        if (!Number.isFinite(v) || v <= 0) return;
+        const v = parseLengthMm(arcRadiusValue);
+        if (v == null) return;
         for (const a of arcEntitySel) {
             // 既存の同 entity に対する半径系拘束を全部 drop。
             for (const cid in constraints) {
@@ -818,8 +947,8 @@ export default function ConstraintPanel() {
         }
     };
     const addArcDiameter = () => {
-        const v = parseFloat(arcDiameterValue);
-        if (!Number.isFinite(v) || v <= 0) return;
+        const v = parseLengthMm(arcDiameterValue);
+        if (v == null) return;
         for (const a of arcEntitySel) {
             for (const cid in constraints) {
                 const c = constraints[cid];
@@ -845,10 +974,13 @@ export default function ConstraintPanel() {
     // 2 点間の距離拘束 (= edge と独立)。点が 2 個 (= 部屋頂点 / 壁端点 /
     // 柱中心 / 通芯端点 / 原点 の任意組み合わせ) で edge / circle が無い時。
     const canP2PLength = nPoints === 2 && nEdges === 0 && nCircles === 0;
+    // Parallel / Collinear は連鎖で N>=2 対応 (addParallel / addCollinear で
+    // (e0,e1),(e0,e2),... の pairwise 拘束に分解)。Perpendicular は意味的に
+    // 2 辺限定 (直交ペア)。
     const canParallel = onlyEdges && nEdges >= 2;
-    const canPerpendicular = onlyEdges && nEdges >= 2;
+    const canPerpendicular = onlyEdges && nEdges === 2;
     const canAngle = onlyEdges && nEdges === 2;
-    const canCollinear = onlyEdges && nEdges === 2;
+    const canCollinear = onlyEdges && nEdges >= 2;
     const canEqualLength = onlyEdges && nEdges >= 2;
     // PerpDistance は 2 系統:
     //   (A) 1点 + 1線 → 1 本
@@ -863,20 +995,23 @@ export default function ConstraintPanel() {
         (nPoints === 0 && nCircles === 0 && polyEdgeCount === 1 && refEdgeCount === 1)
     );
     // 通芯 + 点 の Length 拘束 (= 通芯線への距離)。
-    // 1 通芯 + 1 点 (= 部屋頂点 / 壁端点 / 柱 / 通芯端点 / 原点) で他の edge / circle が無い時。
+    // 1 通芯 + 1 点 (= 部屋頂点 / 壁端点 / 柱 / 通芯端点 / 原点) で polygon edge / wall axis が無い時。
+    // nEdges は gridLineSel も含むため、ここでは edgeSel / wallAxisSel で個別判定する。
     const canGridPointLength = (
         gridLineSel.length === 1
         && pointLikeSel.length === 1
-        && nEdges === 0   // polygon edge / wall axis を含まない
+        && edgeSel.length === 0 && wallAxisSel.length === 0 && columnEdgeSel.length === 0
         && nCircles === 0
     );
     // 通芯 + 通芯 の Length 拘束 (= 通芯間の距離)。
     const canGridGridLength = (
         gridLineSel.length === 2
         && pointLikeSel.length === 0
-        && nEdges === 0   // polygon edge / wall axis を含まない
+        && edgeSel.length === 0 && wallAxisSel.length === 0 && columnEdgeSel.length === 0
         && nCircles === 0
     );
+    // 2 点間の水平 / 垂直距離拘束 (柱-柱が主用途、任意の点ペアに使用可)。
+    const canHorizVertDistance = nPoints === 2 && nEdges === 0 && nCircles === 0;
     const canCoincident = onlyPoints && nPoints >= 2;
     const canPointOnGrid = onlyPoints && nPoints >= 1 && grids.length > 0;
     const canCircleRadius = onlyCircles && nCircles >= 1;
@@ -891,7 +1026,7 @@ export default function ConstraintPanel() {
     const canArcDiameter = arcEntitySel.length >= 1;
 
     const anyApplicable =
-        canHV || canLength || canP2PLength || canParallel || canPerpendicular || canAngle || canCollinear || canEqualLength || canCoincident || canPointOnGrid ||
+        canHV || canLength || canP2PLength || canHorizVertDistance || canParallel || canPerpendicular || canAngle || canCollinear || canEqualLength || canCoincident || canPointOnGrid ||
         canPerpDistance ||
         canGridPointLength || canGridGridLength ||
         canCircleRadius || canCircleDiameter || canConcentric || canEqualRadius || canTangent || canPointOnCircle ||
@@ -974,8 +1109,8 @@ export default function ConstraintPanel() {
                             <input
                                 className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
                                 type="number"
-                                step="0.1"
-                                placeholder="長さ m"
+                                step="10"
+                                placeholder="長さ mm"
                                 value={lengthValue}
                                 onChange={(e) => setLengthValue(e.target.value)}
                             />
@@ -991,8 +1126,8 @@ export default function ConstraintPanel() {
                             <input
                                 className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
                                 type="number"
-                                step="0.1"
-                                placeholder="距離 m"
+                                step="10"
+                                placeholder="距離 mm"
                                 value={lengthValue}
                                 onChange={(e) => setLengthValue(e.target.value)}
                             />
@@ -1004,13 +1139,37 @@ export default function ConstraintPanel() {
                             >2点距離 ↔</button>
                         </div>
                     )}
+                    {canHorizVertDistance && (
+                        <div className="flex items-center gap-1">
+                            <input
+                                className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
+                                type="number"
+                                step="10"
+                                placeholder="距離 mm"
+                                value={lengthValue}
+                                onChange={(e) => setLengthValue(e.target.value)}
+                            />
+                            <button
+                                className={btn + " disabled:opacity-30 disabled:cursor-not-allowed"}
+                                disabled={!lengthValue}
+                                onClick={addHorizDistance}
+                                title="2 点間の水平 (X 軸) 距離を固定"
+                            >水平距離 ←→</button>
+                            <button
+                                className={btn + " disabled:opacity-30 disabled:cursor-not-allowed"}
+                                disabled={!lengthValue}
+                                onClick={addVertDistance}
+                                title="2 点間の垂直 (Z 軸) 距離を固定"
+                            >垂直距離 ↑↓</button>
+                        </div>
+                    )}
                     {canGridPointLength && (
                         <div className="flex items-center gap-1">
                             <input
                                 className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
                                 type="number"
-                                step="0.1"
-                                placeholder="距離 m"
+                                step="10"
+                                placeholder="距離 mm"
                                 value={lengthValue}
                                 onChange={(e) => setLengthValue(e.target.value)}
                             />
@@ -1027,8 +1186,8 @@ export default function ConstraintPanel() {
                             <input
                                 className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
                                 type="number"
-                                step="0.1"
-                                placeholder="距離 m"
+                                step="10"
+                                placeholder="距離 mm"
                                 value={lengthValue}
                                 onChange={(e) => setLengthValue(e.target.value)}
                             />
@@ -1060,7 +1219,7 @@ export default function ConstraintPanel() {
                         <div className="flex items-center gap-1">
                             <input
                                 className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
-                                type="number" step="0.01" placeholder="距離 m"
+                                type="number" step="10" placeholder="距離 mm"
                                 value={perpDistValue}
                                 onChange={(e) => setPerpDistValue(e.target.value)}
                             />
@@ -1112,7 +1271,7 @@ export default function ConstraintPanel() {
                         <div className="flex items-center gap-1">
                             <input
                                 className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
-                                type="number" step="0.1" placeholder="半径 m"
+                                type="number" step="10" placeholder="半径 mm"
                                 value={radiusValue}
                                 onChange={(e) => setRadiusValue(e.target.value)}
                             />
@@ -1127,7 +1286,7 @@ export default function ConstraintPanel() {
                         <div className="flex items-center gap-1">
                             <input
                                 className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
-                                type="number" step="0.1" placeholder="直径 m"
+                                type="number" step="10" placeholder="直径 mm"
                                 value={diameterValue}
                                 onChange={(e) => setDiameterValue(e.target.value)}
                             />
@@ -1142,7 +1301,7 @@ export default function ConstraintPanel() {
                         <div className="flex items-center gap-1">
                             <input
                                 className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
-                                type="number" step="0.1" placeholder="弧半径 m"
+                                type="number" step="10" placeholder="弧半径 mm"
                                 value={arcRadiusValue}
                                 onChange={(e) => setArcRadiusValue(e.target.value)}
                             />
@@ -1157,7 +1316,7 @@ export default function ConstraintPanel() {
                         <div className="flex items-center gap-1">
                             <input
                                 className="flex-1 min-w-0 text-[10px] px-1 py-1 bg-zinc-900 border border-zinc-700 rounded text-zinc-200"
-                                type="number" step="0.1" placeholder="弧直径 m"
+                                type="number" step="10" placeholder="弧直径 mm"
                                 value={arcDiameterValue}
                                 onChange={(e) => setArcDiameterValue(e.target.value)}
                             />
@@ -1197,6 +1356,8 @@ export default function ConstraintPanel() {
                                 {c.value !== undefined && c.type === "ArcRadius" && ` (R=${c.value.toFixed(2)} m)`}
                                 {c.value !== undefined && c.type === "ArcDiameter" && ` (⌀=${c.value.toFixed(2)} m)`}
                                 {c.value !== undefined && c.type === "Length" && ` (${c.value.toFixed(2)} m)`}
+                                {c.value !== undefined && c.type === "HorizDistance" && ` (${Math.abs(c.value).toFixed(2)} m)`}
+                                {c.value !== undefined && c.type === "VertDistance" && ` (${Math.abs(c.value).toFixed(2)} m)`}
                             </span>
                             <button className="text-red-400 hover:text-red-300" onClick={() => removeC(c.id)}>×</button>
                         </div>

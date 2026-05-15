@@ -9,6 +9,7 @@ import RoomPropertyPanel from "../room/RoomPropertyPanel";
 import WallEditPanel from "../wall/WallEditPanel";
 import GridPropertyPanel from "../grid/GridPropertyPanel";
 import SlabPropertyPanel from "../slab/SlabPropertyPanel";
+import StairPropertyPanel from "../stair/StairPropertyPanel";
 import ConstraintPanel from "../constraint/ConstraintPanel";
 import ElementTypePanel from "../catalog/ElementTypePanel";
 import EdgeWallTypePanel from "../catalog/EdgeWallTypePanel";
@@ -197,73 +198,91 @@ export default function CadShell() {
                     >Export IFC</button>
                 </div>
                 <div className="ml-auto flex gap-2 text-sm items-center">
+
+
                     {/* 2D 限定ツール群 (作図系) + Select。3D ビューでは作図
                         位置の解像度が荒くなるため隠す。3D 切替時に setViewMode
                         が活性ツールを select へ戻すので、3D で Select ボタン
                         を出す意味は薄い (= Door/Window はトグルで select に
                         戻れるし、Escape でも戻る)。Door / Window は 3D 専用。 */}
                     {viewMode === "2D" && (<>
-                    <button
-                        className={`px-3 py-1 rounded border ${activeTool === "select" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
-                        onClick={() => setActiveTool("select")}
-                    >Select</button>
-                    <button
-                        className={`px-3 py-1 rounded border ${activeTool === "column" ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
-                        onClick={() => {
-                            if (!activeLevelId) return;
-                            setActiveTool(activeTool === "column" ? "select" : "column");
-                        }}
-                        title={!activeLevelId ? "Select a level first" : "柱作成ツール (点配置)"}
-                    >Column</button>
-                    <button
-                        className={`px-3 py-1 rounded border ${activeTool === "beam" ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
-                        onClick={() => {
-                            if (!activeLevelId) return;
-                            setActiveTool(activeTool === "beam" ? "select" : "beam");
-                        }}
-                        title={!activeLevelId ? "Select a level first" : "梁作成ツール (2点指定)"}
-                    >Beam</button>
-                    <button
-                        className={`px-3 py-1 rounded border ${inRoomMode ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
-                        onClick={() => {
-                            if (!activeLevelId) return;
-                            if (activeRoomId) {
-                                setActiveRoom(null);
-                            } else if (pendingRoomLevelId) {
-                                setPendingRoomLevel(null);
-                            } else {
-                                handleAddRoom();
-                            }
-                        }}
-                        title={!activeLevelId ? "Select a level first" : "部屋作成ツール (図形を描いた時点で新規 Space を生成)"}
-                    >Room</button>
-                    <button
-                        className={`px-3 py-1 rounded border ${activeTool === "slab" ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
-                        onClick={() => {
-                            if (!activeLevelId) return;
-                            setActiveTool(activeTool === "slab" ? "select" : "slab");
-                        }}
-                        title={!activeLevelId ? "Select a level first" : "床作成ツール (Spaceをクリックで床生成)"}
-                    >Slab</button>
-                    <button
-                        className={`px-3 py-1 rounded border ${activeTool === "gridline" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
-                        onClick={() => setActiveTool(activeTool === "gridline" ? "select" : "gridline")}
-                        title="通芯 (グリッドライン) ツール"
-                    >Grid</button>
+                        <button
+                            className={`px-3 py-1 rounded border ${activeTool === "select" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                            onClick={() => setActiveTool("select")}
+                        >Select</button>
+                        <button
+                            className={`px-3 py-1 rounded border ${activeTool === "column" ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                            onClick={() => {
+                                if (!activeLevelId) return;
+                                setActiveTool(activeTool === "column" ? "select" : "column");
+                            }}
+                            title={!activeLevelId ? "Select a level first" : "柱作成ツール (点配置)"}
+                        >Column</button>
+
+                        <button
+                            className={`px-3 py-1 rounded border ${activeTool === "beam" ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                            onClick={() => {
+                                if (!activeLevelId) return;
+                                setActiveTool(activeTool === "beam" ? "select" : "beam");
+                            }}
+                            title={!activeLevelId ? "Select a level first" : "梁作成ツール (2点指定)"}
+                        >Beam</button>
+
+                        <button
+                            className={`px-3 py-1 rounded border ${inRoomMode ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                            onClick={() => {
+                                if (!activeLevelId) return;
+                                if (activeRoomId) {
+                                    setActiveRoom(null);
+                                } else if (pendingRoomLevelId) {
+                                    setPendingRoomLevel(null);
+                                } else {
+                                    handleAddRoom();
+                                }
+                            }}
+                            title={!activeLevelId ? "Select a level first" : "部屋作成ツール (図形を描いた時点で新規 Space を生成)"}
+                        >Room</button>
+
+                        <button
+                            className={`px-3 py-1 rounded border ${activeTool === "slab" ? "bg-zinc-700 border-zinc-500" : !activeLevelId ? "bg-zinc-800 border-transparent text-zinc-600 cursor-not-allowed" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                            onClick={() => {
+                                if (!activeLevelId) return;
+                                setActiveTool(activeTool === "slab" ? "select" : "slab");
+                            }}
+                            title={!activeLevelId ? "Select a level first" : "床作成ツール (Spaceをクリックで床生成)"}
+                        >Slab</button>
+
+                        <button
+                            className={`px-3 py-1 rounded border ${activeTool === "gridline" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                            onClick={() => setActiveTool(activeTool === "gridline" ? "select" : "gridline")}
+                            title="通芯 (グリッドライン) ツール"
+                        >Grid</button>
+
                     </>)}
                     {/* Door / Window は 3D ビュー専用 (壁面の高さ位置を見ながら
                         配置する必要があるため)。 */}
                     {viewMode === "3D" && (<>
-                    <button
-                        className={`px-3 py-1 rounded border ${activeTool === "door" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
-                        onClick={() => setActiveTool(activeTool === "door" ? "select" : "door")}
-                        title="ドア配置ツール (壁にホバーしてクリックで配置)"
-                    >Door</button>
-                    <button
-                        className={`px-3 py-1 rounded border ${activeTool === "window" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
-                        onClick={() => setActiveTool(activeTool === "window" ? "select" : "window")}
-                        title="窓配置ツール (壁にホバーしてクリックで配置)"
-                    >Window</button>
+                        <button
+                            className={`px-3 py-1 rounded border ${activeTool === "door" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                            onClick={() => setActiveTool(activeTool === "door" ? "select" : "door")}
+                            title="ドア配置ツール (壁にホバーしてクリックで配置)"
+                        >Door</button>
+
+                        <button
+                            className={`px-3 py-1 rounded border ${activeTool === "window" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                            onClick={() => setActiveTool(activeTool === "window" ? "select" : "window")}
+                            title="窓配置ツール (壁にホバーしてクリックで配置)"
+                        >Window</button>
+
+                        {/* 共通 (2D / 3D 両方) ツール: Stair。
+                        階段は 3D 形状作成だが平面位置の指定 / 編集が中心の作業
+                        なので 2D / 3D 両方で起動できるようにする。 */}
+                        <button
+                            className={`px-3 py-1 rounded border ${activeTool === "stair" ? "bg-zinc-700 border-zinc-500" : "bg-zinc-800 border-transparent hover:bg-zinc-700"}`}
+                            onClick={() => setActiveTool(activeTool === "stair" ? "select" : "stair")}
+                            title="階段作成ツール (右パネルでパラメータ入力 → Create)"
+                        >Stair</button>
+
                     </>)}
                     {/* 2D / 3D ビュー切替 — ツールバー右端に **固定** 配置。
                         ツール群は viewMode で増減するので、トグルを左側に置くと
@@ -305,6 +324,14 @@ export default function CadShell() {
                     {selectedGridIds.length > 0 ? (
                         <GridPropertyPanel />
                     ) : (() => {
+                        // Stair: activeTool === "stair" (= 新規作成) または
+                        // 単独で Stair を選択中の場合に StairPropertyPanel を出す。
+                        // (新規作成時は draft、選択時は updateElement に直接 bind)
+                        const stairSelected = selection.length === 1
+                            && elements[selection[0]]?.type === "Stair";
+                        if (activeTool === "stair" || stairSelected) {
+                            return <StairPropertyPanel />;
+                        }
                         // Slab を 1 つだけ選択している時は SlabPropertyPanel。
                         const slabId = selection.length === 1
                             && elements[selection[0]]?.type === "Slab"

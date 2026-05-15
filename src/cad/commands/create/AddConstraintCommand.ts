@@ -10,15 +10,36 @@ export function generateConstraintId(): string {
 }
 
 export class AddConstraintCommand implements Command {
-    constructor(public constraint: Constraint) {}
+    constructor(
+        public constraint: Constraint,
+        private options: { solve?: boolean } = {},
+    ) {}
 
     execute(): CommandResult {
-        useAppState.getState().addConstraint(this.constraint);
+        if (this.options.solve === false) {
+            useAppState.setState((state) => ({
+                constraints: { ...state.constraints, [this.constraint.id]: this.constraint },
+            }));
+        } else {
+            useAppState.getState().addConstraint(this.constraint);
+        }
         return { success: true };
     }
 
     undo(): CommandResult {
-        useAppState.getState().removeConstraint(this.constraint.id);
+        if (this.options.solve === false) {
+            useAppState.setState((state) => {
+                const { [this.constraint.id]: _removed, ...rest } = state.constraints;
+                return {
+                    constraints: rest,
+                    selectedConstraintId: state.selectedConstraintId === this.constraint.id
+                        ? null
+                        : state.selectedConstraintId,
+                };
+            });
+        } else {
+            useAppState.getState().removeConstraint(this.constraint.id);
+        }
         return { success: true };
     }
 }

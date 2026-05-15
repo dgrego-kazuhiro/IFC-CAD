@@ -25,11 +25,18 @@ import { AddConstraintCommand, RemoveConstraintCommand, generateConstraintId } f
 import { CreateSpaceCommand } from "../../commands/create/CreateSpaceCommand";
 import { pickNewRoomName } from "./roomNaming";
 import { ElementId } from "../../model/base/ElementId";
-import { Constraint } from "../../model/constraint/Constraint";
+import { Constraint, ConstraintTarget } from "../../model/constraint/Constraint";
 import { snapToGrids, snapAxisAlign, DEFAULT_GRID_SNAP_TOLERANCE } from "../../model/grid/GridSnap";
 import { GridLine, gridVertices } from "../../model/grid/GridLine";
 import { SnapBVH } from "../../model/grid/SnapBVH";
 import { unifiedSnap } from "../../snapping/UnifiedSnap";
+import {
+    SNAP_RGBA_OBJ, SNAP_RGBA_AXIS, SNAP_RGBA_WHITE,
+    SNAP_RGBA_POLAR_GUIDE, SNAP_RGBA_POLAR_ACTIVE, SNAP_MARKER_HALF,
+    ORIGIN_RGBA_X, ORIGIN_RGBA_Z, ORIGIN_RGBA_DOT_STROKE,
+    ORIGIN_AXIS_LEN_PX, ORIGIN_DOT_RADIUS, ORIGIN_STROKE_WIDTH, SNAP_STROKE_WIDTH,
+    SNAP_MARKER_STYLES, SnapKind,
+} from "../snapStyle";
 import {
     SketchEntity,
     LineEntity,
@@ -272,6 +279,109 @@ function cloneEntity(e: SketchEntity): SketchEntity {
     return e;
 }
 
+/**
+ * 全体移動 (= poly translate) で「一緒に動かすべき別 polygon」を BFS で集める。
+ *
+ * 対象拘束:
+ *   - Collinear / Parallel / Perpendicular: 辺同士の **向き** 拘束
+ *   - Length: 距離 / 長さ拘束
+ *  これらは「両 polygon が同じ delta だけ平行移動」した時に拘束が保たれる
+ *  (= 連結 polygon を rigid に一緒に動かせば OK)。Coincident は別途ブロック
+ *  処理されるのでここには含めない。
+ *  outline polygon (wallOutlineOf 付き) は派生扱いなので除外。
+ *
+ * 戻り値: seedPolyId/seedSpaceId 以外の連結 polygon のスナップショット。
+ *  各 polygon について origEntities / origOuter / origHoles を deep copy で保持。
+ */
+function collectLinkedPolysForTranslate(
+    seedPolyId: string,
+    seedSpaceId: string,
+    elements: Record<string, any>,
+    constraints: Record<string, any>,
+): {
+    spaceId: string;
+    polyId: string;
+    origEntities: { entityId: string; snapshot: SketchEntity }[];
+    origOuter: Vec2[];
+    origHoles: Vec2[][];
+}[] {
+    const TRANSLATE_PRESERVING = new Set([
+        "Collinear", "Parallel", "Perpendicular", "Length",
+    ]);
+    // polyId → spaceId の lookup
+    const polyToSpace = new Map<string, string>();
+    for (const eid in elements) {
+        const el = elements[eid];
+        if (!el || el.type !== "Space") continue;
+        const sp = el as SpaceElement;
+        for (const p of sp.polygons ?? []) {
+            polyToSpace.set(p.id, eid);
+        }
+    }
+    // BFS: seed から「TRANSLATE_PRESERVING 拘束で共有する別 polygon」を辿る
+    const visited = new Set<string>([seedPolyId]);
+    const queue: string[] = [seedPolyId];
+    const result: ReturnType<typeof collectLinkedPolysForTranslate> = [];
+    while (queue.length > 0) {
+        const cur = queue.shift() as string;
+        for (const cid in constraints) {
+            const c = constraints[cid];
+            if (!TRANSLATE_PRESERVING.has(c.type)) continue;
+            if (!Array.isArray(c.targets)) continue;
+            // この拘束が cur を含むか
+            const targetsCur = c.targets.some((t: any) =>
+                (t.kind === "SketchPoint" || t.kind === "SketchEdge")
+                && t.polyId === cur,
+            );
+            if (!targetsCur) continue;
+            // 同じ拘束の中の **別 polyId** を集めて queue に追加
+            for (const t of c.targets) {
+                if (t.kind !== "SketchPoint" && t.kind !== "SketchEdge") continue;
+                const otherPid = (t as any).polyId as string | undefined;
+                if (!otherPid || otherPid === cur) continue;
+                if (visited.has(otherPid)) continue;
+                const otherSpaceId = polyToSpace.get(otherPid);
+                if (!otherSpaceId) continue;
+                const otherSp = elements[otherSpaceId] as SpaceElement | undefined;
+                if (!otherSp) continue;
+                const otherPoly = otherSp.polygons?.find((p) => p.id === otherPid);
+                if (!otherPoly) continue;
+                if (otherPoly.wallOutlineOf) continue;
+                visited.add(otherPid);
+                queue.push(otherPid);
+                result.push({
+                    spaceId: otherSpaceId,
+                    polyId: otherPid,
+                    origEntities: collectPolyEntitiesSnapshot(otherSp, otherPid),
+                    origOuter: otherPoly.outer.map((p) => [p[0], p[1]] as Vec2),
+                    origHoles: (otherPoly.holes ?? []).map((h) =>
+                        h.map((p) => [p[0], p[1]] as Vec2),
+                    ),
+                });
+                // outline 兄弟 polygon (= 同じ Space 内で wallOutlineOf === otherPid)
+                // も合わせて記録。entity を持たないので origEntities は空のまま
+                // (= 後段の legacy path で polygon.outer を直接 translate)。
+                for (const sibling of otherSp.polygons ?? []) {
+                    if (sibling.wallOutlineOf !== otherPid) continue;
+                    if (visited.has(sibling.id)) continue;
+                    visited.add(sibling.id);
+                    result.push({
+                        spaceId: otherSpaceId,
+                        polyId: sibling.id,
+                        origEntities: [],
+                        origOuter: sibling.outer.map((p) => [p[0], p[1]] as Vec2),
+                        origHoles: (sibling.holes ?? []).map((h) =>
+                            h.map((p) => [p[0], p[1]] as Vec2),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    void seedSpaceId;
+    return result;
+}
+
 function translateEntity(e: SketchEntity, dx: number, dy: number): SketchEntity {
     if (e.kind === "line") {
         return {
@@ -368,6 +478,19 @@ interface DragPolyState {
      * polygon (= legacy / outline 等) → polygon 直接更新フォールバックを使う。
      */
     origEntities: { entityId: string; snapshot: SketchEntity }[];
+    /**
+     * cross-poly 拘束 (Collinear / Parallel / Perpendicular / Length) で
+     * 連結された **別 polygon** のスナップショット。同じ delta で一緒に平行
+     * 移動することで、向き・距離系の拘束が保たれる。Coincident は別途ブロック
+     * 処理されるのでここには含めない。
+     */
+    linkedPolys: {
+        spaceId: string;
+        polyId: string;
+        origEntities: { entityId: string; snapshot: SketchEntity }[];
+        origOuter: Vec2[];
+        origHoles: Vec2[][];
+    }[];
     moved: boolean;
 }
 interface DragPolyVertexState {
@@ -378,6 +501,25 @@ interface DragPolyVertexState {
     origHoles: Vec2[][];
     wallThickness?: number;
     moved: boolean;
+    /** drag 開始時点で確定した「対応 entity の ID と point index」。entity 駆動 drag
+     *  で毎フレーム位置探索すると、第 1 フレームの後で entity の point が動いて
+     *  探索が失敗するので、ここに固定する。entity 不在 (= legacy polygon) なら null。 */
+    entityId?: string | null;
+    entityPointIdx?: number;
+    /**
+     * cross-poly 拘束 (Collinear / Parallel / Perpendicular / Length) で連結された
+     * 別 polygon。頂点ドラッグでも、propagateSimpleConstraints の cascade で
+     * 「ある edge の両端点が同じ delta で動いた」場合はその edge が剛体平行移動
+     * したことになるので、連結 polygon も同じ delta で平行移動して collinear
+     * 関係を保つ。
+     */
+    linkedPolys?: {
+        spaceId: string;
+        polyId: string;
+        origEntities: { entityId: string; snapshot: SketchEntity }[];
+        origOuter: Vec2[];
+        origHoles: Vec2[][];
+    }[];
 }
 interface DragPolyEdgeState {
     kind: "polyEdge";
@@ -389,6 +531,24 @@ interface DragPolyEdgeState {
     wallThickness?: number;
     startWorld: [number, number];
     moved: boolean;
+    /**
+     * cross-poly 拘束 (Collinear / Parallel / Perpendicular / Length) で連結
+     * された別 polygon。エッジを perp 方向にドラッグした時、これらも同じ
+     * (normal * perp) 分だけ rigid 平行移動する → Collinear が drag 中も保たれる。
+     */
+    linkedPolys?: {
+        spaceId: string;
+        polyId: string;
+        origEntities: { entityId: string; snapshot: SketchEntity }[];
+        origOuter: Vec2[];
+        origHoles: Vec2[][];
+    }[];
+    /** drag 開始時点で確定した「対応 entity の ID と edge 両端の point index」。
+     *  entity 駆動 drag で毎フレーム位置探索すると、第 1 フレーム後で entity の
+     *  point が動いて探索が失敗するので、ここに固定する。entity 不在なら null。 */
+    entityId?: string | null;
+    entityPointIdxA?: number;
+    entityPointIdxB?: number;
     /**
      * polygon の chain が「直線（line / open polyline）+ 弧 1 本」で構成される
      * 単純な D 形状の場合に、ドラッグ開始時の entity スナップショットを保存。
@@ -497,6 +657,9 @@ const VERTEX_SCREEN_RADIUS = 10;
 
 type RGBA = [number, number, number, number];
 const rgba = (r: number, g: number, b: number, a = 1): RGBA => [r / 255, g / 255, b / 255, a];
+const ROOM_SHAPE_DEBUG = true;
+const fmtDbgPt = (p: Vec2 | [number, number]) => `(${p[0].toFixed(3)},${p[1].toFixed(3)})`;
+const fmtDbgRing = (pts: Array<Vec2 | [number, number]>) => `[${pts.map(fmtDbgPt).join(" ")}]`;
 
 const C_RECT          = rgba(59, 130, 246);
 const C_RECT_FILL     = rgba(59, 130, 246, 0.06);
@@ -508,7 +671,7 @@ const C_RECT_SEL      = rgba(249, 115, 22);
 const C_RECT_SEL_FILL = rgba(249, 115, 22, 0.25);
 const C_TEMP          = rgba(34, 197, 94);
 const C_TEMP_FILL     = rgba(34, 197, 94, 0.08);
-const C_WHITE         = rgba(255, 255, 255);
+const C_WHITE         = SNAP_RGBA_WHITE;
 const C_HL_ORANGE     = rgba(234, 88, 12);
 const C_HL_FILL       = rgba(234, 88, 12, 0.25);
 const C_WALL_SLAB     = rgba(140, 140, 145, 0.85);
@@ -520,12 +683,18 @@ const C_VIRTUAL_WALL  = rgba(160, 170, 185, 0.55);
 const VIRTUAL_WALL_THICKNESS_M = 0.105;
 const C_OVERLAP       = rgba(236, 72, 153);
 const C_OVERLAP_FILL  = rgba(236, 72, 153, 0.18);
-const C_SNAP_OBJ      = rgba(25, 204, 102);
-const C_SNAP_AXIS     = rgba(51, 191, 242);
+const C_SNAP_OBJ      = SNAP_RGBA_OBJ;
+const C_SNAP_AXIS     = SNAP_RGBA_AXIS;
+const C_POLAR_GUIDE   = SNAP_RGBA_POLAR_GUIDE;
+const C_POLAR_ACTIVE  = SNAP_RGBA_POLAR_ACTIVE;
 const C_EDGE_HOV      = rgba(251, 146, 60);
 // 壁省略 (= wallSkip) を可視化するときの色。dashed thin で描画。
 const C_WALL_SKIP     = rgba(120, 130, 145, 0.85);
 const C_WALL_SKIP_PICK = rgba(220, 90, 90); // wallSkip ピック中のプレビュー
+// 他階の壁を「参照線」として描く色 (スケッチライン非表示・壁外周だけ薄グレー)。
+//   部屋編集中、他レベルの壁を見ながら同位置に重ねる (= 上下階の柱・通り芯
+//   合わせ) 用途のため、目立ちすぎず 視認できる薄さで採用。
+const C_OTHER_LEVEL_REF = rgba(140, 140, 145, 0.55);
 
 /** [0, 1] の中で `kept` が占めない部分 (= 補集合) を返す。`kept` は
  *  `unskippedRanges` の出力と同形式 (start で sort 済み、互いに重ならない)。 */
@@ -539,48 +708,31 @@ function complementRanges01(kept: Array<[number, number]>): Array<[number, numbe
     if (prev < 1) out.push([prev, 1]);
     return out;
 }
-const C_ORIGIN_X      = rgba(239, 68, 68);
-const C_ORIGIN_Z      = rgba(34, 197, 94);
-const C_ORIGIN_DOT    = rgba(80, 80, 80);
-const ORIGIN_AXIS_LEN = 0.3;
+const C_ORIGIN_X   = ORIGIN_RGBA_X;
+const C_ORIGIN_Z   = ORIGIN_RGBA_Z;
+const C_ORIGIN_DOT = ORIGIN_RGBA_DOT_STROKE;
 
-// ── Auto-constraints applied to a freshly-drawn rectangle ────────────────────
 function autoRectConstraints(spaceId: string, polyId: string): Constraint[] {
-    // Edge order in a rect-shape polygon (BL→BR=0, BR→TR=1, TR→TL=2, TL→BL=3)
     return [
-        // 2 pairs of parallel edges
-        {
-            id: generateConstraintId(),
-            type: "Parallel",
-            targets: [
-                { kind: "SketchEdge", spaceId, polyId, edgeIdx: 0 },
-                { kind: "SketchEdge", spaceId, polyId, edgeIdx: 2 },
-            ],
-        },
-        {
-            id: generateConstraintId(),
-            type: "Parallel",
-            targets: [
-                { kind: "SketchEdge", spaceId, polyId, edgeIdx: 1 },
-                { kind: "SketchEdge", spaceId, polyId, edgeIdx: 3 },
-            ],
-        },
-        // Right angle between adjacent edges → forces parallelogram → rectangle
-        {
-            id: generateConstraintId(),
-            type: "Perpendicular",
-            targets: [
-                { kind: "SketchEdge", spaceId, polyId, edgeIdx: 0 },
-                { kind: "SketchEdge", spaceId, polyId, edgeIdx: 1 },
-            ],
-        },
-        // Lock orientation to axis-aligned
         {
             id: generateConstraintId(),
             type: "Horizontal",
-            targets: [
-                { kind: "SketchEdge", spaceId, polyId, edgeIdx: 0 },
-            ],
+            targets: [{ kind: "SketchEdge", spaceId, polyId, edgeIdx: 0 }],
+        },
+        {
+            id: generateConstraintId(),
+            type: "Horizontal",
+            targets: [{ kind: "SketchEdge", spaceId, polyId, edgeIdx: 2 }],
+        },
+        {
+            id: generateConstraintId(),
+            type: "Vertical",
+            targets: [{ kind: "SketchEdge", spaceId, polyId, edgeIdx: 1 }],
+        },
+        {
+            id: generateConstraintId(),
+            type: "Vertical",
+            targets: [{ kind: "SketchEdge", spaceId, polyId, edgeIdx: 3 }],
         },
     ];
 }
@@ -644,6 +796,13 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const wallPathDraftSnapsRef = useRef<(WallPathSnapTargetSafe | undefined)[]>([]);
     // Circle draft: center set on 1st click, radius committed on 2nd click
     const [circleCenter, setCircleCenter] = useState<[number, number] | null>(null);
+    // Circle live preview ref (= マウス移動中に 3D 壁を出すための incremental
+    // CircleEntity)。WallPath / polyline と同じ機構。
+    const circleLiveDraftRef = useRef<{
+        polyId: string;
+        roomId: ElementId;
+        entityId: string;
+    } | null>(null);
     // Single-line draft (mode = "line"): first click sets start, second commits.
     const [lineStart, setLineStart] = useState<[number, number] | null>(null);
     // 3-click arc draft (mode = "arc"): 弦端点 P0 → 弦端点 P1 → bulge カーソル
@@ -680,11 +839,17 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const [trimFirstPoint, setTrimFirstPoint] = useState<[number, number] | null>(null);
     const [gridSnapInfo, setGridSnapInfo] = useState<{
         point: [number, number];
-        kind: "obj" | "axis";
+        // 各 kind のシンボル形状・色は ../snapStyle.ts の SNAP_MARKER_STYLES で定義。
+        kind: SnapKind;
         refH?: [number, number];
         refV?: [number, number];
     } | null>(null);
     const [hoveredPolyId, setHoveredPolyId] = useState<string | null>(null);
+    // hoveredPolyId が属する Space。アクティブ Room 上なら activeRoomId と一致するが、
+    // 別 Room (重なり領域で上に乗っている Room) をホバーした場合は別の値を持つ。
+    // ハイライト描画とカーソル切替の両方で「どの Room の polygon を指しているか」を
+    // 判別するために必要。
+    const [hoveredPolySpaceId, setHoveredPolySpaceId] = useState<string | null>(null);
     const [hoveredPolyVertex, setHoveredPolyVertex] = useState<HoveredPolyVertex | null>(null);
     const [hoveredEdge, setHoveredEdge] = useState<HoveredEdge | null>(null);
     // 通芯 (gridLine / gridPoint) のホバー — カーソル形状を pointer に切り替える
@@ -706,12 +871,26 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     // stays live for picking room geometry. This flag stays true for the
     // remainder of that gesture so pointermove / pointerup are forwarded too.
     const wallPassthroughRef = useRef(false);
+    const suppressSelectDragUntilPointerUpRef = useRef(false);
+    const lastRectangleCommitAtRef = useRef(0);
+    // クリック / ドラッグ判定のしきい値 (CSS px)。pointerdown 時の画面座標を
+    // ここに保存し、pointermove で距離が DRAG_THRESHOLD_PX 未満ならまだクリック
+    // 扱いにする → dragState.moved を true にせず、ドラッグ系の reflow も走らせ
+    // ない。これがないと「Shift+クリックで複数選択」しようとした際にわずかな
+    // マウスジッタで毎回 setSelection([]) (ドラッグ確定) が走り、選択が捨てら
+    // れていた。
+    const DRAG_THRESHOLD_PX = 4;
+    const dragStartScreenRef = useRef<[number, number] | null>(null);
 
     // Refs mirroring state so the render loop reads latest values
     const roomEditModeRef = useRef(roomEditMode); roomEditModeRef.current = roomEditMode;
     const elementsRef = useRef(elements); elementsRef.current = elements;
     const selectionRef = useRef(selection); selectionRef.current = selection;
     const activeRoomIdRef = useRef(activeRoomId); activeRoomIdRef.current = activeRoomId;
+    // 部屋モードに入ったが Space 未生成の状態 (= "Add Room" 直後) で、編集中
+    // レベルを保持する。buildDrawLists / snap が「現在編集中のレベル」を参照
+    // するために必要 (= 他レベルの壁を参照線として描く / スナップ判定に使う)。
+    const pendingRoomLevelIdRef = useRef(pendingRoomLevelId); pendingRoomLevelIdRef.current = pendingRoomLevelId;
     const rectStartRef = useRef(rectStart); rectStartRef.current = rectStart;
     const mouseWorldRef = useRef(mouseWorld); mouseWorldRef.current = mouseWorld;
     const polyDraftPointsRef = useRef(polyDraftPoints); polyDraftPointsRef.current = polyDraftPoints;
@@ -727,7 +906,10 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     // the early return) call the latest closure.
     const commitPolyDraftRef = useRef<(pts: [number, number][]) => void>(() => {});
     const commitWallPathDraftRef = useRef<(pts: [number, number][]) => void>(() => {});
+    const discardLiveWallPathDraftRef = useRef<() => void>(() => {});
+    const discardLiveCircleDraftRef = useRef<() => void>(() => {});
     const hoveredPolyIdRef = useRef(hoveredPolyId); hoveredPolyIdRef.current = hoveredPolyId;
+    const hoveredPolySpaceIdRef = useRef(hoveredPolySpaceId); hoveredPolySpaceIdRef.current = hoveredPolySpaceId;
     const hoveredPolyVertexRef = useRef(hoveredPolyVertex); hoveredPolyVertexRef.current = hoveredPolyVertex;
     const hoveredEdgeRef = useRef(hoveredEdge); hoveredEdgeRef.current = hoveredEdge;
     const dragStateRef = useRef(dragState); dragStateRef.current = dragState;
@@ -820,7 +1002,8 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
 
     const commitDimRef = useRef((_v: string) => {});
     const startDimRef = useRef((_pid: string, _axis: "w" | "h", _mm: number) => {});
-    const mergeRef = useRef(() => {});
+    const mergeRef = useRef<(focusPolyId?: string) => void>(() => {});
+    const clipRef  = useRef<(focusPolyId?: string) => void>(() => {});
     const applyCollinearRef = useRef(
         (_polyIdA: string, _edgeIdxA: number, _polyIdB: string, _edgeIdxB: number) => {},
     );
@@ -855,7 +1038,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             const dimH = aabb.maxY - aabb.minY;
 
             const isSel = selection.includes(`poly:${poly.id}`);
-            const isHov = hoveredPolyId === poly.id && !isSel;
+            const isHov = hoveredPolyId === poly.id
+                && hoveredPolySpaceId === activeRoomId
+                && !isSel;
             const color = isSel ? "#f97316" : isHov ? "#60a5fa" : "#3b82f6";
 
             const mkLabel = (text: string, left: number, top: number, center: boolean, axis: "w" | "h", mm: number) => {
@@ -889,51 +1074,85 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             layer.appendChild(d);
         }
 
-        // Merge icon (shown at top-right of last-dragged poly when overlapping)
-        // 「1図形=1Room」の仕様 (449b326 大モード追加 / 4d3b0cc each new shape spawns
-        // its own Room) のため、最後にドラッグした polygon は active room 以外の
-        // Space に属することがある。重ね合わせ判定は **全 Space の polygon** を
-        // 対象にする (同一 Space 内に複数 polygon があるケースもサポート)。
-        if (lastDraggedPolyId) {
-            // focus polygon を全 Space から検索 (= drag した polygon が属する Space)。
-            let focus: RoomPolygon | undefined;
-            let focusSpaceId: string | undefined;
+        // Merge / Clip icons (shown at top-right of an overlapping polygon)
+        //
+        // 仕様: 部屋同士が重なっている間は常時表示する (= 他の要素を選択しても
+        // 消えない)。focus polygon の選択優先度:
+        //   1. lastDraggedPolyId (= 直近で動かした polygon) が今も重なっていれば
+        //      それを focus にする。
+        //   2. そうでなければ全 Space の polygon を走査して、最初に重なっている
+        //      ものを focus にする。
+        // 「1図形=1Room」仕様 (449b326 / 4d3b0cc) のため、全 Space を横断して
+        // 検索する。outline polygon (wallOutlineOf) は派生形状なので除外。
+        // レベルガード: 異なる階の polygon 同士は重なり判定しない。
+        {
+            const eps = 1e-6;
+            interface PolyRef { poly: RoomPolygon; spaceId: string; }
+            const aabb = (p: RoomPolygon) => {
+                const xs = p.outer.map((q) => q[0]);
+                const ys = p.outer.map((q) => q[1]);
+                return [
+                    Math.min(...xs), Math.max(...xs),
+                    Math.min(...ys), Math.max(...ys),
+                ];
+            };
+            const overlaps = (a: RoomPolygon, b: RoomPolygon) => {
+                const [aMinX, aMaxX, aMinY, aMaxY] = aabb(a);
+                const [bMinX, bMaxX, bMinY, bMaxY] = aabb(b);
+                return aMinX < bMaxX - eps && aMaxX > bMinX + eps
+                    && aMinY < bMaxY - eps && aMaxY > bMinY + eps;
+            };
+            const lvlOf = (spaceId: string): string | undefined => {
+                const sp = elements[spaceId];
+                return sp && sp.type === "Space"
+                    ? (sp as SpaceElement).levelId : undefined;
+            };
+            // 全 non-outline polygon を集める。
+            const allPolys: PolyRef[] = [];
             for (const id in elements) {
                 const el = elements[id];
                 if (!el || el.type !== "Space") continue;
                 const sp = el as SpaceElement;
-                const f = (sp.polygons ?? []).find((p) => p.id === lastDraggedPolyId);
-                if (f) { focus = f; focusSpaceId = id; break; }
+                for (const p of sp.polygons ?? []) {
+                    if (p.wallOutlineOf) continue;
+                    allPolys.push({ poly: p, spaceId: id });
+                }
+            }
+            const findOverlapPartner = (ref: PolyRef): boolean => {
+                const refLvl = lvlOf(ref.spaceId);
+                for (const other of allPolys) {
+                    if (other.poly.id === ref.poly.id) continue;
+                    const oLvl = lvlOf(other.spaceId);
+                    if (refLvl !== undefined && oLvl !== undefined && oLvl !== refLvl) continue;
+                    if (overlaps(ref.poly, other.poly)) return true;
+                }
+                return false;
+            };
+            // focus 選択: lastDragged が今も重なっていれば優先、なければ任意。
+            let focus: RoomPolygon | undefined;
+            let focusSpaceId: string | undefined;
+            if (lastDraggedPolyId) {
+                const ld = allPolys.find((r) => r.poly.id === lastDraggedPolyId);
+                if (ld && findOverlapPartner(ld)) {
+                    focus = ld.poly;
+                    focusSpaceId = ld.spaceId;
+                }
+            }
+            if (!focus) {
+                for (const ref of allPolys) {
+                    if (findOverlapPartner(ref)) {
+                        focus = ref.poly;
+                        focusSpaceId = ref.spaceId;
+                        break;
+                    }
+                }
             }
             if (focus && focusSpaceId) {
                 const xs = focus.outer.map(p => p[0]);
                 const ys = focus.outer.map(p => p[1]);
                 const fMinX = Math.min(...xs), fMaxX = Math.max(...xs);
                 const fMinZ = Math.min(...ys), fMaxZ = Math.max(...ys);
-                const eps = 1e-6;
-                let hasOverlap = false;
-                // 全 Space を走査して AABB 交差を検出。outline polygon
-                // (wallOutlineOf set) は派生形状なのでスキップ。
-                for (const id in elements) {
-                    const el = elements[id];
-                    if (!el || el.type !== "Space") continue;
-                    const sp = el as SpaceElement;
-                    for (const other of sp.polygons ?? []) {
-                        if (other.id === focus.id) continue;
-                        if (other.wallOutlineOf) continue;
-                        const oxs = other.outer.map(p => p[0]);
-                        const oys = other.outer.map(p => p[1]);
-                        const oMinX = Math.min(...oxs), oMaxX = Math.max(...oxs);
-                        const oMinZ = Math.min(...oys), oMaxZ = Math.max(...oys);
-                        if (fMinX < oMaxX - eps && fMaxX > oMinX + eps &&
-                            fMinZ < oMaxZ - eps && fMaxZ > oMinZ + eps) {
-                            hasOverlap = true;
-                            break;
-                        }
-                    }
-                    if (hasOverlap) break;
-                }
-                if (hasOverlap) {
+                {
                     const [mx1, my1] = proj(fMinX, fMinZ);
                     const [mx2, my2] = proj(fMaxX, fMaxZ);
                     const rightX = Math.max(mx1, mx2);
@@ -943,12 +1162,26 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     btn.title = "重なる部屋を結合";
                     btn.textContent = "⛶";
                     btn.style.cssText = `position:absolute;left:${rightX + 6}px;top:${topY - 14}px;width:24px;height:24px;border-radius:12px;border:1.5px solid #ec4899;background:#fff;color:#ec4899;font-size:14px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 6px rgba(236,72,153,0.35);pointer-events:auto;user-select:none;padding:0;line-height:1;`;
+                    const focusPolyIdForClick = focus.id;
                     btn.addEventListener("mousedown", (ev) => {
                         ev.stopPropagation();
                         ev.preventDefault();
-                        mergeRef.current();
+                        mergeRef.current(focusPolyIdForClick);
                     });
                     layer.appendChild(btn);
+
+                    // ── Clip (subtract) button ──
+                    const clipBtn = document.createElement("button");
+                    clipBtn.type = "button";
+                    clipBtn.title = "重なる部屋を差し引き（上の部屋の形で下の部屋を切り取る）";
+                    clipBtn.textContent = "⊖";
+                    clipBtn.style.cssText = `position:absolute;left:${rightX + 6}px;top:${topY + 16}px;width:24px;height:24px;border-radius:12px;border:1.5px solid #f97316;background:#fff;color:#f97316;font-size:14px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 6px rgba(249,115,22,0.35);pointer-events:auto;user-select:none;padding:0;line-height:1;`;
+                    clipBtn.addEventListener("mousedown", (ev) => {
+                        ev.stopPropagation();
+                        ev.preventDefault();
+                        clipRef.current(focusPolyIdForClick);
+                    });
+                    layer.appendChild(clipBtn);
                 }
 
                 // ── Collinear-suggestion icons ──────────────────────────
@@ -1107,6 +1340,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 else commitWallPathDraftRef.current(polyDraftPoints);
             } else if (e.key === "Escape" && polyDraftPoints.length > 0) {
                 e.preventDefault();
+                // incremental 3D 壁 / open polyline live ドラフトも破棄する
+                // (polyline / wallPath どちらのモードでも同じ ref を共有)。
+                discardLiveWallPathDraftRef.current();
                 setPolyDraftPoints([]);
                 setMouseWorld(null);
                 setGridSnapInfo(null);
@@ -1146,29 +1382,18 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     useEffect(() => {
         if (roomEditMode !== "polyline" && roomEditMode !== "wallPath" && polyDraftPoints.length > 0) {
             setPolyDraftPoints([]);
-            // wallPath モード離脱時に live polygon (= incremental 壁付き) が
-            // 残っていればクリーンアップ。確定済みなら ref は null なので no-op。
-            // entity ベースで polygon を派生させる方式なので、entity を消せば
-            // derive 経由で polygon も消える (壁は明示的に remove する)。
-            if (wallPathDraftRef.current) {
-                const ref = wallPathDraftRef.current;
-                const live = useAppState.getState();
-                const space = live.elements[ref.roomId] as SpaceElement | undefined;
-                if (space) {
-                    const target = space.polygons?.find((p) => p.id === ref.polyId);
-                    if (target) {
-                        for (const wid of target.wallIds ?? []) {
-                            if (wid && live.elements[wid]) live.removeElement(wid);
-                        }
-                    }
-                    setSpaceEntities(ref.roomId, (es) =>
-                        es.filter((e) => e.id !== ref.entityId));
-                }
-                wallPathDraftRef.current = null;
-                wallPathDraftSnapsRef.current = [];
-            }
+            // モード離脱時の auto-finalize:
+            // incremental commit で作った entity は「実体」として残す
+            // (= 削除しない)。ドラフトの ref / snaps state だけクリアして、
+            // entity と polygon と 3D 壁はそのまま保持。
+            // これがないと「クリックで描画した WallPath が、Room モードを
+            // 離れた瞬間に消える」現象になる。
+            wallPathDraftRef.current = null;
+            wallPathDraftSnapsRef.current = [];
         }
-        if (roomEditMode !== "circle" && circleCenter) {
+        if (roomEditMode !== "circle" && (circleCenter || circleLiveDraftRef.current)) {
+            // Circle も同じ: live entity は実体として残し、ref state だけクリア。
+            circleLiveDraftRef.current = null;
             setCircleCenter(null);
         }
         if (roomEditMode !== "line" && lineStart) setLineStart(null);
@@ -1297,6 +1522,18 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     } => {
         const tol = DEFAULT_GRID_SNAP_TOLERANCE;
         const cursor: Vec3 = [xy[0], 0, xy[1]];
+        // 編集中レベル: active room の levelId、無ければ pending 状態のレベル。
+        // currentLevelId を渡すと unifiedSnap が「他階壁の axis」もスナップ対象に
+        // 含めるので、参照線として描画している他階壁の上にもクリックで吸着する。
+        const editingLvl: string | undefined = (() => {
+            const els2 = elementsRef.current;
+            const rid2 = activeRoomIdRef.current;
+            const real2 = rid2 ? els2[rid2] : undefined;
+            const lvl = real2 && real2.type === "Space"
+                ? (real2 as SpaceElement).levelId
+                : pendingRoomLevelIdRef.current;
+            return (lvl as string | undefined) ?? undefined;
+        })();
         const snap = unifiedSnap(cursor, elements, gridsRef.current, {
             tolerance: tol,
             // 部屋モードの 2D 作図では Column / Beam / WallAxis のスナップは
@@ -1304,6 +1541,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             // Axis は引き続き有効。
             enableElementSnaps: false,
             snapBVH: snapBVHRef.current,
+            // 他階壁の axis (= 参照線) には吸着可能にする。同階壁は polygon
+            // edge スナップと被るので除外される (= UnifiedSnap 側で制御)。
+            currentLevelId: editingLvl,
         });
         if (snap.kind) {
             const p: [number, number] = [snap.point[0], snap.point[2]];
@@ -1347,12 +1587,16 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     type WallPathSnapTarget =
         | { kind: "polyVertex"; spaceId: string; polyId: string; targetVertexIdx: number }
         | { kind: "polyEdge"; spaceId: string; polyId: string; targetEdgeIdx: number; t: number };
-    const applyWallPathSnap = (xy: [number, number]): {
+    const applyWallPathSnap = (
+        xy: [number, number],
+        opts: { excludePolyId?: string } = {},
+    ): {
         p: [number, number];
         info: typeof gridSnapInfo;
         target?: WallPathSnapTarget;
     } => {
         const tol = DEFAULT_GRID_SNAP_TOLERANCE;
+        const excludeId = opts.excludePolyId;
         // 1. Vertex snap (existing wall corners).
         let bestV: {
             p: [number, number];
@@ -1367,6 +1611,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             const sp = el as SpaceElement;
             for (const poly of sp.polygons ?? []) {
                 if (poly.wallOutlineOf) continue;
+                if (excludeId && poly.id === excludeId) continue;
                 for (let vi = 0; vi < poly.outer.length; vi++) {
                     const v = poly.outer[vi];
                     const d = Math.hypot(xy[0] - v[0], xy[1] - v[1]);
@@ -1382,7 +1627,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         if (bestV) {
             return {
                 p: bestV.p,
-                info: { point: bestV.p, kind: "obj" },
+                info: { point: bestV.p, kind: "vertex" },
                 target: {
                     kind: "polyVertex",
                     spaceId: bestV.spaceId,
@@ -1409,6 +1654,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             const sp = el as SpaceElement;
             for (const poly of sp.polygons ?? []) {
                 if (poly.wallOutlineOf) continue;
+                if (excludeId && poly.id === excludeId) continue;
                 const edges = polygonEdges(poly);
                 for (let ei = 0; ei < edges.length; ei++) {
                     const [a, b] = edges[ei];
@@ -1435,7 +1681,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         if (bestE) {
             return {
                 p: bestE.p,
-                info: { point: bestE.p, kind: "obj" },
+                info: { point: bestE.p, kind: "edge" },
                 target: {
                     kind: "polyEdge",
                     spaceId: bestE.spaceId,
@@ -1445,7 +1691,34 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 },
             };
         }
-        // 4. Fallback: grid axis 整列 or 何も無し。
+        // 4. Polar angle snap (45° 刻み) — 最後の確定点が基準。
+        //    grid や vertex よりは低優先だが、フリー描画時に角度を拘束できる。
+        const draftPts = polyDraftPointsRef.current;
+        if (draftPts.length > 0) {
+            const last = draftPts[draftPts.length - 1];
+            const dx = xy[0] - last[0];
+            const dz = xy[1] - last[1];
+            const dist = Math.hypot(dx, dz);
+            if (dist > 0.05) {
+                const POLAR_STEP = Math.PI / 4;
+                const POLAR_TOL  = 10 * Math.PI / 180;
+                const raw = Math.atan2(dz, dx);
+                const nearest = Math.round(raw / POLAR_STEP);
+                const snapped = nearest * POLAR_STEP;
+                let diff = raw - snapped;
+                while (diff >  Math.PI) diff -= Math.PI * 2;
+                while (diff < -Math.PI) diff += Math.PI * 2;
+                if (Math.abs(diff) < POLAR_TOL) {
+                    const sp: [number, number] = [
+                        last[0] + dist * Math.cos(snapped),
+                        last[1] + dist * Math.sin(snapped),
+                    ];
+                    return { p: sp, info: { point: sp, kind: "axis" as const } };
+                }
+            }
+        }
+
+        // 5. Fallback: grid axis 整列 or 何も無し。
         return grid;
     };
 
@@ -1461,6 +1734,50 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             if (pointInRoomPolygon(wx, wz, p.outer, p.holes ?? [])) return p.id;
         }
         return null;
+    };
+
+    /**
+     * 全 Space を横断して、点 (wx, wz) を内包する polygon を返す。複数候補が
+     * あるときは Space の `createdAt` が最大 (= 後から追加した Room) を優先し、
+     * 「重なり領域では上に乗せた矩形が勝つ」というレイヤ原則に揃える。
+     * 編集中レベル (= activeRoom or pendingRoomLevel) の Space のみを対象とし、
+     * 他階の参照線は除外する。ホバーハイライトのターゲット検出に使う。
+     */
+    const hitTestPolyAcrossSpaces = (wx: number, wz: number): { spaceId: string; polyId: string } | null => {
+        const editingLvl: ElementId | null =
+            (activeRoomId
+                ? ((elements[activeRoomId] as SpaceElement | undefined)?.levelId as ElementId | undefined)
+                : (pendingRoomLevelId as ElementId | null | undefined))
+            ?? null;
+        let bestSpaceId: string | null = null;
+        let bestPolyId: string | null = null;
+        let bestCreatedAt = -Infinity;
+        for (const sid in elements) {
+            const el = elements[sid];
+            if (!el || el.type !== "Space") continue;
+            const sp = el as SpaceElement;
+            if (!sp.polygons) continue;
+            if (editingLvl !== null && sp.levelId && sp.levelId !== editingLvl) continue;
+            let candidate: string | null = null;
+            for (let i = sp.polygons.length - 1; i >= 0; i--) {
+                const p = sp.polygons[i];
+                if (p.wallOutlineOf) continue;
+                if (!isPolygonClosed(p)) continue;
+                if (pointInRoomPolygon(wx, wz, p.outer, p.holes ?? [])) {
+                    candidate = p.id;
+                    break;
+                }
+            }
+            if (!candidate) continue;
+            const c = sp.createdAt ?? -Infinity;
+            if (c >= bestCreatedAt) {
+                bestCreatedAt = c;
+                bestSpaceId = sid;
+                bestPolyId = candidate;
+            }
+        }
+        if (!bestSpaceId || !bestPolyId) return null;
+        return { spaceId: bestSpaceId, polyId: bestPolyId };
     };
     /**
      * 弧 / 円 entity に **完全に内包される** tessellation 頂点 (= chord の
@@ -1501,7 +1818,15 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             if (p.shape?.type === "circle") continue; // no vertex picking on circles
             for (let i = 0; i < p.outer.length; i++) {
                 if (isCurveInteriorVertex(p, i)) continue; // 弧/円の途中点はドラッグ不可
-                if (isArcVertex(p.outer, i)) continue; // 角度ヒューリスティック (旧データ用フォールバック)
+                // edgeOwners が無い旧データのみ角度ヒューリスティックを併用。
+                // 新データは `isCurveInteriorVertex` のみで弧/円判定が完結するので、
+                // 切断点 (= 直線上に挿入された実頂点) を誤って弾かない。
+                if (!p.edgeOwners && isArcVertex(p.outer, i)) continue;
+                // 180° collinear な split 頂点 (= wallRegen が junction split で
+                // 挿入したもの、entity に対応点なし) はドラッグ不可。これを返すと
+                // entity 駆動 drag が「対応点なし」で何もしないため。
+                // ※ turnAngleAt は 0..π。0 ≒ collinear (180° 連続)。
+                if (turnAngleAt(p.outer, i) < ARC_VERTEX_ANGLE_THRESHOLD) continue;
                 const [wx, wz] = p.outer[i];
                 const [px, py] = project(wx, wz);
                 const d = Math.hypot(sx - px, sy - py);
@@ -1540,6 +1865,103 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             }
         }
         return best;
+    };
+    /**
+     * Cross-space 版のヒットテスト。非アクティブ Room のエッジ・頂点も拾える
+     * よう全 Space の polygon を走査する。アクティブ Room の polygon ヒットも
+     * 当然候補に入る。レベルガード: 編集中レベル以外の部屋は対象外
+     * (= 参照線として描画している他階壁を誤クリックしない)。
+     * 同一スクリーン位置に複数候補がある場合は `createdAt` が新しい Space を
+     * 優先する (= 重ねた時に「上に乗せた方」が確実に拾える)。
+     */
+    const hitTestEdgeAcrossSpaces = (
+        sx: number, sy: number,
+    ): { spaceId: string; polyId: string; edgeIdx: number; midWx: number; midWz: number } | null => {
+        const editingLvl: string | undefined = (() => {
+            const lvl = activeRoomId
+                ? (elements[activeRoomId] as SpaceElement | undefined)?.levelId
+                : pendingRoomLevelId;
+            return (lvl as string | undefined) ?? undefined;
+        })();
+        let best: { spaceId: string; polyId: string; edgeIdx: number; midWx: number; midWz: number; createdAt: number } | null = null;
+        let bestD = EDGE_SCREEN_TOLERANCE;
+        for (const eid in elements) {
+            const el = elements[eid];
+            if (!el || el.type !== "Space") continue;
+            const sp = el as SpaceElement;
+            if (editingLvl !== undefined && sp.levelId && sp.levelId !== editingLvl) continue;
+            const createdAt = sp.createdAt ?? -Infinity;
+            for (const poly of sp.polygons ?? []) {
+                if (poly.shape?.type === "circle") continue;
+                if (poly.wallOutlineOf) continue;
+                const edges = polygonEdges(poly);
+                for (let i = 0; i < edges.length; i++) {
+                    const [ai, bi] = edges[i];
+                    const [ax, az] = poly.outer[ai];
+                    const [bx, bz] = poly.outer[bi];
+                    const [px0, py0] = project(ax, az);
+                    const [px1, py1] = project(bx, bz);
+                    const dx = px1 - px0, dy = py1 - py0;
+                    const lenSq = dx * dx + dy * dy;
+                    const t = lenSq > 0
+                        ? Math.max(0, Math.min(1, ((sx - px0) * dx + (sy - py0) * dy) / lenSq))
+                        : 0;
+                    const qx = px0 + dx * t, qy = py0 + dy * t;
+                    const d = Math.hypot(sx - qx, sy - qy);
+                    if (d < bestD || (d <= bestD + 0.5 && best && createdAt > best.createdAt)) {
+                        bestD = d;
+                        best = {
+                            spaceId: eid, polyId: poly.id, edgeIdx: i,
+                            midWx: (ax + bx) / 2, midWz: (az + bz) / 2,
+                            createdAt,
+                        };
+                    }
+                }
+            }
+        }
+        if (!best) return null;
+        const { createdAt: _ca, ...out } = best;
+        void _ca;
+        return out;
+    };
+    const hitTestPolyVertexAcrossSpaces = (
+        sx: number, sy: number,
+    ): { spaceId: string; polyId: string; vertexIdx: number; wx: number; wz: number } | null => {
+        const editingLvl: string | undefined = (() => {
+            const lvl = activeRoomId
+                ? (elements[activeRoomId] as SpaceElement | undefined)?.levelId
+                : pendingRoomLevelId;
+            return (lvl as string | undefined) ?? undefined;
+        })();
+        let best: { spaceId: string; polyId: string; vertexIdx: number; wx: number; wz: number; createdAt: number } | null = null;
+        let bestD = VERTEX_SCREEN_RADIUS;
+        for (const eid in elements) {
+            const el = elements[eid];
+            if (!el || el.type !== "Space") continue;
+            const sp = el as SpaceElement;
+            if (editingLvl !== undefined && sp.levelId && sp.levelId !== editingLvl) continue;
+            const createdAt = sp.createdAt ?? -Infinity;
+            for (const poly of sp.polygons ?? []) {
+                if (poly.shape?.type === "circle") continue;
+                if (poly.wallOutlineOf) continue;
+                for (let i = 0; i < poly.outer.length; i++) {
+                    if (isCurveInteriorVertex(poly, i)) continue;
+                    if (!poly.edgeOwners && isArcVertex(poly.outer, i)) continue;
+                    if (turnAngleAt(poly.outer, i) < ARC_VERTEX_ANGLE_THRESHOLD) continue;
+                    const [wx, wz] = poly.outer[i];
+                    const [px, py] = project(wx, wz);
+                    const d = Math.hypot(sx - px, sy - py);
+                    if (d < bestD || (d <= bestD + 0.5 && best && createdAt > best.createdAt)) {
+                        bestD = d;
+                        best = { spaceId: eid, polyId: poly.id, vertexIdx: i, wx, wz, createdAt };
+                    }
+                }
+            }
+        }
+        if (!best) return null;
+        const { createdAt: _ca, ...out } = best;
+        void _ca;
+        return out;
     };
 
     /**
@@ -1702,6 +2124,46 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const updatePolysAndSync = (newPolys: RoomPolygon[]) => {
         // pending 中 (実体 Space 無し) は polygons 編集が発生しない。安全側で無視。
         if (!activeRoomId) return;
+
+        // ── 形状崩壊ガード ─────────────────────────────────────
+        // 以前は正常サイズだった polygon が今回の更新で 1mm 未満まで潰れたら、
+        // この更新フレーム自体を棄却。drag・拘束ソルバ・cross-room 切替後の
+        // 中間状態など、どこかのパスで bbox 一辺が 0 に近づいた瞬間に Room が
+        // 線状にロックされるのを防ぐ。棄却されても次フレームの正常な入力で
+        // 更新が反映されるので連続ドラッグは止まらない。`setSpaceEntities` 側に
+        // も同等のガードがあるが、こちらは entity を経由しない直接 polygon 書き
+        // 戻し経路 (wallOutline / Coincident propagation / 寸法ラベル編集など) を
+        // カバーする。
+        {
+            const MIN_DIM = 0.001;
+            const bbox = (ring: Vec2[]): [number, number] => {
+                let mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity;
+                for (const [x, y] of ring) {
+                    if (x < mnX) mnX = x; if (x > mxX) mxX = x;
+                    if (y < mnY) mnY = y; if (y > mxY) mxY = y;
+                }
+                return [mxX - mnX, mxY - mnY];
+            };
+            for (const np of newPolys) {
+                if (np.wallOutlineOf) continue;
+                if (!np.outer || np.outer.length < 3) continue;
+                const [nw, nh] = bbox(np.outer);
+                if (nw >= MIN_DIM && nh >= MIN_DIM) continue;
+                const prev = room.polygons?.find((p) => p.id === np.id);
+                if (!prev || !prev.outer || prev.outer.length < 3) continue;
+                const [pw, ph] = bbox(prev.outer);
+                if (pw >= MIN_DIM && ph >= MIN_DIM) {
+                    // eslint-disable-next-line no-console
+                    console.warn(
+                        `[updatePolysAndSync] rejected degenerate polygon ${np.id}: `
+                        + `${pw.toFixed(3)}x${ph.toFixed(3)} → ${nw.toFixed(3)}x${nh.toFixed(3)}`,
+                    );
+                    return;
+                }
+            }
+        }
+        // ─────────────────────────────────────────────────────
+
         const synced = newPolys.map((p) => {
             if (!p.wallOutlineOf) return p;
             const inner = newPolys.find((q) => q.id === p.wallOutlineOf);
@@ -1874,19 +2336,6 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             const endMoved = movedByPos.find(
                 (m) => Math.hypot(m.oldPos[0] - endPt[0], m.oldPos[1] - endPt[1]) < ARC_TOL,
             );
-            // 診断ログ: 弧端点と movedByPos の対応が取れているかをダンプ。
-            // user 報告「line drag で弧だけになる」の原因切り分け用。
-            // eslint-disable-next-line no-console
-            console.log(
-                `[arc-handle] arc=${e.id.slice(0, 6)} ` +
-                `startPt=(${startPt[0].toFixed(3)},${startPt[1].toFixed(3)}) ` +
-                `endPt=(${endPt[0].toFixed(3)},${endPt[1].toFixed(3)}) ` +
-                `moved=${movedByPos.length} ` +
-                `startMatch=${startMoved ? "Y" : "N"} endMatch=${endMoved ? "Y" : "N"} ` +
-                (movedByPos.length > 0
-                    ? `firstOld=(${movedByPos[0].oldPos[0].toFixed(3)},${movedByPos[0].oldPos[1].toFixed(3)})`
-                    : ""),
-            );
             if (!startMoved && !endMoved) continue;
             // 元の弧の **bulge 比率** (= chord の半長に対する bulge の比)。
             // この比率を新 chord に合わせて再投影することで、chord 長が
@@ -1981,41 +2430,56 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 patch.aEnd = arc.aEnd;
             }
         }
-        if (entityUpdates.size > 0) {
-            // Use setSpaceEntities so polygon is re-derived from updated entities.
-            // This keeps polygon.outer and entity.points in sync (= chain
-            // detection always reconnects between e.g. polyline and arc).
-            setSpaceEntities(activeRoomId, (entities) => entities.map((e) => {
-                const p = entityUpdates.get(e.id);
-                if (!p) return e;
-                if (p.kind === "polyline" && e.kind === "polyline") {
-                    return { ...e, points: p.points };
-                }
-                if (p.kind === "line" && e.kind === "line") {
-                    return {
-                        ...e,
-                        ...(p.p0 ? { p0: p.p0 } : {}),
-                        ...(p.p1 ? { p1: p.p1 } : {}),
-                    };
-                }
-                if (p.kind === "circle" && e.kind === "circle") {
-                    return {
-                        ...e,
-                        ...(p.center ? { center: p.center } : {}),
-                        ...(p.radius !== undefined ? { radius: p.radius } : {}),
-                    };
-                }
-                if (p.kind === "arc" && e.kind === "arc") {
-                    return {
-                        ...e,
-                        center: [p.cx, p.cy],
-                        ...(p.radius !== undefined ? { radius: p.radius } : {}),
-                        ...(p.aStart !== undefined ? { aStart: p.aStart } : {}),
-                        ...(p.aEnd !== undefined ? { aEnd: p.aEnd } : {}),
-                    };
-                }
-                return e;
-            }));
+        const applyEntityPatch = (e: SketchEntity): SketchEntity => {
+            const p = entityUpdates.get(e.id);
+            if (!p) return e;
+            if (p.kind === "polyline" && e.kind === "polyline") {
+                return { ...e, points: p.points };
+            }
+            if (p.kind === "line" && e.kind === "line") {
+                return {
+                    ...e,
+                    ...(p.p0 ? { p0: p.p0 } : {}),
+                    ...(p.p1 ? { p1: p.p1 } : {}),
+                };
+            }
+            if (p.kind === "circle" && e.kind === "circle") {
+                return {
+                    ...e,
+                    ...(p.center ? { center: p.center } : {}),
+                    ...(p.radius !== undefined ? { radius: p.radius } : {}),
+                };
+            }
+            if (p.kind === "arc" && e.kind === "arc") {
+                return {
+                    ...e,
+                    center: [p.cx, p.cy],
+                    ...(p.radius !== undefined ? { radius: p.radius } : {}),
+                    ...(p.aStart !== undefined ? { aStart: p.aStart } : {}),
+                    ...(p.aEnd !== undefined ? { aEnd: p.aEnd } : {}),
+                };
+            }
+            return e;
+        };
+        const isDragging = useAppState.getState().solverDragHint.length > 0;
+        if (entityUpdates.size > 0 && isDragging) {
+            // drag 中: polygons と entities を **同一 updateElement で 1 回** に
+            // まとめて書き込む。以前は updateElement(polygons) + setSpaceEntities(entities)
+            // と 2 回 state 更新していたが、React の再レンダーが毎フレーム 2 回起きて
+            // 「全体ドラッグが重い」原因になっていた。setSpaceEntities は drag 中に
+            // polygon を再 derive しないので、entities だけ直接 patch すれば derive を
+            // 経由する必要は無い。mouseup で solverDragHint がクリアされると次回
+            // setSpaceEntities/solver で正しく再 derive される。
+            const liveSpace = useAppState.getState().elements[activeRoomId] as SpaceElement | undefined;
+            const newEntities = (liveSpace?.entities ?? []).map(applyEntityPatch);
+            updateElement(activeRoomId, {
+                polygons: synced,
+                entities: newEntities,
+                dirtyFlags: new Set([...room.dirtyFlags, "Geometry", "Mesh", "Render"]),
+            } as any);
+        } else if (entityUpdates.size > 0) {
+            // Non-drag: 既存経路。setSpaceEntities が再 derive を実施。
+            setSpaceEntities(activeRoomId, (entities) => entities.map(applyEntityPatch));
         } else {
             // No entity-mappable changes — fall back to direct polygon writeback.
             updateElement(activeRoomId, {
@@ -2023,20 +2487,29 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 dirtyFlags: new Set([...room.dirtyFlags, "Geometry", "Mesh", "Render"]),
             } as any);
         }
-        for (const poly of synced) {
-            if (!poly.wallIds || !poly.wallThickness) continue;
-            if (poly.wallIds.length !== poly.outer.length) continue;
-            let cx = 0, cy = 0;
-            for (const p of poly.outer) { cx += p[0]; cy += p[1]; }
-            cx /= poly.outer.length; cy /= poly.outer.length;
-            const axes = computeMiteredWallAxes(poly.outer, [cx, cy], poly.wallThickness / 2);
-            for (let i = 0; i < poly.wallIds.length; i++) {
-                const wid = poly.wallIds[i];
-                if (!wid) continue;
-                updateElement(wid, {
-                    axis: axes[i],
-                    dirtyFlags: new Set(["Geometry", "Mesh", "Render"]),
-                } as any);
+        // drag 中は 3D 壁の毎フレーム再描画を skip する。
+        // wall axis を更新すると 3D mesh が再生成されて重いうえ、ユーザは
+        // 「ドラッグ中の 3D 壁は不要、オレンジの polygon プレビューだけ見たい」
+        // という運用 (= スケッチ専念) を望んでいる。`maybeRealtimeRegenWalls`
+        // が mouseup 時に呼ばれて wall axis と 3D mesh が再構築されるので、
+        // ドラッグ中の wall 表示は意図的に静止 (= 別経路で hide される)。
+        const isDraggingForWalls = useAppState.getState().solverDragHint.length > 0;
+        if (!isDraggingForWalls) {
+            for (const poly of synced) {
+                if (!poly.wallIds || !poly.wallThickness) continue;
+                if (poly.wallIds.length !== poly.outer.length) continue;
+                let cx = 0, cy = 0;
+                for (const p of poly.outer) { cx += p[0]; cy += p[1]; }
+                cx /= poly.outer.length; cy /= poly.outer.length;
+                const axes = computeMiteredWallAxes(poly.outer, [cx, cy], poly.wallThickness / 2);
+                for (let i = 0; i < poly.wallIds.length; i++) {
+                    const wid = poly.wallIds[i];
+                    if (!wid) continue;
+                    updateElement(wid, {
+                        axis: axes[i],
+                        dirtyFlags: new Set(["Geometry", "Mesh", "Render"]),
+                    } as any);
+                }
             }
         }
     };
@@ -2148,8 +2621,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     //   - マージで吸収された側の polygon は元 Space から削除
     //   - マージで吸収された Space に他に polygon が残っていなければ Space ごと削除
     //   - 各 polygon の wallIds に紐付く壁も削除
-    mergeRef.current = () => {
-        if (!lastDraggedPolyId) return;
+    mergeRef.current = (focusPolyId?: string) => {
+        const seedPolyId = focusPolyId ?? lastDraggedPolyId;
+        if (!seedPolyId) return;
         const liveElements = useAppState.getState().elements;
 
         // focus polygon の所属 Space を全 Space から検索
@@ -2159,7 +2633,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             const el = liveElements[id];
             if (!el || el.type !== "Space") continue;
             const sp = el as SpaceElement;
-            const f = (sp.polygons ?? []).find((p) => p.id === lastDraggedPolyId);
+            const f = (sp.polygons ?? []).find((p) => p.id === seedPolyId);
             if (f) { focus = f; focusSpaceId = id; break; }
         }
         if (!focus || !focusSpaceId) return;
@@ -2186,6 +2660,11 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
 
         // 全 Space を走査して交差 polygon を集める。
         // 形式: { polyId: spaceId } で「どの Space から削除するか」を保持。
+        // **レベルガード**: focus と異なる階の部屋は merge 対象外 (= 各階は
+        //   独立した平面なので、平面位置で重なっても結合してはいけない)。
+        const focusSpForMerge = liveElements[focusSpaceId] as SpaceElement | undefined;
+        const focusLvlForMerge = focusSpForMerge && focusSpForMerge.type === "Space"
+            ? focusSpForMerge.levelId : undefined;
         const mergePolys: { poly: RoomPolygon; spaceId: string }[] = [
             { poly: focus, spaceId: focusSpaceId },
         ];
@@ -2193,6 +2672,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             const el = liveElements[id];
             if (!el || el.type !== "Space") continue;
             const sp = el as SpaceElement;
+            // 他階はスキップ
+            if (focusLvlForMerge !== undefined && sp.levelId !== undefined
+                && sp.levelId !== focusLvlForMerge) continue;
             for (const other of sp.polygons ?? []) {
                 if (other.id === focus.id) continue;
                 if (other.wallOutlineOf) continue; // 派生 outline はスキップ
@@ -2305,6 +2787,172 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         setSelection([]);
     };
 
+    // ─── Clip (subtract): focus polygon の形状で overlapping polygons を差し引く ───
+    // focus (lastDragged) はそのまま。他の重なり部屋に対して
+    // difference(other, focus) を計算し、結果で置き換える。
+    clipRef.current = (focusPolyId?: string) => {
+        const seedPolyId = focusPolyId ?? lastDraggedPolyId;
+        if (!seedPolyId) return;
+        const liveElements = useAppState.getState().elements;
+
+        // focus polygon を探す
+        let focus: RoomPolygon | undefined;
+        let focusSpaceId: string | undefined;
+        for (const id in liveElements) {
+            const el = liveElements[id];
+            if (!el || el.type !== "Space") continue;
+            const sp = el as SpaceElement;
+            const f = (sp.polygons ?? []).find((p) => p.id === seedPolyId);
+            if (f) { focus = f; focusSpaceId = id; break; }
+        }
+        if (!focus || !focusSpaceId) return;
+
+        const polyToCoords = (p: RoomPolygon): [number, number][][] => {
+            const ring = p.outer.map(([x, y]) => [x, y] as [number, number]);
+            if (ring.length < 3) return [];
+            ring.push([ring[0][0], ring[0][1]]);
+            const rings: [number, number][][] = [ring];
+            for (const h of p.holes ?? []) {
+                if (h.length < 3) continue;
+                const hh = h.map(([x, y]) => [x, y] as [number, number]);
+                hh.push([hh[0][0], hh[0][1]]);
+                rings.push(hh);
+            }
+            return rings;
+        };
+
+        const DEDUP_EPS = 1e-6;
+        const dedupRing = (ring: [number, number][]): [number, number][] => {
+            const out: [number, number][] = [];
+            for (const p of ring) {
+                const last = out[out.length - 1];
+                if (!last || Math.hypot(p[0] - last[0], p[1] - last[1]) > DEDUP_EPS) {
+                    out.push(p);
+                }
+            }
+            while (out.length > 1) {
+                const a = out[0], b = out[out.length - 1];
+                if (Math.hypot(a[0] - b[0], a[1] - b[1]) <= DEDUP_EPS) out.pop();
+                else break;
+            }
+            return out;
+        };
+
+        const fxs = focus.outer.map(p => p[0]);
+        const fys = focus.outer.map(p => p[1]);
+        const fMinX = Math.min(...fxs), fMaxX = Math.max(...fxs);
+        const fMinZ = Math.min(...fys), fMaxZ = Math.max(...fys);
+        const eps = 1e-6;
+
+        const focusSp = liveElements[focusSpaceId] as SpaceElement | undefined;
+        const focusLvl = focusSp && focusSp.type === "Space" ? focusSp.levelId : undefined;
+        const focusCoords = polyToCoords(focus);
+        if (focusCoords.length === 0) return;
+
+        // 全 Space を走査して AABB 交差する他 polygon に difference を適用
+        const regenPolyIds: string[] = [];
+
+        for (const id in liveElements) {
+            const el = liveElements[id];
+            if (!el || el.type !== "Space") continue;
+            const sp = el as SpaceElement;
+            if (focusLvl !== undefined && sp.levelId !== undefined
+                && sp.levelId !== focusLvl) continue;
+
+            let changed = false;
+            // wallOutlineOf 派生を除いた通常 polygon のみ処理対象にする。
+            // 派生 outline は後で全部削除してから regenerateAllWalls に任せる。
+            const nextPolygons: RoomPolygon[] = [];
+
+            for (const other of sp.polygons ?? []) {
+                if (other.id === focus.id) { nextPolygons.push(other); continue; }
+                // 派生 outline は古いまま残さず、後で再生成に任せる
+                if (other.wallOutlineOf) { changed = true; continue; }
+
+                const oxs = other.outer.map(p => p[0]);
+                const oys = other.outer.map(p => p[1]);
+                const oMinX = Math.min(...oxs), oMaxX = Math.max(...oxs);
+                const oMinZ = Math.min(...oys), oMaxZ = Math.max(...oys);
+                const overlaps = fMinX < oMaxX - eps && fMaxX > oMinX + eps
+                    && fMinZ < oMaxZ - eps && fMaxZ > oMinZ + eps;
+                if (!overlaps) { nextPolygons.push(other); continue; }
+
+                // difference: other の中から focus の領域を除去
+                const otherCoords = polyToCoords(other);
+                if (otherCoords.length === 0) { nextPolygons.push(other); continue; }
+
+                const diffResult = polygonClipping.difference(otherCoords, focusCoords);
+
+                // 古い wallIds に紐付く壁エレメントを削除（再生成で置き換わる）
+                if (other.wallIds) {
+                    for (const wid of other.wallIds) {
+                        if (wid && liveElements[wid]) removeElement(wid);
+                    }
+                }
+
+                if (diffResult.length === 0) {
+                    // other が focus に完全に含まれる → polygon ごと削除
+                    changed = true;
+                    continue;
+                }
+
+                // 差し引き結果を新 polygon として追加（複数の孤立領域になりうる）
+                for (const poly of diffResult) {
+                    if (poly.length === 0) continue;
+                    let outer = dedupRing(poly[0].map(([x, y]) => [x, y] as [number, number]));
+                    if (outer.length > 1
+                        && outer[0][0] === outer[outer.length - 1][0]
+                        && outer[0][1] === outer[outer.length - 1][1]) {
+                        outer.pop();
+                    }
+                    outer = dedupRing(outer);
+                    const holes: Vec2[][] = [];
+                    for (let i = 1; i < poly.length; i++) {
+                        let h = dedupRing(poly[i].map(([x, y]) => [x, y] as [number, number]));
+                        if (h.length > 1
+                            && h[0][0] === h[h.length - 1][0]
+                            && h[0][1] === h[h.length - 1][1]) {
+                            h.pop();
+                        }
+                        h = dedupRing(h);
+                        holes.push(h as Vec2[]);
+                    }
+                    if (outer.length >= 3) {
+                        const newId = generateId();
+                        nextPolygons.push({ id: newId, outer: outer as Vec2[], holes });
+                        regenPolyIds.push(newId);
+                        changed = true;
+                    }
+                }
+            }
+
+            if (!changed) continue;
+
+            if (id !== focusSpaceId && nextPolygons.filter(p => !p.wallOutlineOf).length === 0) {
+                removeElement(id);
+            } else {
+                updateElement(id, {
+                    polygons: nextPolygons,
+                    dirtyFlags: new Set([...(sp.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                } as any);
+            }
+        }
+
+        // 変形した polygon の壁を再生成する
+        if (regenPolyIds.length > 0) {
+            const s = useAppState.getState();
+            regenerateAllWalls({
+                wallThicknessMm: s.wallThicknessMm,
+                circleWallAngleDeg: s.circleWallAngleDeg,
+                wallReferenceMode: s.wallReferenceMode,
+                seedPolyIds: regenPolyIds,
+            });
+        }
+
+        setLastDraggedPolyId(null);
+        setSelection([]);
+    };
+
     // ─── Build draw lists from current state ───
     function buildDrawLists(): { lines: SketchLine[]; quads: SketchQuad[]; markers: SketchMarker[] } {
         const lines: SketchLine[] = [];
@@ -2337,6 +2985,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
 
         const drag = dragStateRef.current;
         const hovPolyId = hoveredPolyIdRef.current;
+        const hovPolySpaceId = hoveredPolySpaceIdRef.current;
         const hovPVtx = hoveredPolyVertexRef.current;
         const sketchSel = sketchSelectionRef.current;
 
@@ -2352,11 +3001,19 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             if (!e || e.type !== "Space") continue;
             const sp = e as SpaceElement;
             for (const p of sp.polygons ?? []) {
-                for (const wid of p.wallIds ?? []) {
-                    if (!wid) continue;
+                // wallIds は edge ごとに canonical 1 本だけ。cross-poly overlap で
+                // 同じ polygon edge に複数 wall が紐づくケース (split された
+                // 2 本目以降) は wallsPerEdge にしか入っていないので、両方を
+                // 走査して owner 判定が漏れないようにする。
+                const collect = (wid: string | undefined) => {
+                    if (!wid) return;
                     let s = wallToPolyIds.get(wid);
                     if (!s) { s = new Set(); wallToPolyIds.set(wid, s); }
                     s.add(p.id);
+                };
+                for (const wid of p.wallIds ?? []) collect(wid);
+                for (const widList of p.wallsPerEdge ?? []) {
+                    for (const wid of widList) collect(wid);
                 }
             }
         }
@@ -2461,13 +3118,12 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         const pxToWorld = (projY > 1e-9 && canvasH > 0)
             ? 2 / (projY * canvasH)
             : 0.015;
-        const ORIGIN_AXIS_PX = 30;
-        const axisLenWorld = ORIGIN_AXIS_PX * pxToWorld;
-        lines.push({ ax: 0, az: 0, bx: axisLenWorld, bz: 0, color: C_ORIGIN_X, width: 1.5 });
-        lines.push({ ax: 0, az: 0, bx: 0, bz: axisLenWorld, color: C_ORIGIN_Z, width: 1.5 });
+        const axisLenWorld = ORIGIN_AXIS_LEN_PX * pxToWorld;
+        lines.push({ ax: 0, az: 0, bx: axisLenWorld, bz: 0, color: C_ORIGIN_X, width: ORIGIN_STROKE_WIDTH });
+        lines.push({ ax: 0, az: 0, bx: 0, bz: axisLenWorld, color: C_ORIGIN_Z, width: ORIGIN_STROKE_WIDTH });
         markers.push({
-            wx: 0, wz: 0, radius: 4, shape: "circle",
-            fill: C_WHITE, stroke: C_ORIGIN_DOT, strokeWidth: 1.5,
+            wx: 0, wz: 0, radius: ORIGIN_DOT_RADIUS, shape: "circle",
+            fill: C_WHITE, stroke: C_ORIGIN_DOT, strokeWidth: ORIGIN_STROKE_WIDTH,
         });
 
         // ── Passive pass: render OTHER rooms' polygons behind the active one.
@@ -2475,15 +3131,78 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         // without this pass switching the active room would make every
         // previously-drawn room disappear from the 2D overlay. We draw their
         // outlines + virtual-wall bands + faint fill, but no edit handles.
+        //
+        // **レベルフィルタ**: 編集中レベル以外 (= 他階) の部屋は「参照線」
+        // モードで描く — スケッチライン (polygon outer)・fill・仮壁帯は出さず、
+        // 壁の hex フットプリント外周だけを薄グレーの線で出力する。これは
+        // 上下階の壁・柱位置を合わせる作図参照を提供するための表示。
+        // editingLevelId は active room の levelId、無ければ pendingRoomLevelId。
+        const editingLevelId: string | null =
+            (real && (real as SpaceElement).levelId) ?? pendingRoomLevelIdRef.current ?? null;
         for (const otherId in els) {
             if (otherId === rid) continue;
             const other = els[otherId];
             if (!other || other.type !== "Space") continue;
             const otherRoom = other as SpaceElement;
             if (!otherRoom.polygons) continue;
+
+            // ── 他レベル部屋: 壁の外周だけをグレー線で出力 ─────────────
+            const isOtherLevel =
+                editingLevelId !== null
+                && !!otherRoom.levelId
+                && otherRoom.levelId !== editingLevelId;
+            if (isOtherLevel) {
+                for (const poly of otherRoom.polygons) {
+                    if (poly.wallOutlineOf) continue;
+                    if (poly.outer.length < 3) continue;
+                    const passiveEdgeCount = polygonEdges(poly).length;
+                    if (!poly.wallIds || poly.wallIds.length !== passiveEdgeCount) continue;
+                    const renderedWidsRef = new Set<string>();
+                    for (let i = 0; i < passiveEdgeCount; i++) {
+                        // split された 2 本目以降を取りこぼさないため wallsPerEdge 優先。
+                        const widList = poly.wallsPerEdge?.[i] ?? [poly.wallIds[i]];
+                        for (const wid of widList) {
+                            if (!wid) continue;
+                            if (!isWallOwner(wid, poly.id)) continue;
+                            if (renderedWidsRef.has(wid)) continue;
+                            renderedWidsRef.add(wid);
+                            const wallEl = els[wid] as WallElement | undefined;
+                            // 壁の外周頂点列。footprint 優先 (= JunctionGraph fp)、
+                            // 無ければ computeWallHexagon で 6 頂点 hex を計算。
+                            let outline: Vec2[] | null = null;
+                            if (wallEl?.footprint && wallEl.footprint.length >= 3) {
+                                outline = wallEl.footprint;
+                            } else if (poly.wallThickness != null
+                                    || (poly.innerThickness != null && poly.outerThickness != null)) {
+                                const hex = computeWallHexagon(poly, i, polygonLookup);
+                                if (hex) outline = hex.vertices;
+                            }
+                            if (!outline) continue;
+                            for (let j = 0; j < outline.length; j++) {
+                                const a = outline[j];
+                                const b = outline[(j + 1) % outline.length];
+                                lines.push({
+                                    ax: a[0], az: a[1], bx: b[0], bz: b[1],
+                                    color: C_OTHER_LEVEL_REF, width: 1.0,
+                                });
+                            }
+                        }
+                    }
+                }
+                // 他レベル部屋は参照線のみ。下の通常 passive 描画はスキップ。
+                continue;
+            }
+
             for (const poly of otherRoom.polygons) {
                 if (poly.wallOutlineOf) continue;
                 if (poly.outer.length < 3) continue;
+
+                // 別 Room (= 非アクティブ) の polygon にカーソルを乗せた時の
+                // ハイライト。createdAt を考慮した cross-Space ホバー検出
+                // (`hitTestPolyAcrossSpaces`) が hovPolyId / hovPolySpaceId を
+                // セットするので、ここで反応させて active Room と同じ
+                // ホバー色 (C_RECT_HOV / C_RECT_HOV_FILL) を出す。
+                const isOtherHovered = hovPolyId === poly.id && hovPolySpaceId === otherId;
 
                 // Confirmed walls (other rooms) — per-edge 6-vertex hexagon
                 // via computeWallHexagon. Shared edges render only on the
@@ -2491,23 +3210,29 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 // wallIds は edge ごとに 1 個 → 閉じ図形なら .length === outer.length、
                 // 開いたポリライン (wallPath) なら .length === edges.length (= outer.length-1)。
                 // どちらでも正しく描画できるよう polygonEdges() の長さで照合する。
+                // **drag 中は wall slab を描画しない** (active 側と同じ判断)。
+                // 共有壁が inactive 側の canonical owner で描画される場合があるため、
+                // ここでも drag 中の slab 描画を抑止しないと「離れた残骸」が残る。
                 const passiveEdgeCount = polygonEdges(poly).length;
-                if (poly.wallIds && poly.wallIds.length === passiveEdgeCount
+                if (!drag && poly.wallIds && poly.wallIds.length === passiveEdgeCount
                     && (poly.wallThickness != null
                         || (poly.innerThickness != null && poly.outerThickness != null))) {
                     const renderedWidsP = new Set<string>();
                     for (let i = 0; i < passiveEdgeCount; i++) {
-                        const wid = poly.wallIds[i];
-                        if (!wid) continue;
-                        if (!isWallOwner(wid, poly.id)) continue;
-                        if (renderedWidsP.has(wid)) continue;
-                        renderedWidsP.add(wid);
-                        // 統合 footprint があればそちらを優先 (= 弧グループ wall)。
-                        const wallEl = els[wid] as WallElement | undefined;
-                        if (wallEl?.footprint && wallEl.footprint.length >= 3) {
-                            for (const q of buildFootprintSlabQuads(wallEl.footprint, wallEl.footprintHoles)) quads.push(q);
-                        } else {
-                            for (const q of buildWallSlabQuads(poly, i)) quads.push(q);
+                        // active 側と同じく split された 2 本目以降を取りこぼさない
+                        // ため wallsPerEdge を優先。
+                        const widList = poly.wallsPerEdge?.[i] ?? [poly.wallIds[i]];
+                        for (const wid of widList) {
+                            if (!wid) continue;
+                            if (!isWallOwner(wid, poly.id)) continue;
+                            if (renderedWidsP.has(wid)) continue;
+                            renderedWidsP.add(wid);
+                            const wallEl = els[wid] as WallElement | undefined;
+                            if (wallEl?.footprint && wallEl.footprint.length >= 3) {
+                                for (const q of buildFootprintSlabQuads(wallEl.footprint, wallEl.footprintHoles)) quads.push(q);
+                            } else {
+                                for (const q of buildWallSlabQuads(poly, i)) quads.push(q);
+                            }
                         }
                     }
                 } else if (isPolygonClosed(poly)) {
@@ -2543,7 +3268,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         for (const p of h) flat.push(p[0], p[1]);
                     }
                     const tris = earcut(flat, holeIdx.length > 0 ? holeIdx : undefined, 2);
-                    const inactiveFill: RGBA = rgba(100, 116, 139, 0.05);
+                    const inactiveFill: RGBA = isOtherHovered
+                        ? C_RECT_HOV_FILL
+                        : rgba(100, 116, 139, 0.05);
                     for (let i = 0; i < tris.length; i += 3) {
                         const ai = tris[i] * 2, bi = tris[i + 1] * 2, ci = tris[i + 2] * 2;
                         quads.push({
@@ -2558,15 +3285,31 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
 
                 // Outline edges in muted slate so the active room visually wins.
                 // Arc / Circle 由来 edge は分割線ではなく弧として滑らかに描画。
-                const inactiveStroke: RGBA = rgba(100, 116, 139, 0.65);
+                // ホバー/選択された辺はアクティブ Room と同じハイライト色で描画
+                // (= 非アクティブ Room の辺もホバー視認 / 選択視認できる)。
+                const inactiveStroke: RGBA = isOtherHovered
+                    ? C_RECT_HOV
+                    : rgba(100, 116, 139, 0.65);
+                const inactiveStrokeWidth = isOtherHovered ? 2 : 1.2;
                 const polyEdgeList = polygonEdges(poly);
                 const passiveEntById = new Map<string, SketchEntity>();
                 for (const en of otherRoom.entities ?? []) passiveEntById.set(en.id, en);
+                const hovEPassive = hoveredEdgeRef.current;
+                const isPassiveEdgeHov = (ei: number): boolean =>
+                    !!hovEPassive && hovEPassive.polyId === poly.id && hovEPassive.edgeIdx === ei;
+                const isPassiveEdgeSel = (ei: number): boolean =>
+                    sketchSel.some((s) => s.kind === "edge" && s.polyId === poly.id && s.edgeIdx === ei);
                 for (let pei = 0; pei < polyEdgeList.length; pei++) {
                     const [ai, bi] = polyEdgeList[pei];
                     const a = poly.outer[ai], b = poly.outer[bi];
                     const ownerId = poly.edgeOwners?.[pei];
                     const owner = ownerId ? passiveEntById.get(ownerId) : undefined;
+                    const selE = isPassiveEdgeSel(pei);
+                    const hovEd = !selE && isPassiveEdgeHov(pei);
+                    let col: RGBA = inactiveStroke;
+                    let width = inactiveStrokeWidth;
+                    if (selE) { col = C_HL_ORANGE; width = inactiveStrokeWidth + 1.5; }
+                    else if (hovEd) { col = C_EDGE_HOV; width = inactiveStrokeWidth + 1; }
                     if (owner && (owner.kind === "arc" || owner.kind === "circle")) {
                         const cx = owner.center[0], cy = owner.center[1];
                         const r = owner.radius;
@@ -2584,14 +3327,14 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                             const ny = cy + r * Math.sin(ang);
                             lines.push({
                                 ax: prevX, az: prevY, bx: nx, bz: ny,
-                                color: inactiveStroke, width: 1.2,
+                                color: col, width,
                             });
                             prevX = nx; prevY = ny;
                         }
                     } else {
                         lines.push({
                             ax: a[0], az: a[1], bx: b[0], bz: b[1],
-                            color: inactiveStroke, width: 1.2,
+                            color: col, width,
                         });
                     }
                 }
@@ -2602,7 +3345,7 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         const b = h[(i + 1) % h.length];
                         lines.push({
                             ax: a[0], az: a[1], bx: b[0], bz: b[1],
-                            color: inactiveStroke, width: 1.2,
+                            color: inactiveStroke, width: inactiveStrokeWidth,
                         });
                     }
                 }
@@ -2640,7 +3383,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         if (rm.polygons) {
             for (const poly of rm.polygons) {
                 const isSel = sel.includes(`poly:${poly.id}`);
-                const isHov = hovPolyId === poly.id && !isSel;
+                const isHov = hovPolyId === poly.id
+                    && hovPolySpaceId === rid
+                    && !isSel;
                 const isDrg = drag?.kind === "poly" && drag.polyId === poly.id;
                 const isOverlap = overlapping.has(poly.id);
                 const isCircleSketchSel = poly.shape?.type === "circle" && sketchSel.some(
@@ -2673,23 +3418,38 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 // render only in the canonical owner.
                 // 閉じ図形は wallIds.length === outer.length、開いたポリラインは
                 // wallIds.length === edges.length。polygonEdges() で統一的に判定。
+                // **drag 中は wall slab を描画しない**: drag 中は wall axis を
+                // 更新しない方針なので、polygon (オレンジ枠) は移動するが wall
+                // footprint は元の位置のまま固定され、視覚的に「離れた残骸」が
+                // 残ってしまう。drag 中はその残骸を消し、オレンジ polygon プレ
+                // ビューだけ見せる。mouseup で wallRegenerate が走り wall が
+                // 新位置に再生成される。
+                const isAnyDrag = !!drag;
                 const activeEdgeCount = polygonEdges(poly).length;
-                if (poly.wallIds && poly.wallIds.length === activeEdgeCount
+                if (!isAnyDrag
+                    && poly.wallIds && poly.wallIds.length === activeEdgeCount
                     && (poly.wallThickness != null
                         || (poly.innerThickness != null && poly.outerThickness != null))) {
                     const renderedWidsA = new Set<string>();
                     for (let i = 0; i < activeEdgeCount; i++) {
-                        const wid = poly.wallIds[i];
-                        if (!wid) continue;
-                        if (!isWallOwner(wid, poly.id)) continue;
-                        if (renderedWidsA.has(wid)) continue;
-                        renderedWidsA.add(wid);
-                        // 統合 footprint があればそちらを優先 (= 弧グループ wall)。
-                        const wallEl = els[wid] as WallElement | undefined;
-                        if (wallEl?.footprint && wallEl.footprint.length >= 3) {
-                            for (const q of buildFootprintSlabQuads(wallEl.footprint, wallEl.footprintHoles)) quads.push(q);
-                        } else {
-                            for (const q of buildWallSlabQuads(poly, i)) quads.push(q);
+                        // 1 つの polygon edge に複数 wall が紐づく場合 (= cross-poly
+                        // overlap で split されたケース) を取りこぼさないよう
+                        // wallsPerEdge を優先。未設定なら wallIds[i] にフォールバック。
+                        const widList = poly.wallsPerEdge?.[i] ?? [poly.wallIds[i]];
+                        for (const wid of widList) {
+                            if (!wid) continue;
+                            if (!isWallOwner(wid, poly.id)) continue;
+                            if (renderedWidsA.has(wid)) continue;
+                            renderedWidsA.add(wid);
+                            // wall.footprint があれば優先 (= JunctionGraph 確定形状)。
+                            // wall.footprint は §7 で全 wall に書かれているので、
+                            // ここに来ればほぼ常に this path を通る。
+                            const wallEl = els[wid] as WallElement | undefined;
+                            if (wallEl?.footprint && wallEl.footprint.length >= 3) {
+                                for (const q of buildFootprintSlabQuads(wallEl.footprint, wallEl.footprintHoles)) quads.push(q);
+                            } else {
+                                for (const q of buildWallSlabQuads(poly, i)) quads.push(q);
+                            }
                         }
                     }
                 }
@@ -2932,6 +3692,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         const owner = ownerId ? entByIdM.get(ownerId) : undefined;
                         const tPair: [number, number] = [skip.t0, skip.t1];
                         for (const t of tPair) {
+                            // 0 or 1 (= 端点) は既に polygon 頂点ハンドルが
+                            // 描画されているのでマーカ重複を避ける。
+                            if (t <= 1e-6 || t >= 1 - 1e-6) continue;
                             const tc = Math.max(0, Math.min(1, t));
                             let wx: number, wz: number;
                             if (owner && (owner.kind === "arc" || owner.kind === "circle")) {
@@ -2981,7 +3744,12 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 if (!isCircle) {
                     for (let i = 0; i < n; i++) {
                         if (isCurveInteriorVertex(poly, i)) continue; // 弧/円の途中点はハンドルを出さない
-                        if (isArcVertex(poly.outer, i)) continue;
+                        // edgeOwners ベースの判定 (= isCurveInteriorVertex) で
+                        // 「弧/円の途中点」は既に除外済み。残った near-180° の
+                        // 頂点は壁トリムの切断点など意図的に挿入した実頂点なので
+                        // ハンドルを出す。`isArcVertex` の角度ヒューリスティックは
+                        // edgeOwners が無い旧データに対してのみフォールバックで使う。
+                        if (!poly.edgeOwners && isArcVertex(poly.outer, i)) continue;
                         const [wx, wz] = poly.outer[i];
                         const isCh = hovPVtx?.polyId === poly.id && hovPVtx.vertexIdx === i;
                         const selP = isVertSel(i);
@@ -3444,6 +4212,46 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         if (mode === "polyline" || mode === "wallPath") {
             const pts = polyDraftPointsRef.current;
             const cursor = mw;
+
+            // ── 45° ポーラーガイド線 (wallPath のみ、1点以上確定後) ──────
+            if (mode === "wallPath" && pts.length > 0) {
+                const last = pts[pts.length - 1];
+                const POLAR_STEP = Math.PI / 4;
+                const POLAR_TOL  = 10 * Math.PI / 180; // ±10°
+                const GUIDE_LEN  = 200; // world meters — クリッピングされる
+
+                // カーソルから最近接レイを判定してハイライト
+                let activeIdx = -1;
+                if (cursor) {
+                    const dx = cursor[0] - last[0];
+                    const dz = cursor[1] - last[1];
+                    if (Math.hypot(dx, dz) > 0.05) {
+                        const raw = Math.atan2(dz, dx);
+                        const nearest = Math.round(raw / POLAR_STEP);
+                        let diff = raw - nearest * POLAR_STEP;
+                        while (diff >  Math.PI) diff -= Math.PI * 2;
+                        while (diff < -Math.PI) diff += Math.PI * 2;
+                        if (Math.abs(diff) < POLAR_TOL) {
+                            activeIdx = ((nearest % 8) + 8) % 8;
+                        }
+                    }
+                }
+
+                for (let i = 0; i < 8; i++) {
+                    const angle  = i * POLAR_STEP;
+                    const isActive = i === activeIdx;
+                    lines.push({
+                        ax: last[0], az: last[1],
+                        bx: last[0] + Math.cos(angle) * GUIDE_LEN,
+                        bz: last[1] + Math.sin(angle) * GUIDE_LEN,
+                        color: isActive ? C_POLAR_ACTIVE : C_POLAR_GUIDE,
+                        width: isActive ? 1.0 : 0.7,
+                        dash: isActive ? 5 : 8,
+                        dashRatio: 0.45,
+                    });
+                }
+            }
+
             // Solid committed segments
             for (let i = 0; i < pts.length - 1; i++) {
                 lines.push({
@@ -3516,20 +4324,12 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             });
         }
 
-        // Grid snap indicator (cross marker + axis-alignment guide lines)
-        // 通芯 / 原点 / 軸整列のスナップシンボルは、SketchMarker.radius が
-        // CSS pixel 単位 (= カメラ位置・ズームに非依存) なので 12px 固定で
-        // 表示する (SketchOverlayRenderer の marker shader 仕様)。
-        const SNAP_MARKER_PX = 12;
         const snapInfo = gridSnapInfoRef.current;
         if (snapInfo) {
             const [sx, sz] = snapInfo.point;
-            if (snapInfo.kind === "obj") {
-                markers.push({
-                    wx: sx, wz: sz, radius: SNAP_MARKER_PX, shape: "square",
-                    fill: C_SNAP_OBJ, stroke: C_WHITE, strokeWidth: 1.5,
-                });
-            } else {
+            // axis 整列のみガイド線を追加描画。マーカー本体は SNAP_MARKER_STYLES
+            // の表 (../snapStyle.ts) から kind 別に色 / 形状を引く。
+            if (snapInfo.kind === "axis") {
                 if (snapInfo.refH) {
                     lines.push({
                         ax: snapInfo.refH[0], az: snapInfo.refH[1],
@@ -3544,11 +4344,16 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         color: C_SNAP_AXIS, width: 1,
                     });
                 }
-                markers.push({
-                    wx: sx, wz: sz, radius: SNAP_MARKER_PX, shape: "circle",
-                    fill: C_SNAP_AXIS, stroke: C_WHITE, strokeWidth: 1.5,
-                });
             }
+            const style = SNAP_MARKER_STYLES[snapInfo.kind];
+            markers.push({
+                wx: sx, wz: sz,
+                radius: style.radius,
+                shape: style.shape,
+                fill: style.fillRgba,
+                stroke: style.strokeRgba,
+                strokeWidth: style.strokeWidth,
+            });
         }
 
         return { lines, quads, markers };
@@ -3567,19 +4372,303 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     const maybeRealtimeRegenWalls = (reason: string, seedPolyIds?: string[]) => {
         const s = useAppState.getState();
         if (!s.realtimeWallGen) return;
-        // eslint-disable-next-line no-console
-        console.log(
-            `[realtime-walls] regen triggered: ${reason}` +
-            (seedPolyIds && seedPolyIds.length
-                ? ` seeds=[${seedPolyIds.map((p) => p.slice(0, 6)).join(",")}]`
-                : ""),
-        );
         regenerateAllWalls({
             wallThicknessMm: s.wallThicknessMm,
             circleWallAngleDeg: s.circleWallAngleDeg,
             wallReferenceMode: s.wallReferenceMode,
             seedPolyIds,
         });
+    };
+
+    /**
+     * 壁トリム (= 部分削除) の確定処理。エッジを **3 つのサブエッジ** に分割
+     * した上で中央サブエッジに full-skip を貼る。サブエッジ境界の点は polygon
+     * の通常頂点として材料化されるので、ドラッグ・距離拘束・グリッドスナップ
+     * がすべて使える。
+     *
+     * 処理:
+     *   1. 元 SketchEntity (line / polyline) を T0/T1 で 3 分割 (= entity の
+     *      points 配列に 2 点挿入。line の場合は polyline 化)
+     *   2. setSpaceEntities で同期再 derive → 新しい polygon outer を取得
+     *   3. 新しい中央サブエッジ idx を特定 → wallSkips に full-skip を push
+     *   4. 既存 polygon-targeting 拘束を新エッジ index に再マップ。Horizontal
+     *      / Vertical は 3 サブエッジ全てに複製 (= 元の方向性を維持)
+     *   5. サブエッジ間に Collinear 拘束を貼る (= 切断点が元エッジの直線上を
+     *      スライドするだけになる)
+     *
+     * arc / circle entity 由来エッジ、もしくはチェイン照合に失敗した場合は
+     * `false` を返す → 呼び出し側は仮想 wallSkip (= 2D 表示のみ) にフォール
+     * バックする。
+     */
+    const promoteWallSkipToVertices = (params: {
+        spaceId: string;
+        polyId: string;
+        edgeIdx: number;
+        Va: Vec2;
+        Vb: Vec2;
+        T0: Vec2;
+        T1: Vec2;
+        t0: number;
+        t1: number;
+    }): boolean => {
+        const { spaceId, polyId, edgeIdx, Va, Vb, T0, T1 } = params;
+        const eps = 1e-7;
+        const sameVec2 = (x: Vec2, y: Vec2) =>
+            Math.abs(x[0] - y[0]) < eps && Math.abs(x[1] - y[1]) < eps;
+        const sqDist = (x: Vec2, y: Vec2) =>
+            (x[0] - y[0]) * (x[0] - y[0]) + (x[1] - y[1]) * (x[1] - y[1]);
+
+        // ── ソルバ抑制 ─────────────────────────────────────────────────
+        // この関数の中では entity 更新 / polygon 更新 / 拘束追加削除を多段で
+        // 行う。途中で ソルバが走ると、新エッジに古い拘束 (= 旧 edgeIdx 参照)
+        // が適用されて polygon が捻じれる。`setSolverDragHint` にダミーピン
+        // を入れて runSketchSolver を一律で抑制し、関数末尾で clear して
+        // 「全状態が一貫した最終形」で 1 回だけ solve させる。
+        const SUPPRESS_PIN: import("../../application/AppState").SolverDragPin = {
+            spaceId: spaceId as ElementId,
+            polyId,
+            vertexIdx: -1,
+            x: 0, y: 0,
+        };
+        setSolverDragHint([SUPPRESS_PIN]);
+        let okFinish = false;
+        try {
+
+        const sp = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+        if (!sp) return false;
+        const oldPoly = sp.polygons.find((p) => p.id === polyId);
+        if (!oldPoly) return false;
+        const oldOuter = oldPoly.outer.map((p) => [p[0], p[1]] as Vec2);
+        const oldEdges = polygonEdges(oldPoly).map((e) => [e[0], e[1]] as [number, number]);
+        const oldWallSkips: WallSkip[] = (oldPoly.wallSkips ?? []).map((s) => ({ ...s }));
+        const ownerId = oldPoly.edgeOwners?.[edgeIdx];
+        const owner = ownerId ? sp.entities?.find((e) => e.id === ownerId) : undefined;
+        if (!owner) return false;
+
+        // 弦上で T0 / T1 のうち Va に近い方を pNear、遠い方を pFar とする。
+        const dT0Va = sqDist(T0, Va);
+        const dT1Va = sqDist(T1, Va);
+        const pNear: Vec2 = dT0Va < dT1Va ? T0 : T1;
+        const pFar: Vec2 = dT0Va < dT1Va ? T1 : T0;
+
+        // 元 entity を 2 点挿入で更新する。kind === "line" なら polyline 化。
+        let newEntity: SketchEntity;
+        if (owner.kind === "line") {
+            const VaIsP0 = sameVec2(Va, owner.p0);
+            // entity の点列順序 (p0 → p1) で挿入順を決める。Va が p0 なら
+            // [p0, pNear, pFar, p1]、Va が p1 なら [p0, pFar, pNear, p1]。
+            const newPoints: Vec2[] = VaIsP0
+                ? [[owner.p0[0], owner.p0[1]], pNear, pFar, [owner.p1[0], owner.p1[1]]]
+                : [[owner.p0[0], owner.p0[1]], pFar, pNear, [owner.p1[0], owner.p1[1]]];
+            newEntity = {
+                id: owner.id,
+                kind: "polyline",
+                points: newPoints,
+                closed: false,
+                construction: owner.construction,
+            };
+        } else if (owner.kind === "polyline") {
+            // polyline.points 上で Va, Vb がどの sub-segment に対応するかを探す。
+            const pts = owner.points;
+            const n = pts.length;
+            const segCount = owner.closed ? n : n - 1;
+            let segIdx = -1;
+            let segReversed = false;
+            for (let i = 0; i < segCount; i++) {
+                const j = owner.closed ? (i + 1) % n : i + 1;
+                const pi = pts[i], pj = pts[j];
+                if (sameVec2(pi, Va) && sameVec2(pj, Vb)) { segIdx = i; segReversed = false; break; }
+                if (sameVec2(pi, Vb) && sameVec2(pj, Va)) { segIdx = i; segReversed = true; break; }
+            }
+            if (segIdx < 0) return false;
+            const insertAt = segIdx + 1;
+            // entity 順 (segIdx → segIdx+1) で並ぶ向きに合わせて挿入。reversed
+            // なら entity の points[segIdx] = Vb なので pFar が先。
+            const ins0 = segReversed ? pFar : pNear;
+            const ins1 = segReversed ? pNear : pFar;
+            const newPoints = [
+                ...pts.slice(0, insertAt).map((p) => [p[0], p[1]] as Vec2),
+                ins0, ins1,
+                ...pts.slice(insertAt).map((p) => [p[0], p[1]] as Vec2),
+            ];
+            newEntity = { ...owner, points: newPoints };
+        } else {
+            // arc / circle: 昇格未対応 (フォールバック)。
+            return false;
+        }
+
+        // ── Apply entity update via setSpaceEntities (= 同期再 derive) ────
+        setSpaceEntities(spaceId, (es) => es.map((e) => (e.id === owner.id ? newEntity : e)));
+
+        const updatedSpace = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+        const newPoly = updatedSpace?.polygons?.find((p) => p.id === polyId);
+        if (!newPoly) return false;
+        const newEdges = polygonEdges(newPoly);
+
+        // 新 polygon outer 上で Va, Vb, pNear, pFar の頂点 idx を世界座標で見つける。
+        const idxOfWorld = (target: Vec2): number => {
+            for (let i = 0; i < newPoly.outer.length; i++) {
+                if (sameVec2(newPoly.outer[i], target)) return i;
+            }
+            return -1;
+        };
+        const niVa = idxOfWorld(Va);
+        const niVb = idxOfWorld(Vb);
+        const niPNear = idxOfWorld(pNear);
+        const niPFar = idxOfWorld(pFar);
+        if (niVa < 0 || niVb < 0 || niPNear < 0 || niPFar < 0) return false;
+
+        const findEdgeByVerts = (a: number, b: number): number => {
+            for (let i = 0; i < newEdges.length; i++) {
+                const [ea, eb] = newEdges[i];
+                if ((ea === a && eb === b) || (ea === b && eb === a)) return i;
+            }
+            return -1;
+        };
+        const subE0 = findEdgeByVerts(niVa, niPNear);
+        const subEMid = findEdgeByVerts(niPNear, niPFar);
+        const subE2 = findEdgeByVerts(niPFar, niVb);
+        if (subE0 < 0 || subEMid < 0 || subE2 < 0) return false;
+
+        // 旧 edgeIdx → 新 edgeIdx を世界座標で引くマップ。split 対象 (= edgeIdx)
+        // はマップに含めない (= 旧 wallSkip の元エッジ参照は破棄して新 full skip
+        // に置き換える)。
+        const oldToNewEdge = new Map<number, number>();
+        for (let oi = 0; oi < oldEdges.length; oi++) {
+            if (oi === edgeIdx) continue;
+            const [oai, obi] = oldEdges[oi];
+            const oa = oldOuter[oai];
+            const ob = oldOuter[obi];
+            for (let ni = 0; ni < newEdges.length; ni++) {
+                const [nai, nbi] = newEdges[ni];
+                const na = newPoly.outer[nai];
+                const nb = newPoly.outer[nbi];
+                if ((sameVec2(oa, na) && sameVec2(ob, nb))
+                    || (sameVec2(oa, nb) && sameVec2(ob, na))) {
+                    oldToNewEdge.set(oi, ni);
+                    break;
+                }
+            }
+        }
+        // 旧 vertexIdx → 新 vertexIdx (= 世界座標一致)。
+        const oldToNewVertex = new Map<number, number>();
+        for (let oi = 0; oi < oldOuter.length; oi++) {
+            const ni = idxOfWorld(oldOuter[oi]);
+            if (ni >= 0) oldToNewVertex.set(oi, ni);
+        }
+
+        // 旧 wallSkips を再マップ。split 対象 edge の旧 skip は破棄 (= 新しい
+        // full skip に置き換わる)。
+        const remappedSkips: WallSkip[] = [];
+        for (const skip of oldWallSkips) {
+            if (skip.edgeIdx === edgeIdx) continue;
+            const ni = oldToNewEdge.get(skip.edgeIdx);
+            if (ni !== undefined) remappedSkips.push({ ...skip, edgeIdx: ni });
+        }
+        remappedSkips.push({ edgeIdx: subEMid, t0: 0, t1: 1 });
+
+        // ── 拘束の再マップ ─────────────────────────────────────────────
+        const allConstraints = useAppState.getState().constraints;
+        for (const cid in allConstraints) {
+            const c = allConstraints[cid];
+            // 当該 polygon を参照しないなら触らない。
+            const refsThisPoly = c.targets.some((t) =>
+                (t.kind === "SketchPoint" || t.kind === "SketchEdge" || t.kind === "SketchCircle")
+                && t.polyId === polyId,
+            );
+            if (!refsThisPoly) continue;
+
+            // ── target 列を辿り、再マップ後の targets 候補 (= 複製パターン)
+            //    を replicaTargets に積み上げる。Horizontal / Vertical で split
+            //    edge を参照する場合は 3 サブエッジ分に複製。
+            let replicaTargets: ConstraintTarget[][] = [c.targets.map((t) => ({ ...t }))];
+            let drop = false;
+            for (let ti = 0; ti < c.targets.length; ti++) {
+                const t = c.targets[ti];
+                if (t.kind === "SketchPoint" && t.polyId === polyId) {
+                    const newVi = oldToNewVertex.get(t.vertexIdx);
+                    if (newVi === undefined) { drop = true; break; }
+                    for (const r of replicaTargets) (r[ti] as any).vertexIdx = newVi;
+                } else if (t.kind === "SketchEdge" && t.polyId === polyId) {
+                    if (t.edgeIdx === edgeIdx) {
+                        // split 対象。方向・配向系の拘束は **両端のサブエッジ
+                        // (subE0, subE2) に複製** する (= 中央の subEMid は壁を
+                        // 削除する区間なので拘束対象から外す)。両端が同じ方向
+                        // 拘束を持つことで、subEMid (= 共有頂点 pNear, pFar の
+                        // 端点) も自動的に元エッジの直線上に保たれる → 別途
+                        // Collinear 拘束は不要。
+                        const directionTypes = new Set<string>([
+                            "Horizontal", "Vertical",
+                            "Parallel", "Perpendicular",
+                            "Collinear", "Angle", "PerpDistance",
+                        ]);
+                        if (directionTypes.has(c.type)) {
+                            const subs = [subE0, subE2];
+                            const next: ConstraintTarget[][] = [];
+                            for (const r of replicaTargets) {
+                                for (const sub of subs) {
+                                    const cp = r.map((x) => ({ ...x }));
+                                    (cp[ti] as any).edgeIdx = sub;
+                                    next.push(cp);
+                                }
+                            }
+                            replicaTargets = next;
+                        } else {
+                            // Length / EqualLength は分割で意味を失うので破棄。
+                            drop = true;
+                            break;
+                        }
+                    } else {
+                        const newEi = oldToNewEdge.get(t.edgeIdx);
+                        if (newEi === undefined) { drop = true; break; }
+                        for (const r of replicaTargets) (r[ti] as any).edgeIdx = newEi;
+                    }
+                }
+                // SketchCircle / SketchEntity / WallAxis / Grid / Origin など
+                // edge / vertex に依存しない target はそのまま。
+            }
+
+            if (drop) {
+                executeCommand(new RemoveConstraintCommand(cid));
+            } else {
+                executeCommand(new RemoveConstraintCommand(cid));
+                for (const targets of replicaTargets) {
+                    executeCommand(new AddConstraintCommand({
+                        id: generateConstraintId(),
+                        type: c.type,
+                        targets,
+                        value: c.value,
+                    }));
+                }
+            }
+        }
+
+        // 旧 split edge の方向拘束 (Horizontal / Vertical / Parallel / Perpendicular)
+        // が両端の subE0 / subE2 に複製されるので、両端は元エッジと同方向に
+        // 保たれる。共有頂点 pNear / pFar が両端の端点でもあるため、自動的に
+        // 元エッジの直線上にとどまる → 追加の Collinear 拘束は不要。
+
+        // ── 最終 polygon (wallSkips 付け替え) ─────────────────────────
+        const final = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+        if (final) {
+            const finalPolys = final.polygons.map((p) => {
+                if (p.id !== polyId) return p;
+                return { ...p, wallSkips: remappedSkips };
+            });
+            updateElement(spaceId as ElementId, {
+                polygons: finalPolys,
+                dirtyFlags: new Set([...(final.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+            } as any);
+        }
+        okFinish = true;
+        return true;
+
+        } finally {
+            // ソルバ抑制を解除。clear すると pending solve が 1 回だけ走り、
+            // 全状態 (= entity / polygon / 拘束) が一貫した形でソルブされる。
+            setSolverDragHint(null);
+            void okFinish;
+        }
     };
 
     /**
@@ -3653,6 +4742,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             `closed-entity ${entity.kind}`,
             polyId ? [polyId] : undefined,
         );
+        // 新規 polygon を「最後に操作した polygon」として登録し、
+        // 他 polygon と重なっていれば merge / clip ボタンを表示できるようにする。
+        if (polyId) setLastDraggedPolyId(polyId);
         return { roomId: target.roomId, polyId };
     };
 
@@ -3695,6 +4787,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     // Finalize the polyline draft as a closed PolylineEntity (auto-derives polygon).
     const commitPolyDraft = (points: [number, number][]) => {
         if (points.length < 3) return;
+        // polyline モードでも incremental 3D 壁描画 (wallPath 機構を流用) を行うため、
+        // 確定時には先に live wallPath 由来の open polyline と仮壁を破棄する。
+        discardLiveWallPathDraft();
         const entity: PolylineEntity = {
             id: generateId(),
             kind: "polyline",
@@ -3732,351 +4827,6 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         wallPathDraftSnapsRef.current = [];
     };
 
-    /**
-     * Mode 2 (shared-edge) で、最初と最後の WallPath 点が同じ既存ポリゴンに
-     * スナップしているとき、**そのポリゴンの外周を CW (= 逆 CCW) でたどる**
-     * 中間頂点列を返す。これを WallPath 点列の末尾に連結すると、新 Room の
-     * outer は「WallPath で外側を回って → 元部屋の外周で内側に戻る」CCW
-     * 多角形になる。
-     *
-     *  - 最後の点 B を **global t** 表示 (vertex 0=t0, vertex 1=t1, edge i 上の
-     *    比率 r なら t=i+r) して、B → A への CW 経路 (= t 降順) を辿る。
-     *  - 中間頂点 = (t_A, t_B) または (-∞, t_B) ∪ (t_A, n) に厳密に含まれる
-     *    整数 t に対応する元頂点。
-     *  - A・B が同じ辺なら中間ゼロ → outer は WallPath 点列のみで、暗黙の
-     *    閉じ辺が元部屋の壁と共線 (= 共有エッジ判定対象)。
-     */
-    type WallPathSnapTargetSafeForTrace =
-        | { kind: "polyVertex"; spaceId: string; polyId: string; targetVertexIdx: number }
-        | { kind: "polyEdge"; spaceId: string; polyId: string; targetEdgeIdx: number; t: number };
-
-    /**
-     * 元部屋の外周を `direction` 方向にたどる中間頂点列。
-     *  - "cw": 始点 B → 終点 A への CW (= 逆 CCW = t 降順)。
-     *  - "ccw": B → A への CCW (= t 昇順)。
-     *
-     * 各点を **global t** 表示 (vertex i = t i, edge i 上の比率 r なら t=i+r)。
-     */
-    const computeOuterTraceIntermediate = (
-        sourcePoly: RoomPolygon,
-        firstSnap: WallPathSnapTargetSafeForTrace,
-        lastSnap: WallPathSnapTargetSafeForTrace,
-        direction: "cw" | "ccw",
-    ): Vec2[] => {
-        const n = sourcePoly.outer.length;
-        if (n < 3) return [];
-        const tOf = (s: WallPathSnapTargetSafeForTrace): number =>
-            s.kind === "polyVertex"
-                ? s.targetVertexIdx
-                : s.targetEdgeIdx + Math.max(0, Math.min(1, s.t));
-        const tA = tOf(firstSnap);
-        const tB = tOf(lastSnap);
-        const eps = 1e-6;
-        if (Math.abs(tA - tB) < eps) return [];
-        const indices: number[] = [];
-        if (direction === "cw") {
-            // 降順 (= reverse CCW)
-            if (tA + eps < tB) {
-                for (let i = Math.floor(tB - eps); i >= Math.ceil(tA + eps); i--) {
-                    indices.push(((i % n) + n) % n);
-                }
-            } else {
-                for (let i = Math.floor(tB - eps); i >= 0; i--) {
-                    indices.push(((i % n) + n) % n);
-                }
-                for (let i = n - 1; i >= Math.ceil(tA + eps); i--) {
-                    indices.push(((i % n) + n) % n);
-                }
-            }
-        } else {
-            // 昇順 (= forward CCW)
-            if (tB + eps < tA) {
-                for (let i = Math.ceil(tB + eps); i <= Math.floor(tA - eps); i++) {
-                    indices.push(((i % n) + n) % n);
-                }
-            } else {
-                for (let i = Math.ceil(tB + eps); i <= n - 1; i++) {
-                    indices.push(((i % n) + n) % n);
-                }
-                for (let i = 0; i <= Math.floor(tA - eps); i++) {
-                    indices.push(((i % n) + n) % n);
-                }
-            }
-        }
-        return indices.map((idx) =>
-            [sourcePoly.outer[idx][0], sourcePoly.outer[idx][1]] as Vec2,
-        );
-    };
-
-    /** 多角形の符号付き面積 (CCW=正, CW=負)。Shoelace 公式。 */
-    const signedPolyArea = (verts: Vec2[]): number => {
-        let a = 0;
-        for (let i = 0; i < verts.length; i++) {
-            const j = (i + 1) % verts.length;
-            a += verts[i][0] * verts[j][1] - verts[j][0] * verts[i][1];
-        }
-        return a / 2;
-    };
-
-    /**
-     * Mode 3 (cross-polygon) で、WallPath の最初/最後が **異なる polygon** の壁に
-     * スナップしている場合の閉じ方。複数 Room の壁が共有されているとき、
-     * 単一 polygon の outer をたどるだけでは囲い切れないので、関係する全 Room
-     * polygon の **union 外周** をたどる。
-     *
-     * アルゴリズム:
-     *  1. 全 Space の closed polygon を集めて `polygonClipping.union` で合成。
-     *  2. 結果の各 outer ring について、最初の WallPath 点 A と最後の WallPath
-     *     点 B が共にリング上にあるものを探す (≤1mm 距離許容)。
-     *  3. 見つかったリングで A と B の **global t** (= 整数頂点 + edge 上の比) を
-     *     計算。
-     *  4. B → A を **forward (t 昇順)** と **backward (t 降順)** の 2 通りで
-     *     辿り、それぞれ中間頂点列を取得 (端点 A, B は WallPath 側で持つので
-     *     除外する)。
-     *  5. WallPath 点列に各中間列を連結して 2 つの候補多角形を構築。
-     *  6. 面積が小さい方を採用、CCW 正規化して返す。
-     *
-     * 失敗 (= 該当リングが無い) なら null。呼び出し側は WallPath だけで
-     * 閉じる fallback を使う。
-     */
-    const computeUnionClosure = (
-        points: [number, number][],
-        elements: Record<string, any>,
-    ): Vec2[] | null => {
-        if (points.length < 2) return null;
-        const A: Vec2 = [points[0][0], points[0][1]];
-        const B: Vec2 = [points[points.length - 1][0], points[points.length - 1][1]];
-        const wpVerts: Vec2[] = points.map((p) => [p[0], p[1]] as Vec2);
-
-        // 1. 全 Space の closed polygon を収集して union 入力に整形。
-        type Coords = [number, number][][];
-        const inputs: Coords[] = [];
-        for (const eid in elements) {
-            const el = elements[eid];
-            if (!el || el.type !== "Space") continue;
-            const sp = el as SpaceElement;
-            for (const p of sp.polygons ?? []) {
-                if (!isPolygonClosed(p)) continue;
-                if (!p.outer || p.outer.length < 3) continue;
-                const ring = p.outer.map(([x, y]) => [x, y] as [number, number]);
-                ring.push([ring[0][0], ring[0][1]]);
-                const rings: Coords = [ring];
-                for (const h of p.holes ?? []) {
-                    if (h.length < 3) continue;
-                    const hh = h.map(([x, y]) => [x, y] as [number, number]);
-                    hh.push([hh[0][0], hh[0][1]]);
-                    rings.push(hh);
-                }
-                inputs.push(rings);
-            }
-        }
-        if (inputs.length === 0) return null;
-        const [first, ...rest] = inputs;
-        let unioned: ReturnType<typeof polygonClipping.union>;
-        try {
-            unioned = polygonClipping.union(first as any, ...(rest as any[]));
-        } catch {
-            return null;
-        }
-        if (!unioned || unioned.length === 0) return null;
-
-        // 2. 各 outer ring 上で A・B を探す。最も両者が乗っているリングを採用。
-        const TOL = 1e-3; // 1 mm
-        type RingHit = { ring: Vec2[]; tA: number; tB: number };
-        let best: RingHit | null = null;
-        let bestErr = Infinity;
-        for (const polygon of unioned) {
-            if (!polygon || polygon.length === 0) continue;
-            const rawRing = polygon[0]; // outer ring (first/last point duplicated)
-            if (!rawRing || rawRing.length < 4) continue;
-            // 末尾の重複点を取り除いた純粋な頂点列。
-            const ring: Vec2[] = [];
-            for (let i = 0; i < rawRing.length - 1; i++) {
-                ring.push([rawRing[i][0], rawRing[i][1]] as Vec2);
-            }
-            const n = ring.length;
-            if (n < 3) continue;
-            // A, B 各点の global t と segment 距離を求める。
-            const tOf = (pt: Vec2): { t: number; err: number } => {
-                let bestT = 0, bestD2 = Infinity;
-                for (let i = 0; i < n; i++) {
-                    const a = ring[i], b = ring[(i + 1) % n];
-                    const dx = b[0] - a[0], dy = b[1] - a[1];
-                    const segLen2 = dx * dx + dy * dy;
-                    if (segLen2 < 1e-18) continue;
-                    let r = ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / segLen2;
-                    r = Math.max(0, Math.min(1, r));
-                    const px = a[0] + dx * r, py = a[1] + dy * r;
-                    const d2 = (pt[0] - px) ** 2 + (pt[1] - py) ** 2;
-                    if (d2 < bestD2) {
-                        bestD2 = d2;
-                        bestT = i + r;
-                    }
-                }
-                return { t: bestT, err: Math.sqrt(bestD2) };
-            };
-            const ha = tOf(A);
-            const hb = tOf(B);
-            if (ha.err > TOL || hb.err > TOL) continue;
-            const totalErr = ha.err + hb.err;
-            if (totalErr < bestErr) {
-                bestErr = totalErr;
-                best = { ring, tA: ha.t, tB: hb.t };
-            }
-        }
-        if (!best) return null;
-
-        // 3. ring 上で B → A の中間頂点を 2 方向で取得。
-        const ring = best.ring;
-        const n = ring.length;
-        const eps = 1e-6;
-        const collectIndices = (direction: "forward" | "backward"): number[] => {
-            const tA = best!.tA, tB = best!.tB;
-            const indices: number[] = [];
-            if (Math.abs(tA - tB) < eps) return indices;
-            if (direction === "forward") {
-                // t 昇順 (= 通常の ring 順)。B → A。
-                if (tA + eps > tB) {
-                    for (let i = Math.ceil(tB + eps); i <= Math.floor(tA - eps); i++) {
-                        indices.push(((i % n) + n) % n);
-                    }
-                } else {
-                    for (let i = Math.ceil(tB + eps); i <= n - 1; i++) {
-                        indices.push(((i % n) + n) % n);
-                    }
-                    for (let i = 0; i <= Math.floor(tA - eps); i++) {
-                        indices.push(((i % n) + n) % n);
-                    }
-                }
-            } else {
-                // t 降順。B → A。
-                if (tA + eps < tB) {
-                    for (let i = Math.floor(tB - eps); i >= Math.ceil(tA + eps); i--) {
-                        indices.push(((i % n) + n) % n);
-                    }
-                } else {
-                    for (let i = Math.floor(tB - eps); i >= 0; i--) {
-                        indices.push(((i % n) + n) % n);
-                    }
-                    for (let i = n - 1; i >= Math.ceil(tA + eps); i--) {
-                        indices.push(((i % n) + n) % n);
-                    }
-                }
-            }
-            return indices;
-        };
-        const interFwd = collectIndices("forward").map((i) =>
-            [ring[i][0], ring[i][1]] as Vec2,
-        );
-        const interBwd = collectIndices("backward").map((i) =>
-            [ring[i][0], ring[i][1]] as Vec2,
-        );
-
-        // 4. 候補を構築 → 面積最小を採用 → CCW 正規化。
-        const candFwd = [...wpVerts, ...interFwd];
-        const candBwd = [...wpVerts, ...interBwd];
-        const aFwd = Math.abs(signedPolyArea(candFwd));
-        const aBwd = Math.abs(signedPolyArea(candBwd));
-        let chosen = aFwd <= aBwd ? candFwd : candBwd;
-        if (chosen.length < 3) return null;
-        if (signedPolyArea(chosen) < 0) {
-            chosen = [...chosen].reverse();
-        }
-        // eslint-disable-next-line no-console
-        console.log(
-            `[wallPath/closed] cross-polygon mode: areaFwd=${aFwd.toFixed(3)} ` +
-            `areaBwd=${aBwd.toFixed(3)} → picked ${aFwd <= aBwd ? "forward" : "backward"} ` +
-            `(${chosen.length} verts, ringSize=${n})`,
-        );
-        return chosen;
-    };
-
-    /**
-     * WallPath が閉じた図形を成した場合に、単独壁ではなく **新しい Room**
-     * として確定する。closure の種別 (= `detectWallPathClosure` の戻り値) に
-     * 応じて outer を組み立て:
-     *  - "loopback": WallPath 点列だけ (= 自己閉)。
-     *  - "shared-edge": WallPath 点列 + 元部屋の外周中間頂点 (= 元の壁の
-     *    スケッチ線をそのまま使う)。これにより新 Room の閉じ辺は元部屋の
-     *    壁と完全に重なり、cluster sub-derivation が共有エッジとして自然に
-     *    検出 → 新規に壁を勝手に追加せず、既存壁を共用する形になる。
-     *  - "cross-polygon": WallPath が **2 つ以上の異なる Room polygon** の壁に
-     *    跨ってスナップしているケース。全 Room の union 外周をたどり、最も
-     *    面積が小さくなる方向で閉じる。隣接 Room の共有壁を再利用する。
-     */
-    const commitWallPathAsClosedRoom = (points: [number, number][]) => {
-        // mode 判別 (commit 直前に再評価)。snaps をスナップショットに退避。
-        const closureMode = detectWallPathClosure(points);
-        const snapsCopy = wallPathDraftSnapsRef.current.slice();
-        // live polygon と壁を片付けてから entity-driven の閉ポリゴン経路へ移譲。
-        discardLiveWallPathDraft();
-        wallPathDraftSnapsRef.current = [];
-        setPolyDraftPoints([]);
-        setMouseWorld(null);
-        setGridSnapInfo(null);
-        if (points.length < 3) {
-            setRoomEditMode("select");
-            return;
-        }
-        const wpVerts: Vec2[] = points.map((p) => [p[0], p[1]] as Vec2);
-        let outer: Vec2[] = wpVerts;
-        if (closureMode === "shared-edge") {
-            const fst = snapsCopy[0];
-            const lst = snapsCopy[points.length - 1];
-            if (fst && lst && fst.polyId === lst.polyId) {
-                // 元部屋を polyId で逆引き。
-                const live = useAppState.getState().elements;
-                let sourcePoly: RoomPolygon | null = null;
-                for (const eid in live) {
-                    const el = live[eid];
-                    if (!el || el.type !== "Space") continue;
-                    const sp = el as SpaceElement;
-                    const f = sp.polygons?.find((p) => p.id === fst.polyId);
-                    if (f) { sourcePoly = f; break; }
-                }
-                if (sourcePoly) {
-                    // CW (逆 CCW) と CCW (順 CCW) の 2 通りで閉じ、面積が
-                    // 小さい方を採用する。これで「元部屋の壁を共有して
-                    // 切り出される最小面領域」が常に選ばれる (= ユーザー
-                    // 仕様)。
-                    const interCW = computeOuterTraceIntermediate(
-                        sourcePoly, fst, lst, "cw");
-                    const interCCW = computeOuterTraceIntermediate(
-                        sourcePoly, fst, lst, "ccw");
-                    const candCW = [...wpVerts, ...interCW];
-                    const candCCW = [...wpVerts, ...interCCW];
-                    const aCW = Math.abs(signedPolyArea(candCW));
-                    const aCCW = Math.abs(signedPolyArea(candCCW));
-                    let chosen = aCW <= aCCW ? candCW : candCCW;
-                    // CCW (= 正の符号付き面積) に正規化。
-                    if (signedPolyArea(chosen) < 0) {
-                        chosen = [...chosen].reverse();
-                    }
-                    outer = chosen;
-                    // eslint-disable-next-line no-console
-                    console.log(
-                        `[wallPath/closed] shared-edge mode: areaCW=${aCW.toFixed(3)} ` +
-                        `areaCCW=${aCCW.toFixed(3)} → picked ${aCW <= aCCW ? "CW" : "CCW"} ` +
-                        `(${chosen.length} verts)`,
-                    );
-                }
-            }
-        } else if (closureMode === "cross-polygon") {
-            const live = useAppState.getState().elements;
-            const closed = computeUnionClosure(points, live);
-            if (closed) {
-                outer = closed;
-            }
-        }
-        const entity: PolylineEntity = {
-            id: generateId(),
-            kind: "polyline",
-            points: outer,
-            closed: true,
-        };
-        commitClosedEntity(entity);
-        setRoomEditMode("select");
-    };
 
     /**
      * 既存 polygon の指定エッジを Arc に変換する。実装方針:
@@ -4092,40 +4842,12 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         chord: ArcEdgeChord,
         cursor: Vec2,
     ): boolean => {
-        const fmt = (v: Vec2) => `(${v[0].toFixed(4)}, ${v[1].toFixed(4)})`;
-        // eslint-disable-next-line no-console
-        console.log(
-            `[arcEdge/commit] chord p0=${fmt(chord.p0)} p1=${fmt(chord.p1)} ` +
-            `cursor=${fmt(cursor)} edgeIdx=${chord.edgeIdx} polyId=${chord.polyId.slice(0, 6)}`,
-        );
         const arc = arcFromChordAndCursor(chord.p0, chord.p1, cursor);
         if (!arc) {
             // eslint-disable-next-line no-console
             console.warn(`[arcEdge/commit] arcFromChordAndCursor returned null`);
             return false;
         }
-        // eslint-disable-next-line no-console
-        console.log(
-            `[arcEdge/commit] arc center=${fmt(arc.center)} r=${arc.radius.toFixed(4)} ` +
-            `aStart=${(arc.aStart * 180 / Math.PI).toFixed(2)}° aEnd=${(arc.aEnd * 180 / Math.PI).toFixed(2)}° ` +
-            `sweep=${(((arc.aEnd - arc.aStart + Math.PI * 4) % (Math.PI * 2)) * 180 / Math.PI).toFixed(2)}°`,
-        );
-        // 端点を recompute して chord と一致するか検証 (FP 誤差のサニティチェック)。
-        const recompP0: Vec2 = [
-            arc.center[0] + arc.radius * Math.cos(arc.aStart),
-            arc.center[1] + arc.radius * Math.sin(arc.aStart),
-        ];
-        const recompP1: Vec2 = [
-            arc.center[0] + arc.radius * Math.cos(arc.aEnd),
-            arc.center[1] + arc.radius * Math.sin(arc.aEnd),
-        ];
-        // eslint-disable-next-line no-console
-        console.log(
-            `[arcEdge/commit] recompute(aStart)=${fmt(recompP0)} (Δ from chord: ` +
-            `${(Math.hypot(recompP0[0]-chord.p0[0], recompP0[1]-chord.p0[1])).toExponential(2)} m) ` +
-            `recompute(aEnd)=${fmt(recompP1)} (Δ: ` +
-            `${(Math.hypot(recompP1[0]-chord.p1[0], recompP1[1]-chord.p1[1])).toExponential(2)} m)`,
-        );
         const live = useAppState.getState().elements;
         const space = live[chord.spaceId] as SpaceElement | undefined;
         if (!space || space.type !== "Space") return false;
@@ -4149,16 +4871,6 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         const i = chord.edgeIdx;
         if (i < 0 || i >= n) return false;
         const j = (i + 1) % n;
-        // owner.points と chord.p0/p1 のずれをチェック (drag 等で乖離しているかも)。
-        const ownerP0 = pts[i], ownerP1 = pts[j];
-        // eslint-disable-next-line no-console
-        console.log(
-            `[arcEdge/commit] owner entity id=${owner.id.slice(0, 6)} n=${n} ` +
-            `pts[i=${i}]=${fmt([ownerP0[0], ownerP0[1]])} ` +
-            `pts[j=${j}]=${fmt([ownerP1[0], ownerP1[1]])} ` +
-            `Δp0=${Math.hypot(ownerP0[0]-chord.p0[0], ownerP0[1]-chord.p0[1]).toExponential(2)} ` +
-            `Δp1=${Math.hypot(ownerP1[0]-chord.p1[0], ownerP1[1]-chord.p1[1]).toExponential(2)}`,
-        );
         // 元 entity の点列順序と outer の順序が一致している前提
         // (PolygonDerive 経路で `polyId, e.points.slice()` をそのまま渡している)。
         const polylinePoints: Vec2[] = [];
@@ -4182,11 +4894,6 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             aStart: arc.aStart,
             aEnd: arc.aEnd,
         };
-        // eslint-disable-next-line no-console
-        console.log(
-            `[arcEdge/commit] 新 polyline (open) endpoints: ` +
-            `[0]=${fmt(polylinePoints[0])} [last]=${fmt(polylinePoints[polylinePoints.length-1])}`,
-        );
         // 削除する辺 (= chord.edgeIdx) を参照する拘束、および矩形時に貼られた
         // 自動拘束 (Parallel/Perpendicular/Horizontal/Vertical で edge index が
         // 鎖の繋ぎ替えで意味を失うもの) を破棄する。残ると solver が
@@ -4194,7 +4901,6 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         // 歪む (= スケッチ線がおかしくなる原因)。安全側で当該 polyId を参照
         // する辺/頂点ベースの自動拘束は全部落とす。
         const allConstraints = useAppState.getState().constraints;
-        const removed: string[] = [];
         for (const cid in allConstraints) {
             const c = allConstraints[cid];
             const refsThisPoly = c.targets.some((t) => {
@@ -4212,61 +4918,15 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             ]);
             if (!dropTypes.has(c.type)) continue;
             executeCommand(new RemoveConstraintCommand(cid));
-            removed.push(`${c.type}#${cid.slice(0, 6)}`);
-        }
-        if (removed.length > 0) {
-            // eslint-disable-next-line no-console
-            console.log(`[arcEdge/commit] dropped ${removed.length} stale constraints: ${removed.join(", ")}`);
         }
         setSpaceEntities(chord.spaceId, (es) => {
             const next = es.map((e) => (e.id === owner.id ? newPolyline : e));
             next.push(newArc);
             return next;
         });
-        // 派生後の polygon outer をダンプ。chord 端点付近に重複頂点や微小エッジが
-        // 残っていないかをチェックする。
         const after = useAppState.getState().elements[chord.spaceId] as SpaceElement | undefined;
         const newPoly = after?.polygons?.find((p) => p.id === chord.polyId);
-        if (newPoly) {
-            const N = newPoly.outer.length;
-            // 端点 chord.p0 / chord.p1 にもっとも近い outer 頂点を探す。
-            const findClosest = (target: Vec2) => {
-                let best = -1, bestD = Infinity;
-                for (let k = 0; k < N; k++) {
-                    const d = Math.hypot(
-                        newPoly.outer[k][0] - target[0],
-                        newPoly.outer[k][1] - target[1],
-                    );
-                    if (d < bestD) { bestD = d; best = k; }
-                }
-                return { idx: best, dist: bestD };
-            };
-            const cp0 = findClosest(chord.p0);
-            const cp1 = findClosest(chord.p1);
-            // eslint-disable-next-line no-console
-            console.log(
-                `[arcEdge/commit] 派生後 polygon: outer.length=${N} ` +
-                `chord.p0 → outer[${cp0.idx}] (Δ=${cp0.dist.toExponential(2)}) ` +
-                `chord.p1 → outer[${cp1.idx}] (Δ=${cp1.dist.toExponential(2)})`,
-            );
-            // chord 端点付近 (±3) の頂点と隣接エッジ長をダンプ。
-            const dumpAround = (label: string, hit: { idx: number; dist: number }) => {
-                const lines: string[] = [];
-                for (let off = -3; off <= 3; off++) {
-                    const k = ((hit.idx + off) % N + N) % N;
-                    const v = newPoly.outer[k];
-                    const next = newPoly.outer[((k + 1) % N + N) % N];
-                    const segLen = Math.hypot(next[0] - v[0], next[1] - v[1]);
-                    lines.push(
-                        `  outer[${k}]=${fmt([v[0], v[1]])} → next len=${segLen.toExponential(2)}`,
-                    );
-                }
-                // eslint-disable-next-line no-console
-                console.log(`[arcEdge/commit] ${label} 周辺:\n${lines.join("\n")}`);
-            };
-            dumpAround(`chord.p0 (idx=${cp0.idx})`, cp0);
-            dumpAround(`chord.p1 (idx=${cp1.idx})`, cp1);
-        } else {
+        if (!newPoly) {
             // eslint-disable-next-line no-console
             console.warn(`[arcEdge/commit] 派生後の polygon が見つからない polyId=${chord.polyId}`);
         }
@@ -4305,14 +4965,8 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             }
             return;
         }
-        // 確定 (Enter / 右クリック / ダブルクリック) かつ閉じた図形を成す
-        // (= 自己ループ or 既存 polygon との共有エッジで閉じる) なら、開いた
-        // 壁ではなく Room として確定する。Enter キー経由等で UI 側の closure
-        // チェックを通らないケースのフォールバック。
-        if (isFinal && detectWallPathClosure(points) !== null) {
-            commitWallPathAsClosedRoom(points);
-            return;
-        }
+        // WallPath は **常に開いたポリライン** として確定する (= ユーザ仕様)。
+        // 閉ループ判定は行わない。
         // ストアから直接読む。React closure 経由の activeRoomId は incremental
         // 連続クリックで再レンダ前だと stale になり、2 回目以降のクリックで
         // また新しい Space + WallPath polygon を作ってしまう不具合 (= 同一の
@@ -4335,6 +4989,9 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             executeCommand(cmd);
             targetId = cmd.getElementId();
             setActiveRoom(targetId);
+            // setActiveRoom resets roomEditMode to "select"; restore wallPath mode
+            // so the useEffect cleanup does not fire and delete the draft wall.
+            setRoomEditMode("wallPath");
             targetRoom = useAppState.getState().elements[targetId as string] as SpaceElement;
         }
         if (!targetId || !targetRoom) return;
@@ -4451,16 +5108,104 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         }
     };
 
+    /**
+     * Circle の incremental commit (= マウス移動中の 3D 壁ライブ描画用)。
+     * 既存の live entity があれば center / radius を更新、無ければ新規作成。
+     * 確定 (isFinal=true) ならドラフト ref を消すだけで、live entity が
+     * そのまま最終 entity になる。
+     */
+    const commitCircleDraftIncremental = (
+        center: [number, number],
+        radius: number,
+        isFinal: boolean,
+    ): void => {
+        if (radius < 1e-6) {
+            if (isFinal) discardLiveCircleDraft();
+            return;
+        }
+        const liveState = useAppState.getState();
+        const liveElems = liveState.elements;
+        const existing = circleLiveDraftRef.current;
+        let targetId: ElementId | null = existing?.roomId
+            ?? liveState.activeRoomId
+            ?? null;
+        let targetRoom: SpaceElement | null = targetId
+            ? (liveElems[targetId as string] as SpaceElement | undefined) ?? null
+            : null;
+        if (!targetRoom && liveState.pendingRoomLevelId) {
+            const cmd = new CreateSpaceCommand(
+                pickNewRoomName(liveElems), 3.0, undefined, liveState.pendingRoomLevelId,
+            );
+            executeCommand(cmd);
+            targetId = cmd.getElementId();
+            setActiveRoom(targetId);
+            setRoomEditMode("circle");
+            targetRoom = useAppState.getState().elements[targetId as string] as SpaceElement;
+        }
+        if (!targetId || !targetRoom) return;
+
+        let entityId: string;
+        const isUpdate = existing && existing.roomId === targetId
+            && (targetRoom.entities ?? []).some((e) => e.id === existing.entityId);
+        if (isUpdate) {
+            entityId = existing!.entityId;
+            setSpaceEntities(targetId, (es) => es.map((e) => {
+                if (e.id !== entityId) return e;
+                if (e.kind !== "circle") return e;
+                return { ...e, center: [center[0], center[1]], radius };
+            }));
+        } else {
+            entityId = generateId();
+            const newEntity: CircleEntity = {
+                id: entityId,
+                kind: "circle",
+                center: [center[0], center[1]],
+                radius,
+            };
+            setSpaceEntities(targetId, (es) => [...es, newEntity]);
+        }
+        const fresh = useAppState.getState().elements[targetId as string] as SpaceElement | undefined;
+        const polyId = fresh?.polyIdByEntity?.[entityId];
+        if (!fresh || !polyId) return;
+        circleLiveDraftRef.current = { polyId, roomId: targetId, entityId };
+
+        maybeRealtimeRegenWalls(
+            isFinal ? "circle final commit" : "circle incremental",
+            [polyId],
+        );
+
+        if (isFinal) {
+            setLastDraggedPolyId(polyId);
+            circleLiveDraftRef.current = null;
+            setCircleCenter(null);
+            setMouseWorld(null);
+            setGridSnapInfo(null);
+            setRoomEditMode("select");
+        }
+    };
+
+    /**
+     * 描画中の Circle live entity を即時に消す (canceled-before-commit 用)。
+     */
+    const discardLiveCircleDraft = (): void => {
+        const ref = circleLiveDraftRef.current;
+        if (!ref) return;
+        const live = useAppState.getState();
+        const space = live.elements[ref.roomId] as SpaceElement | undefined;
+        if (space) {
+            const target = space.polygons?.find((p) => p.id === ref.polyId);
+            if (target) {
+                for (const wid of target.wallIds ?? []) {
+                    if (wid && live.elements[wid]) live.removeElement(wid);
+                }
+            }
+            setSpaceEntities(ref.roomId, (es) => es.filter((e) => e.id !== ref.entityId));
+        }
+        circleLiveDraftRef.current = null;
+    };
+
     const commitCircleDraft = (center: [number, number], radius: number) => {
-        if (radius < 1e-6) return;
-        const entity: CircleEntity = {
-            id: generateId(),
-            kind: "circle",
-            center: [center[0], center[1]],
-            radius,
-        };
-        commitClosedEntity(entity);
-        setRoomEditMode("select");
+        commitCircleDraftIncremental(center, radius, true);
     };
 
     // Dispatch a native PointerEvent copy to the 3D canvas beneath this
@@ -4703,15 +5448,28 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     // ─── Event handlers ───
     const handlePointerDown = (e: React.PointerEvent) => {
         if (e.button !== 0) return;
+        try {
+            e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+            // ignore browsers/cases where capture is unavailable
+        }
         const wp = unproject(e.clientX, e.clientY);
         if (!wp) return;
         (window as any).__viewportInteracting = true;
+        // クリック / ドラッグ判定の基準点を保存。
+        dragStartScreenRef.current = [e.clientX, e.clientY];
 
         // Wall tool + active room: overlay acts as a sketch-picker only.
         // Vertex / edge / circle hits toggle sketch selection (for the
         // constraint panel); anything else is forwarded to Viewport for
         // wall drawing.
-        if (activeTool === "wall" && activeRoomId) {
+        // **roomEditMode が "select" のときだけ** wall-tool 経路に入る。
+        // Rectangle / Polyline / WallPath / Circle / Line / Arc / ArcEdge /
+        // Trim / WallSkip のような「クリックで作図する」サブモードでは、
+        // wall ツールがアクティブでも room edit 経路を優先する (= でないと
+        // WallPath ボタンを押しても wall ツールが captureして開ポリラインが
+        // 描けない)。
+        if (activeTool === "wall" && activeRoomId && roomEditMode === "select") {
             const r = getCanvasRect();
             const sx = e.clientX - (r?.left ?? 0), sy = e.clientY - (r?.top ?? 0);
             const additive = e.shiftKey || e.ctrlKey || e.metaKey;
@@ -4815,19 +5573,34 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const first = polyDraftPoints[0];
                 const closeDist = Math.hypot(snapped[0] - first[0], snapped[1] - first[1]);
                 if (closeDist < 0.3) {
+                    // 閉じ確定: incremental で描いていた open polyline と壁を
+                    // 破棄して、改めて closed polyline (= 部屋) を作る。
+                    discardLiveWallPathDraft();
                     commitPolyDraft(polyDraftPoints);
                     return;
                 }
             }
-            setPolyDraftPoints([...polyDraftPoints, snapped]);
+            const newDraft: [number, number][] = [...polyDraftPoints, snapped];
+            setPolyDraftPoints(newDraft);
             setMouseWorld(snapped);
+            // ── incremental 3D 壁描画 (= wallPath と同じ機構を流用) ─────
+            // 2 点目以降のクリックで wallPath の incremental commit を呼んで、
+            // open polyline entity + 3D 壁をリアルタイムに生成する。閉じ
+            // クリックで closed polyline に切り替わる。
+            wallPathDraftSnapsRef.current = [
+                ...wallPathDraftSnapsRef.current,
+                undefined,
+            ];
+            if (newDraft.length >= 2) {
+                commitWallPathDraft(newDraft, false);
+            }
             return;
         }
 
         // wallPath: 単独壁用の開いたポリライン。Enter / 右クリック / ダブル
-        // クリックで確定 (≥2 点)。最初の点付近をクリックしてループを閉じた
-        // 場合は、開いた壁ではなく **閉じた Room** として確定する (= polyline
-        // モードと同じ closure 検出)。
+        // クリックで確定 (≥2 点)。**閉ループ判定は行わない** — ユーザ仕様で
+        // WallPath は常に開いたポリラインとして確定する (= Room を勝手に
+        // 作らない)。
         // applyWallPathSnap で既存壁の頂点・辺 (= スケッチ線) にスナップ。
         // 2 点目以降のクリックでは isFinal=false で incremental commit を呼んで
         // 3D 壁をリアルタイムに生成・拡張する。
@@ -4836,17 +5609,6 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         if (roomEditMode === "wallPath") {
             const snap = applyWallPathSnap(wp);
             const snapped = snap.p;
-            // ─ closure 検出: 既存 ≥3 点 + 最初の点付近クリックで閉ループ確定。
-            if (polyDraftPoints.length >= 3) {
-                const first = polyDraftPoints[0];
-                const closeDist = Math.hypot(
-                    snapped[0] - first[0], snapped[1] - first[1],
-                );
-                if (closeDist < 0.3) {
-                    commitWallPathAsClosedRoom(polyDraftPoints);
-                    return;
-                }
-            }
             const newDraft: [number, number][] = [...polyDraftPoints, snapped];
             setPolyDraftPoints(newDraft);
             setMouseWorld(snapped);
@@ -4867,18 +5629,22 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 setMouseWorld(snapped);
             } else {
                 const r = Math.hypot(snapped[0] - circleCenter[0], snapped[1] - circleCenter[1]);
-                if (r > 1e-3) commitCircleDraft(circleCenter, r);
-                setCircleCenter(null);
-                setMouseWorld(null);
-                setGridSnapInfo(null);
+                // incremental commit が live 円を作っているので、isFinal=true で
+                // ref をクリアして最終 entity として確定する (新規生成しない)。
+                commitCircleDraftIncremental(circleCenter, r, true);
             }
             return;
         }
 
         if (roomEditMode === "rectangle") {
-            console.log("きたよ")
+            dragStateRef.current = null;
+            setDragState(null);
+            useAppState.setState({ solverDragHint: [] });
             const snapped = applyDrawSnap(wp).p;
-            if (!rectStart) { setRectStart(snapped); setMouseWorld(snapped); }
+            if (!rectStart) {
+                setRectStart(snapped);
+                setMouseWorld(snapped);
+            }
             else {
                 // Create a 4-vertex polygon (canonical [BL, BR, TR, TL]) and
                 // attach the auto-rect constraint set so that subsequent edits
@@ -4888,26 +5654,69 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const minY = Math.min(rectStart[1], snapped[1]);
                 const maxY = Math.max(rectStart[1], snapped[1]);
                 if (maxX - minX > 1e-6 && maxY - minY > 1e-6) {
-                    const entity: PolylineEntity = {
-                        id: generateId(),
-                        kind: "polyline",
-                        points: [
-                            [minX, minY],
-                            [maxX, minY],
-                            [maxX, maxY],
-                            [minX, maxY],
-                        ],
-                        closed: true,
+                    // Suppress solves while the entity and its orientation
+                    // constraints are created. The rectangle is already committed
+                    // with valid coordinates; solving unconstrained orientation
+                    // constraints at creation time can move it to another free
+                    // solution. Future edits still solve normally.
+                    const SUPPRESS_PIN: import("../../application/AppState").SolverDragPin = {
+                        spaceId: (activeRoomId ?? pendingRoomLevelId ?? "__rect_commit__") as ElementId,
+                        polyId: "__rect_commit__",
+                        vertexIdx: -1,
+                        x: 0,
+                        y: 0,
                     };
-                    const result = commitClosedEntity(entity);
-                    if (result?.polyId) {
-                        for (const c of autoRectConstraints(result.roomId, result.polyId)) {
-                            executeCommand(new AddConstraintCommand(c));
+                    setSolverDragHint([SUPPRESS_PIN]);
+                    try {
+                        const entity: PolylineEntity = {
+                            id: generateId(),
+                            kind: "polyline",
+                            points: [
+                                [minX, minY],
+                                [maxX, minY],
+                                [maxX, maxY],
+                                [minX, maxY],
+                            ],
+                            closed: true,
+                        };
+                        if (ROOM_SHAPE_DEBUG) {
+                            // eslint-disable-next-line no-console
+                            console.log(
+                                `[room-debug] rectangle commit rectStart=${fmtDbgPt(rectStart)} `
+                                + `snapped=${fmtDbgPt(snapped)} entity=${entity.id.slice(0, 6)} `
+                                + `points=${fmtDbgRing(entity.points)}`,
+                            );
+	                        }
+	                        const result = commitClosedEntity(entity);
+	                        if (result?.polyId) {
+	                            setActiveRoom(result.roomId);
+	                            activeRoomIdRef.current = result.roomId;
+	                            lastRectangleCommitAtRef.current = Date.now();
+	                            for (const c of autoRectConstraints(result.roomId, result.polyId)) {
+	                                executeCommand(new AddConstraintCommand(c, { solve: false }));
+	                            }
+	                            if (ROOM_SHAPE_DEBUG) {
+                                const fresh = useAppState.getState().elements[result.roomId as string] as SpaceElement | undefined;
+                                const poly = fresh?.polygons?.find((p) => p.id === result.polyId);
+                                // eslint-disable-next-line no-console
+                                console.log(
+	                                    `[room-debug] rectangle committed room=${(result.roomId as string).slice(0, 6)} `
+	                                    + `poly=${result.polyId.slice(0, 6)} `
+	                                    + `polyOuter=${poly ? `${poly.outer.length}v${fmtDbgRing(poly.outer)}` : "<missing>"} `
+	                                    + `constraints=Horizontal,Horizontal,Vertical,Vertical`,
+	                                );
+                            }
                         }
+                    } finally {
+                        useAppState.setState({ solverDragHint: [] });
                     }
                 }
-                setRectStart(null); setMouseWorld(null); setGridSnapInfo(null); setRoomEditMode("select");
-            }
+                dragStateRef.current = null;
+	                setDragState(null);
+	                useAppState.setState({ solverDragHint: [] });
+	                suppressSelectDragUntilPointerUpRef.current = true;
+	                setRectStart(null); setMouseWorld(null); setGridSnapInfo(null);
+	            }
             return;
         }
 
@@ -5100,28 +5909,49 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 setWallSkipDraft({ ...draft, t0: null });
                 return;
             }
-            const latest = useAppState.getState().elements[draft.spaceId] as SpaceElement | undefined;
-            if (latest) {
-                const newPolys = latest.polygons.map((p) => {
-                    if (p.id !== draft.polyId) return p;
-                    const cur = p.wallSkips ?? [];
-                    return {
-                        ...p,
-                        wallSkips: [...cur, { edgeIdx: draft.edgeIdx, t0, t1 }],
-                    };
-                });
-                updateElement(draft.spaceId as ElementId, {
-                    polygons: newPolys,
-                    dirtyFlags: new Set([...(latest.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
-                } as any);
-                const s = useAppState.getState();
-                regenerateAllWalls({
-                    wallThicknessMm: s.wallThicknessMm,
-                    circleWallAngleDeg: s.circleWallAngleDeg,
-                    wallReferenceMode: s.wallReferenceMode,
-                    seedPolyIds: [draft.polyId],
-                });
+            // T0, T1 を world 座標で確定 (= 新しい polygon 頂点になる位置)。
+            const T0w: Vec2 = [a[0] + dx * t0, a[1] + dy * t0];
+            const T1w: Vec2 = [a[0] + dx * t1, a[1] + dy * t1];
+
+            const promoted = promoteWallSkipToVertices({
+                spaceId: draft.spaceId,
+                polyId: draft.polyId,
+                edgeIdx: draft.edgeIdx,
+                Va: [a[0], a[1]],
+                Vb: [b[0], b[1]],
+                T0: T0w,
+                T1: T1w,
+                t0,
+                t1,
+            });
+
+            if (!promoted) {
+                // arc / circle / chain match 失敗: 仮想 wallSkip にフォールバック。
+                const latest = useAppState.getState().elements[draft.spaceId] as SpaceElement | undefined;
+                if (latest) {
+                    const newPolys = latest.polygons.map((p) => {
+                        if (p.id !== draft.polyId) return p;
+                        const cur = p.wallSkips ?? [];
+                        return {
+                            ...p,
+                            wallSkips: [...cur, { edgeIdx: draft.edgeIdx, t0, t1 }],
+                        };
+                    });
+                    updateElement(draft.spaceId as ElementId, {
+                        polygons: newPolys,
+                        dirtyFlags: new Set([...(latest.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                    } as any);
+                }
             }
+
+            const s = useAppState.getState();
+            regenerateAllWalls({
+                wallThicknessMm: s.wallThicknessMm,
+                circleWallAngleDeg: s.circleWallAngleDeg,
+                wallReferenceMode: s.wallReferenceMode,
+                seedPolyIds: [draft.polyId],
+            });
+
             // 連続編集を許す: draft をリセットしてエッジ pick から再開。mode は維持。
             setWallSkipDraft(null);
             setMouseWorld(null); setGridSnapInfo(null);
@@ -5129,6 +5959,40 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         }
 
         if (roomEditMode === "select") {
+            const liveActiveRoomId = useAppState.getState().activeRoomId;
+            if (liveActiveRoomId && activeRoomId && liveActiveRoomId !== activeRoomId) {
+                dragStateRef.current = null;
+                setDragState(null);
+                useAppState.setState({ solverDragHint: [] });
+                if (ROOM_SHAPE_DEBUG) {
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `[room-debug] select drag suppressed stale activeRoom closure `
+                        + `closure=${(activeRoomId as string).slice(0, 6)} live=${(liveActiveRoomId as string).slice(0, 6)}`,
+                    );
+                }
+                return;
+            }
+            if (Date.now() - lastRectangleCommitAtRef.current < 500) {
+                dragStateRef.current = null;
+                setDragState(null);
+                useAppState.setState({ solverDragHint: [] });
+                if (ROOM_SHAPE_DEBUG) {
+                    // eslint-disable-next-line no-console
+                    console.log("[room-debug] select drag suppressed just after rectangle commit");
+                }
+                return;
+            }
+            if (suppressSelectDragUntilPointerUpRef.current) {
+                setDragState(null);
+                useAppState.setState({ solverDragHint: [] });
+                if (ROOM_SHAPE_DEBUG) {
+                    // eslint-disable-next-line no-console
+                    console.log("[room-debug] select drag suppressed until pointerup");
+                }
+                dragStateRef.current = null;
+                return;
+            }
             const r = getCanvasRect();
             const sx = e.clientX - (r?.left ?? 0), sy = e.clientY - (r?.top ?? 0);
 
@@ -5167,22 +6031,68 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 }
             }
 
-            // Vertex
-            const pvtx = hitTestPolyVertex(sx, sy);
-            if (pvtx && room.polygons) {
-                const poly = room.polygons.find(p => p.id === pvtx.polyId)!;
-                setSelection([`poly:${pvtx.polyId}`]);
-                setLastDraggedPolyId(null);
-                setDragState({
-                    kind: "polyVertex",
-                    polyId: pvtx.polyId,
-                    vertexIdx: pvtx.vertexIdx,
-                    origOuter: poly.outer.map(p => [p[0], p[1]] as Vec2),
-                    origHoles: (poly.holes ?? []).map(h => h.map(p => [p[0], p[1]] as Vec2)),
-                    wallThickness: poly.wallThickness,
-                    moved: false,
-                });
-                return;
+            // Vertex (cross-space): 非アクティブ Room の頂点も直接拾える。
+            // 当たった polygon が別 Space ならアクティブを切り替えて同ジェスチャで
+            // ドラッグ開始。entity / polyIdByEntity も対象 Room から引く。
+            const pvtxX = hitTestPolyVertexAcrossSpaces(sx, sy);
+            if (pvtxX) {
+                const targetRoomId = pvtxX.spaceId as ElementId;
+                const targetRoom = elements[targetRoomId] as SpaceElement | undefined;
+                const poly = targetRoom?.polygons?.find(p => p.id === pvtxX.polyId);
+                if (targetRoom && poly) {
+                    if (targetRoomId !== activeRoomId) {
+                        setActiveRoom(targetRoomId);
+                        activeRoomIdRef.current = targetRoomId;
+                    }
+                    setSelection([]);
+                    setLastDraggedPolyId(null);
+                    let dragEntityId: string | null = null;
+                    let dragEntityPointIdx = -1;
+                    const polyIdByEntityVtx = targetRoom.polyIdByEntity ?? {};
+                    for (const eid in polyIdByEntityVtx) {
+                        if (polyIdByEntityVtx[eid] === pvtxX.polyId) { dragEntityId = eid; break; }
+                    }
+                    if (dragEntityId) {
+                        const ent = (targetRoom.entities ?? []).find((e) => e.id === dragEntityId);
+                        if (ent && ent.kind === "polyline") {
+                            const targetPt = poly.outer[pvtxX.vertexIdx];
+                            for (let i = 0; i < ent.points.length; i++) {
+                                const ep = ent.points[i];
+                                if (Math.hypot(ep[0] - targetPt[0], ep[1] - targetPt[1]) < 1e-3) {
+                                    dragEntityPointIdx = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (ROOM_SHAPE_DEBUG) {
+                        // eslint-disable-next-line no-console
+                        console.log(
+                            `[room-debug] drag start kind=polyVertex room=${(targetRoomId as string).slice(0, 6)} `
+                            + `poly=${pvtxX.polyId.slice(0, 6)} v=${pvtxX.vertexIdx} `
+                            + `entity=${dragEntityId?.slice(0, 6) ?? "<none>"} entityPoint=${dragEntityPointIdx}`,
+                        );
+                    }
+                    const linkedPolys = collectLinkedPolysForTranslate(
+                        pvtxX.polyId, targetRoomId as string,
+                        elements, constraints,
+                    );
+                    const newDragState: DragPolyVertexState = {
+                        kind: "polyVertex",
+                        polyId: pvtxX.polyId,
+                        vertexIdx: pvtxX.vertexIdx,
+                        origOuter: poly.outer.map(p => [p[0], p[1]] as Vec2),
+                        origHoles: (poly.holes ?? []).map(h => h.map(p => [p[0], p[1]] as Vec2)),
+                        wallThickness: poly.wallThickness,
+                        moved: false,
+                        entityId: dragEntityPointIdx >= 0 ? dragEntityId : null,
+                        entityPointIdx: dragEntityPointIdx >= 0 ? dragEntityPointIdx : undefined,
+                        linkedPolys,
+                    };
+                    setDragState(newDragState);
+                    dragStateRef.current = newDragState;
+                    return;
+                }
             }
 
             // 円ポリゴンの周 → 円を選択 + radius ドラッグ開始 (FreeCAD 流:
@@ -5219,50 +6129,40 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 }
             }
 
-            // Edge
-            const edge = hitTestEdge(sx, sy);
-            if (edge && room.polygons) {
-                const poly = room.polygons.find(p => p.id === edge.polyId)!;
-                // Arc 由来 edge は弧全体を平行移動する entityArc ドラッグへ。
-                // owner entity を解決して、その chord 端点と一致する近傍 polyline /
-                // line 端点も追従できるようキャッシュしておく。
-                const ownerId = poly.edgeOwners?.[edge.edgeIdx];
-                const ownerEnt = ownerId
-                    ? (room.entities ?? []).find((en) => en.id === ownerId)
-                    : undefined;
-                if (ownerEnt && ownerEnt.kind === "arc" && activeRoomId) {
-                    // 弧の curve (rim) クリック → 平行移動。startEntityArcDrag に
-                    // 集約 (FreeCAD `PointPos::none` 相当)。
-                    startEntityArcDrag(ownerEnt, edge.polyId, wp);
-                    return;
-                }
-                const polyEdgeList = polygonEdges(poly);
-                const [va, vb] = polyEdgeList[edge.edgeIdx];
-                const ex = poly.outer[vb][0] - poly.outer[va][0];
-                const ez = poly.outer[vb][1] - poly.outer[va][1];
-                const len = Math.hypot(ex, ez) || 1;
-                // Unit perpendicular (CCW rotate 90°)
-                const normal: [number, number] = [-ez / len, ex / len];
-                setSelection([`poly:${edge.polyId}`]);
-                setLastDraggedPolyId(null);
-                // ── line+arc D 形状の判定と entity snapshot 取得 ────────────────
-                // polygon の chain が「直線系 1 本 + 弧 1 本」で構成される閉
-                // チェイン (= D 形状) で、ドラッグ対象が **直線辺** の場合、
-                // 両 entity を perp delta で一括平行移動 → setSpaceEntities で
-                // 再派生 → chain 接続が必ず保たれる (= 「直線が消える」を回避)。
-                //
-                // 弧辺ドラッグは startEntityArcDrag (line 4705) で先に分岐済み。
-                // 矩形 / 多複合 chain では polyEntities.length !== 2 で除外。
-                let origEntitiesForTranslate:
-                    | { entityId: string; snapshot: SketchEntity }[]
-                    | undefined;
-                if (activeRoomId) {
-                    const ownerId = poly.edgeOwners?.[edge.edgeIdx];
-                    const owner = ownerId
-                        ? (room.entities ?? []).find((e) => e.id === ownerId)
+            // Edge (cross-space): 非アクティブ Room の辺も直接拾える。
+            const edgeX = hitTestEdgeAcrossSpaces(sx, sy);
+            if (edgeX) {
+                const targetRoomId = edgeX.spaceId as ElementId;
+                const targetRoom = elements[targetRoomId] as SpaceElement | undefined;
+                const poly = targetRoom?.polygons?.find(p => p.id === edgeX.polyId);
+                if (targetRoom && poly) {
+                    if (targetRoomId !== activeRoomId) {
+                        setActiveRoom(targetRoomId);
+                        activeRoomIdRef.current = targetRoomId;
+                    }
+                    // Arc 由来 edge は弧全体を平行移動する entityArc ドラッグへ。
+                    const ownerId = poly.edgeOwners?.[edgeX.edgeIdx];
+                    const ownerEnt = ownerId
+                        ? (targetRoom.entities ?? []).find((en) => en.id === ownerId)
                         : undefined;
-                    if (owner && (owner.kind === "line" || owner.kind === "polyline")) {
-                        const polyEntities = collectPolyEntitiesSnapshot(room, edge.polyId);
+                    if (ownerEnt && ownerEnt.kind === "arc") {
+                        startEntityArcDrag(ownerEnt, edgeX.polyId, wp);
+                        return;
+                    }
+                    const polyEdgeList = polygonEdges(poly);
+                    const [va, vb] = polyEdgeList[edgeX.edgeIdx];
+                    const ex = poly.outer[vb][0] - poly.outer[va][0];
+                    const ez = poly.outer[vb][1] - poly.outer[va][1];
+                    const len = Math.hypot(ex, ez) || 1;
+                    const normal: [number, number] = [-ez / len, ex / len];
+                    setSelection([]);
+                    setLastDraggedPolyId(null);
+                    // line+arc D 形状判定 (ターゲット Room の entity を使う)
+                    let origEntitiesForTranslate:
+                        | { entityId: string; snapshot: SketchEntity }[]
+                        | undefined;
+                    if (ownerEnt && (ownerEnt.kind === "line" || ownerEnt.kind === "polyline")) {
+                        const polyEntities = collectPolyEntitiesSnapshot(targetRoom, edgeX.polyId);
                         if (polyEntities.length === 2) {
                             const hasArc = polyEntities.some((p) => p.snapshot.kind === "arc");
                             const hasLineish = polyEntities.some(
@@ -5273,20 +6173,63 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                             }
                         }
                     }
+                    let edgeDragEntityId: string | null = null;
+                    let edgeDragEntityPointA = -1;
+                    let edgeDragEntityPointB = -1;
+                    const polyIdByEntityE = targetRoom.polyIdByEntity ?? {};
+                    for (const eid in polyIdByEntityE) {
+                        if (polyIdByEntityE[eid] === edgeX.polyId) { edgeDragEntityId = eid; break; }
+                    }
+                    if (edgeDragEntityId) {
+                        const ent = (targetRoom.entities ?? []).find((e) => e.id === edgeDragEntityId);
+                        if (ent && ent.kind === "polyline") {
+                            const ptA = poly.outer[va];
+                            const ptB = poly.outer[vb];
+                            for (let i = 0; i < ent.points.length; i++) {
+                                const ep = ent.points[i];
+                                if (edgeDragEntityPointA < 0
+                                    && Math.hypot(ep[0] - ptA[0], ep[1] - ptA[1]) < 1e-3) {
+                                    edgeDragEntityPointA = i;
+                                }
+                                if (edgeDragEntityPointB < 0
+                                    && Math.hypot(ep[0] - ptB[0], ep[1] - ptB[1]) < 1e-3) {
+                                    edgeDragEntityPointB = i;
+                                }
+                            }
+                        }
+                    }
+                    const linkedPolys = collectLinkedPolysForTranslate(
+                        edgeX.polyId, targetRoomId as string,
+                        elements, constraints,
+                    );
+                    // SUPPRESS_PIN: 最初の setSpaceEntities で solver が走らないように。
+                    setSolverDragHint([{
+                        spaceId: targetRoomId,
+                        polyId: edgeX.polyId,
+                        vertexIdx: -1,
+                        x: 0, y: 0,
+                    }]);
+                    const newDragState: DragPolyEdgeState = {
+                        kind: "polyEdge",
+                        polyId: edgeX.polyId,
+                        edgeIdx: edgeX.edgeIdx,
+                        origOuter: poly.outer.map(p => [p[0], p[1]] as Vec2),
+                        origHoles: (poly.holes ?? []).map(h => h.map(p => [p[0], p[1]] as Vec2)),
+                        normal,
+                        wallThickness: poly.wallThickness,
+                        startWorld: wp,
+                        moved: false,
+                        origEntitiesForTranslate,
+                        entityId: (edgeDragEntityPointA >= 0 && edgeDragEntityPointB >= 0)
+                            ? edgeDragEntityId : null,
+                        entityPointIdxA: edgeDragEntityPointA >= 0 ? edgeDragEntityPointA : undefined,
+                        entityPointIdxB: edgeDragEntityPointB >= 0 ? edgeDragEntityPointB : undefined,
+                        linkedPolys,
+                    };
+                    setDragState(newDragState);
+                    dragStateRef.current = newDragState;
+                    return;
                 }
-                setDragState({
-                    kind: "polyEdge",
-                    polyId: edge.polyId,
-                    edgeIdx: edge.edgeIdx,
-                    origOuter: poly.outer.map(p => [p[0], p[1]] as Vec2),
-                    origHoles: (poly.holes ?? []).map(h => h.map(p => [p[0], p[1]] as Vec2)),
-                    normal,
-                    wallThickness: poly.wallThickness,
-                    startWorld: wp,
-                    moved: false,
-                    origEntitiesForTranslate,
-                });
-                return;
             }
 
             // 通芯 (Grid) ヒット → gridPoint / gridLine を sketch selection に
@@ -5321,7 +6264,45 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
 
             // Polygon interior
             const ph = hitTestPoly(cx, cz);
-            if (ph && room.polygons) {
+            // 「後から追加した矩形を優先」のレイヤ原則を満たすため、active 側に
+            // ヒットしていても、より新しい (createdAt が大きい) Room の polygon が
+            // この点で重なっているなら active commit を見送り、下の cross-Room
+            // 切替パスに処理を委ねる。これがないと一度 active になった古い Room の
+            // polygon が常に勝ってしまい、上に乗っている新しい Room を選択できない。
+            let newerRoomOverlapsHere = false;
+            if (ph) {
+                const activeSpaceForPick = activeRoomId
+                    ? (elements[activeRoomId] as SpaceElement | undefined)
+                    : undefined;
+                const activeCreatedAtForPick = activeSpaceForPick?.createdAt ?? -Infinity;
+                const editingLvlForPick: ElementId | null =
+                    (activeSpaceForPick?.levelId as ElementId | undefined)
+                    ?? (pendingRoomLevelId as ElementId | null | undefined)
+                    ?? null;
+                for (const oid in elements) {
+                    if (oid === activeRoomId) continue;
+                    const oel = elements[oid];
+                    if (!oel || oel.type !== "Space") continue;
+                    const ospace = oel as SpaceElement;
+                    if (!ospace.polygons) continue;
+                    if (editingLvlForPick !== null
+                        && ospace.levelId
+                        && ospace.levelId !== editingLvlForPick) continue;
+                    if ((ospace.createdAt ?? -Infinity) <= activeCreatedAtForPick) continue;
+                    let hit = false;
+                    for (let i = ospace.polygons.length - 1; i >= 0; i--) {
+                        const op = ospace.polygons[i];
+                        if (op.wallOutlineOf) continue;
+                        if (!isPolygonClosed(op)) continue;
+                        if (pointInRoomPolygon(cx, cz, op.outer, op.holes ?? [])) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if (hit) { newerRoomOverlapsHere = true; break; }
+                }
+            }
+            if (ph && !newerRoomOverlapsHere && room.polygons) {
                 const poly = room.polygons.find(p => p.id === ph)!;
                 const additive = e.shiftKey || e.ctrlKey || e.metaKey;
                 const polyToken = `poly:${ph}`;
@@ -5403,7 +6384,33 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 // 平行移動した結果を setSpaceEntities に書く。re-derive で polygon
                 // outer は自動更新される。
                 const origEntities = collectPolyEntitiesSnapshot(room, ph);
-                setDragState({
+                // cross-poly 拘束 (Collinear/Parallel/Perpendicular/Length) で
+                // 連結された別 polygon を BFS で集める。連結 polygon は同じ delta
+                // で一緒に平行移動する (= 向き・距離系の拘束を保つ)。
+                const linkedPolys = collectLinkedPolysForTranslate(
+                    ph as string, activeRoomId as string,
+                    elements, constraints,
+                );
+                if (ROOM_SHAPE_DEBUG) {
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `[room-debug] drag start kind=poly room=${(activeRoomId as string).slice(0, 6)} `
+                        + `poly=${ph.slice(0, 6)} at=(${wp[0].toFixed(3)},${wp[1].toFixed(3)}) `
+                        + `entityCount=${origEntities.length} linkedPolys=${linkedPolys.length}`,
+                    );
+                }
+                // drag 開始時点でソルバ抑制ピンを立てておく。これがないと最初の
+                // pointermove で setSpaceEntities が走った瞬間に solverDragHint が
+                // まだ空 → ソルバが起動してしまい、translate 後の entity を
+                // 古い位置へ「戻す」writeback が発火する (= mouseup 直後の bounce-back
+                // の原因)。本物の頂点ピンは pointermove で上書きする。
+                setSolverDragHint([{
+                    spaceId: activeRoomId as ElementId,
+                    polyId: ph,
+                    vertexIdx: -1,
+                    x: 0, y: 0,
+                }]);
+                const newPolyDragState: DragPolyState = {
                     kind: "poly",
                     polyId: ph,
                     spaceId: activeRoomId as string,
@@ -5418,8 +6425,12 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     origConcentric,
                     origOutlines,
                     origEntities,
+                    linkedPolys,
                     moved: false,
-                });
+                };
+                setDragState(newPolyDragState);
+                // re-render を待たずに pointermove から読めるよう ref も即座に更新。
+                dragStateRef.current = newPolyDragState;
                 return;
             }
 
@@ -5429,37 +6440,76 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             // drawn rooms stay editable. Vertex/edge handles are still only
             // rendered for the active room — to vertex-edit an inactive
             // room, click its interior first to activate it.
+            //
+            // **レベルガード**: 編集中レベル以外の部屋 (= 灰色の参照線として
+            // 描画している他階の部屋) はクリックで誤って active 化されない
+            // ようにフィルタする。クリックは無視 (= 通過) して、別の処理 /
+            // 何もしないに流れる。
             {
+                const editingLvlForClick: ElementId | null =
+                    (activeRoomId
+                        ? ((elements[activeRoomId] as SpaceElement | undefined)?.levelId as ElementId | undefined)
+                        : (pendingRoomLevelId as ElementId | null | undefined))
+                    ?? null;
+                // 重なっている Room が複数ある場合は `createdAt` が最大 (= 後から
+                // 追加した Room) を優先する。これにより矩形を重ねた際に「上に
+                // 乗せた方の Room を選択できない」状態を防ぐ。
                 let hitOtherRoomId: ElementId | null = null;
                 let hitOtherPoly: RoomPolygon | null = null;
+                let hitOtherCreatedAt = -Infinity;
                 for (const oid in elements) {
                     if (oid === activeRoomId) continue;
                     const oel = elements[oid];
                     if (!oel || oel.type !== "Space") continue;
                     const ospace = oel as SpaceElement;
                     if (!ospace.polygons) continue;
+                    // 他階の部屋 (= 編集中レベルと違う) はスキップ。
+                    if (editingLvlForClick !== null
+                        && ospace.levelId
+                        && ospace.levelId !== editingLvlForClick) continue;
+                    let candidatePoly: RoomPolygon | null = null;
                     for (let i = ospace.polygons.length - 1; i >= 0; i--) {
                         const op = ospace.polygons[i];
                         if (op.wallOutlineOf) continue;
                         if (!isPolygonClosed(op)) continue;
                         if (pointInRoomPolygon(cx, cz, op.outer, op.holes ?? [])) {
-                            hitOtherRoomId = oid;
-                            hitOtherPoly = op;
+                            candidatePoly = op;
                             break;
                         }
                     }
-                    if (hitOtherRoomId) break;
+                    if (!candidatePoly) continue;
+                    const c = ospace.createdAt ?? -Infinity;
+                    if (c >= hitOtherCreatedAt) {
+                        hitOtherCreatedAt = c;
+                        hitOtherRoomId = oid;
+                        hitOtherPoly = candidatePoly;
+                    }
                 }
                 if (hitOtherRoomId && hitOtherPoly) {
-                    // Snapshot any walls owned by this polygon so the drag
-                    // translates them in lockstep (same as the active path).
-                    const otherWallAxes: { id: string; a: Vec3; b: Vec3 }[] = [];
-                    if (hitOtherPoly.wallIds) {
-                        for (const wid of hitOtherPoly.wallIds) {
+                    // 別 Room の領域をクリックした場合: **同ジェスチャでアクティブ
+                    // 切替 + ドラッグ開始**。以前は state 遷移途中の pointermove が
+                    // 古い closure を参照する懸念から 2 ステップ (= 切替して指を
+                    // 離す → 再度掴む) にしていたが、polyTranslate の本体は
+                    // `dragState` (= snapshot) のみで完結する設計なので、
+                    // setActiveRoom の re-render を待たずに 1 ジェスチャでドラッグ
+                    // できる。snapshot に `spaceId / polyId / origOuter /
+                    // origEntities` を確定済みで保存するので、closure が古くても
+                    // pointermove ハンドラが必要な情報を読める。
+                    const targetRoomId = hitOtherRoomId;
+                    const targetPoly = hitOtherPoly;
+                    const targetRoom = elements[targetRoomId] as SpaceElement;
+                    setActiveRoom(targetRoomId);
+                    activeRoomIdRef.current = targetRoomId;
+                    setSelection([`poly:${targetPoly.id}`]);
+                    setLastDraggedPolyId(null);
+                    // ── drag snapshot 構築 (active 側と同じデータ構造) ──
+                    const origWallAxes: { id: string; a: Vec3; b: Vec3 }[] = [];
+                    if (targetPoly.wallIds) {
+                        for (const wid of targetPoly.wallIds) {
                             if (!wid) continue;
                             const wEl = elements[wid] as WallElement | undefined;
                             if (wEl && wEl.type === "Wall") {
-                                otherWallAxes.push({
+                                origWallAxes.push({
                                     id: wid,
                                     a: [wEl.axis[0][0], wEl.axis[0][1], wEl.axis[0][2]],
                                     b: [wEl.axis[1][0], wEl.axis[1][1], wEl.axis[1][2]],
@@ -5467,35 +6517,81 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                             }
                         }
                     }
-                    setActiveRoom(hitOtherRoomId);
-                    // Sync the ref synchronously so that the pointer-move
-                    // handler — which may fire before React commits the new
-                    // active room — already reads the right room id.
-                    activeRoomIdRef.current = hitOtherRoomId;
-                    setSelection([`poly:${hitOtherPoly.id}`]);
-                    setLastDraggedPolyId(null);
-                    const otherSpace = elements[hitOtherRoomId] as SpaceElement | undefined;
-                    const otherOrigEntities = otherSpace
-                        ? collectPolyEntitiesSnapshot(otherSpace, hitOtherPoly.id)
-                        : [];
-                    setDragState({
+                    const origConcentric: DragPolyState["origConcentric"] = [];
+                    if (targetPoly.shape?.type === "circle" && targetRoom.polygons) {
+                        const group = new Set<string>([targetPoly.id]);
+                        let grew = true;
+                        while (grew) {
+                            grew = false;
+                            for (const cid in constraints) {
+                                const cc = constraints[cid];
+                                if (cc.type !== "ConcentricCircle") continue;
+                                const ids = cc.targets
+                                    .filter((t) => t.kind === "SketchCircle")
+                                    .map((t) => (t as any).polyId as string);
+                                if (ids.some((id) => group.has(id))) {
+                                    for (const id of ids) {
+                                        if (!group.has(id)) { group.add(id); grew = true; }
+                                    }
+                                }
+                            }
+                        }
+                        for (const p of targetRoom.polygons) {
+                            if (p.id === targetPoly.id || !group.has(p.id) || p.shape?.type !== "circle") continue;
+                            origConcentric.push({
+                                polyId: p.id,
+                                outer: p.outer.map((pt) => [pt[0], pt[1]] as Vec2),
+                                holes: (p.holes ?? []).map((h) => h.map((pt) => [pt[0], pt[1]] as Vec2)),
+                                shapeCenter: [p.shape.center[0], p.shape.center[1]],
+                                shapeRadius: p.shape.radius,
+                            });
+                        }
+                    }
+                    const origOutlines: DragPolyState["origOutlines"] = [];
+                    if (targetRoom.polygons) {
+                        for (const op of targetRoom.polygons) {
+                            if (op.wallOutlineOf !== targetPoly.id) continue;
+                            origOutlines.push({
+                                polyId: op.id,
+                                outer: op.outer.map((pt) => [pt[0], pt[1]] as Vec2),
+                                holes: (op.holes ?? []).map((h) => h.map((pt) => [pt[0], pt[1]] as Vec2)),
+                            });
+                        }
+                    }
+                    const origEntities = collectPolyEntitiesSnapshot(targetRoom, targetPoly.id);
+                    const linkedPolys = collectLinkedPolysForTranslate(
+                        targetPoly.id, targetRoomId as string,
+                        elements, constraints,
+                    );
+                    // ソルバ抑制ピン (= 最初の setSpaceEntities で solver が走らない
+                    // ようにする)。本物のピンは pointermove で上書き。
+                    setSolverDragHint([{
+                        spaceId: targetRoomId,
+                        polyId: targetPoly.id,
+                        vertexIdx: -1,
+                        x: 0, y: 0,
+                    }]);
+                    const newDragState: DragPolyState = {
                         kind: "poly",
-                        polyId: hitOtherPoly.id,
-                        spaceId: hitOtherRoomId as string,
+                        polyId: targetPoly.id,
+                        spaceId: targetRoomId as string,
                         startWorld: wp,
-                        origOuter: hitOtherPoly.outer.map(p => [p[0], p[1]] as Vec2),
-                        origHoles: (hitOtherPoly.holes ?? []).map(h => h.map(p => [p[0], p[1]] as Vec2)),
-                        origShapeCenter: hitOtherPoly.shape?.type === "circle"
-                            ? [hitOtherPoly.shape.center[0], hitOtherPoly.shape.center[1]]
+                        origOuter: targetPoly.outer.map(p => [p[0], p[1]] as Vec2),
+                        origHoles: (targetPoly.holes ?? []).map(h => h.map(p => [p[0], p[1]] as Vec2)),
+                        origShapeCenter: targetPoly.shape?.type === "circle"
+                            ? [targetPoly.shape.center[0], targetPoly.shape.center[1]]
                             : undefined,
-                        origShapeRadius: hitOtherPoly.shape?.type === "circle"
-                            ? hitOtherPoly.shape.radius : undefined,
-                        origWallAxes: otherWallAxes,
-                        origConcentric: [],
-                        origOutlines: [],
-                        origEntities: otherOrigEntities,
+                        origShapeRadius: targetPoly.shape?.type === "circle" ? targetPoly.shape.radius : undefined,
+                        origWallAxes,
+                        origConcentric,
+                        origOutlines,
+                        origEntities,
+                        linkedPolys,
                         moved: false,
-                    });
+                    };
+                    setDragState(newDragState);
+                    // re-render を待たずに pointermove から読めるよう ref も即座に更新。
+                    dragStateRef.current = newDragState;
                     return;
                 }
             }
@@ -5532,6 +6628,13 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             const s = applyDrawSnap(wp);
             setGridSnapInfo(s.info);
             setMouseWorld(s.p);
+            // center 確定後はマウス移動に追従して live 円 + 3D 壁を更新する。
+            if (circleCenter) {
+                const r = Math.hypot(s.p[0] - circleCenter[0], s.p[1] - circleCenter[1]);
+                if (r > 1e-3) {
+                    commitCircleDraftIncremental(circleCenter, r, false);
+                }
+            }
             return;
         }
         if (roomEditMode === "arcEdge" && wp) {
@@ -5565,11 +6668,45 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             setMouseWorld(s.p);
             return;
         }
-        if (dragState && wp) {
+        const liveDragState = dragStateRef.current;
+        if (liveDragState && wp) {
+            const dragState = liveDragState;
+            if ((e.buttons & 1) === 0) {
+                dragStateRef.current = null;
+                setDragState(null);
+                useAppState.setState({ solverDragHint: [] });
+                if (ROOM_SHAPE_DEBUG) {
+                    // eslint-disable-next-line no-console
+                    console.log("[room-debug] stale drag cleared on pointermove without primary button");
+                }
+                return;
+            }
+            if (suppressSelectDragUntilPointerUpRef.current) {
+                dragStateRef.current = null;
+                setDragState(null);
+                useAppState.setState({ solverDragHint: [] });
+                if (ROOM_SHAPE_DEBUG) {
+                    // eslint-disable-next-line no-console
+                    console.log("[room-debug] drag move suppressed after rectangle commit");
+                }
+                return;
+            }
             // ドラッグは実体 polygon が必要 → pending 中はそもそも到達しないが
             // TS narrow のためにガード。
             if (!activeRoomId) return;
-            if (!dragState.moved) setDragState({ ...dragState, moved: true });
+            // クリック / ドラッグ判定: pointerdown 位置から DRAG_THRESHOLD_PX 未満
+            // しか動いていなければまだ「クリック」とみなして translate 系を走らせ
+            // ない。これでわずかなマウスジッタで Shift+クリック選択が捨てられる
+            // のを防ぐ。閾値を超えた瞬間に moved=true にして以降は通常ドラッグ。
+            if (!dragState.moved) {
+                const start = dragStartScreenRef.current;
+                if (start) {
+                    const dxPx = e.clientX - start[0];
+                    const dyPx = e.clientY - start[1];
+                    if (Math.hypot(dxPx, dyPx) < DRAG_THRESHOLD_PX) return;
+                }
+                setDragState({ ...dragState, moved: true });
+            }
             if (dragState.kind === "entityArc") {
                 const d = dragState;
                 const s = applyGridSnap(wp);
@@ -5762,10 +6899,15 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 return;
             }
             if (dragState.kind === "polyVertex") {
-                const s = applyGridSnap(wp);
+                const currentPoly = room.polygons.find((p) => p.id === dragState.polyId);
+                // 頂点ドラッグでは他の部屋の頂点・辺・通芯交点・軸整列にスナップ
+                // する (= applyWallPathSnap)。自分自身の他頂点に吸着して動けなく
+                // なるのを避けるため、自 polygon は excludePolyId で除外する。
+                // 閉じたポリゴン (= 部屋) も開いたポリライン (= WallPath) も
+                // 同じ振る舞い。
+                const s = applyWallPathSnap(wp, { excludePolyId: dragState.polyId });
                 setGridSnapInfo(s.info);
                 const sp = s.p;
-                const currentPoly = room.polygons.find((p) => p.id === dragState.polyId);
 
                 // Resolve the "effective outline" being dragged:
                 //   (a) direct — dragState is on a wall-outline polygon, or
@@ -5829,6 +6971,36 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                         x: newInnerOuter[effOutlineVertexIdx][0],
                         y: newInnerOuter[effOutlineVertexIdx][1],
                     });
+                    // ── entity-driven outline drag ───────────────────────────
+                    // outline は inner からの派生なので、inner 側の entity を更新する。
+                    // newInnerOuter は newOutline の各点を負方向ミタリングしたもので、
+                    // inner.outer と 1:1 対応する (= 同じ頂点数)。inner の entity が
+                    // 閉 polyline なら entity.points 1:1 で更新。entity 不在ならフォール
+                    // バックで polygon 直書き。
+                    const polyIdByEntityOL = room.polyIdByEntity ?? {};
+                    let innerEntityId: string | null = null;
+                    for (const eid in polyIdByEntityOL) {
+                        if (polyIdByEntityOL[eid] === effInner.id) { innerEntityId = eid; break; }
+                    }
+                    const innerEnt = innerEntityId
+                        ? (room.entities ?? []).find((e) => e.id === innerEntityId)
+                        : undefined;
+                    if (innerEnt && innerEnt.kind === "polyline"
+                        && innerEnt.points.length === newInnerOuter.length) {
+                        // entity を更新して polygon を derive 経由で更新。
+                        setSpaceEntities(activeRoomId, (entities) =>
+                            entities.map((e) => {
+                                if (e.id !== innerEntityId) return e;
+                                if (e.kind !== "polyline") return e;
+                                return {
+                                    ...e,
+                                    points: newInnerOuter.map((p) => [p[0], p[1]] as Vec2),
+                                };
+                            }),
+                        );
+                        return;
+                    }
+                    // フォールバック: entity 不在 / 頂点数不一致 (= split あり) なら旧 polygon 直書き。
                     const redirected = effOutline.id !== dragState.polyId;
                     const newPolys = room.polygons.map((p) => {
                         if (p.id === effInner.id) return { ...p, outer: newInnerOuter };
@@ -5844,41 +7016,297 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     return;
                 }
 
-                // Inner-drag path.
-                // Hint the solver to pin this vertex at the cursor so other
-                // vertices reflow around it instead of stretching arbitrarily.
+                // ── Inner-drag entity-driven path ────────────────────────────
+                // 設計原則 (= ユーザ指示): entity が真値、polygon は entity からの
+                // 一方通行 derive。drag handler は entity の points を直接動かす。
+                // polygon は setSpaceEntities → derivePolygonsFromEntities で自動更新。
+                // entityId / entityPointIdx は drag 開始時点で確定済 (dragState 内)。
+                const dragEntityId = dragState.entityId;
+                const entityPointIdx = dragState.entityPointIdx ?? -1;
+                const dragEnt = dragEntityId
+                    ? (room.entities ?? []).find((e) => e.id === dragEntityId)
+                    : undefined;
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[drag-move] polyVertex poly=${dragState.polyId.slice(0,6)} v=${dragState.vertexIdx} `
+                    + `entId=${dragEntityId?.slice(0,6) ?? "<none>"} entIdx=${entityPointIdx} `
+                    + `entKind=${dragEnt?.kind ?? "<none>"} cursor=(${sp[0].toFixed(3)},${sp[1].toFixed(3)})`,
+                );
+                // entity が無い (= legacy polygon、または split 頂点掴み) ならフォールバックで polygon 直書き。
+                if (!dragEnt || dragEnt.kind !== "polyline" || entityPointIdx < 0) {
+                    setSolverDragHint({
+                        spaceId: activeRoomId,
+                        polyId: dragState.polyId,
+                        vertexIdx: dragState.vertexIdx,
+                        x: sp[0],
+                        y: sp[1],
+                    });
+                    const baseOuter = currentPoly?.outer ?? dragState.origOuter;
+                    const newOuter: Vec2[] = baseOuter.map((pt, i) =>
+                        i === dragState.vertexIdx ? [sp[0], sp[1]] as Vec2 : [pt[0], pt[1]] as Vec2,
+                    );
+                    propagateSimpleConstraints(newOuter, dragState.polyId, dragState.vertexIdx, constraints);
+                    const newPolys = room.polygons.map(p => {
+                        if (p.id !== dragState.polyId) return p;
+                        return { ...p, outer: newOuter, holes: currentPoly?.holes ?? dragState.origHoles };
+                    });
+                    updatePolysAndSync(newPolys);
+                    return;
+                }
+                // 新しい entity points を構築 (= 該当点だけ cursor へ動かす)。
+                const newPoints: Vec2[] = dragEnt.points.map((p, i) =>
+                    i === entityPointIdx ? [sp[0], sp[1]] as Vec2 : [p[0], p[1]] as Vec2,
+                );
+                // H/V/Coincident の simple propagation を entity.points 上で実行
+                // (= 派生 polygon は entity と 1:1 対応するので indices が一致する)。
+                propagateSimpleConstraints(newPoints, dragState.polyId, entityPointIdx, constraints);
                 setSolverDragHint({
                     spaceId: activeRoomId,
                     polyId: dragState.polyId,
-                    vertexIdx: dragState.vertexIdx,
-                    x: sp[0],
-                    y: sp[1],
+                    vertexIdx: entityPointIdx,
+                    x: newPoints[entityPointIdx][0],
+                    y: newPoints[entityPointIdx][1],
                 });
-                const baseOuter = currentPoly?.outer ?? dragState.origOuter;
-                const newOuter: Vec2[] = baseOuter.map((pt, i) =>
-                    i === dragState.vertexIdx ? [sp[0], sp[1]] as Vec2 : [pt[0], pt[1]] as Vec2,
+                // Cross-poly Coincident propagation:
+                // propagateSimpleConstraints が H/V cascade で動かした全頂点に対して
+                // cross-poly Coincident を伝播する。直接ドラッグした頂点だけだと、
+                // 「BR drag → V cascade で TR が動く → TR の Coincident で Room2 を動かす」
+                // という連鎖が抜け、Room2 だけ取り残されて solver が enforce で形状を
+                // 崩す原因になっていた。
+                interface CrossPolyMove { newPos: [number, number]; vertexIdx: number; }
+                const crossPolyMoves = new Map<string, CrossPolyMove[]>();
+                // 動いた頂点 set を origPoints との比較で算出。
+                const movedEntityIdxs = new Set<number>();
+                for (let i = 0; i < newPoints.length; i++) {
+                    const orig = dragEnt.points[i];
+                    const np = newPoints[i];
+                    if (Math.hypot(np[0] - orig[0], np[1] - orig[1]) > 1e-6) {
+                        movedEntityIdxs.add(i);
+                    }
+                }
+                for (const cid in constraints) {
+                    const c = constraints[cid];
+                    if (c.type !== "Coincident" || c.targets.length < 2) continue;
+                    const t1 = c.targets[0], t2 = c.targets[1];
+                    if (t1.kind !== "SketchPoint" || t2.kind !== "SketchPoint") continue;
+                    let here: typeof t1 | null = null, partner: typeof t2 | null = null;
+                    if (t1.polyId === dragState.polyId && t2.polyId !== dragState.polyId) {
+                        here = t1; partner = t2;
+                    } else if (t2.polyId === dragState.polyId && t1.polyId !== dragState.polyId) {
+                        here = t2; partner = t1;
+                    }
+                    if (!here || !partner) continue;
+                    if (!movedEntityIdxs.has(here.vertexIdx)) continue;
+                    const list = crossPolyMoves.get(partner.polyId) ?? [];
+                    list.push({
+                        newPos: [newPoints[here.vertexIdx][0], newPoints[here.vertexIdx][1]],
+                        vertexIdx: partner.vertexIdx,
+                    });
+                    crossPolyMoves.set(partner.polyId, list);
+                }
+                // 自分の entity を更新 → polygon が derive で更新される。
+                setSpaceEntities(activeRoomId, (entities) =>
+                    entities.map((e) => {
+                        if (e.id !== dragEntityId) return e;
+                        if (e.kind !== "polyline") return e;
+                        return { ...e, points: newPoints };
+                    }),
                 );
-                // Locally propagate simple Horizontal / Vertical / Coincident
-                // constraints so the other endpoint of a constrained edge moves
-                // in the same frame as the dragged vertex. The async solver
-                // will confirm (and extend for more complex constraints).
-                propagateSimpleConstraints(
-                    newOuter,
-                    dragState.polyId,
-                    dragState.vertexIdx,
-                    constraints,
+                // Cross-poly 相手の entity も更新。
+                if (crossPolyMoves.size > 0) {
+                    const liveAll = useAppState.getState().elements;
+                    for (const [partnerPolyId, moves] of crossPolyMoves) {
+                        for (const eid in liveAll) {
+                            const el = liveAll[eid];
+                            if (!el || el.type !== "Space") continue;
+                            const psp = el as SpaceElement;
+                            if (!psp.polygons?.some((p) => p.id === partnerPolyId)) continue;
+                            const partnerPolyIdByEntity = psp.polyIdByEntity ?? {};
+                            let partnerEntityId: string | null = null;
+                            for (const peid in partnerPolyIdByEntity) {
+                                if (partnerPolyIdByEntity[peid] === partnerPolyId) {
+                                    partnerEntityId = peid; break;
+                                }
+                            }
+                            if (!partnerEntityId) break;
+                            const partnerEnt = (psp.entities ?? []).find((e) => e.id === partnerEntityId);
+                            if (!partnerEnt || partnerEnt.kind !== "polyline") break;
+                            const updatedPartnerPoints: Vec2[] = partnerEnt.points.map((pt, i) => {
+                                const m = moves.find((mv) => mv.vertexIdx === i);
+                                return m ? [m.newPos[0], m.newPos[1]] as Vec2 : [pt[0], pt[1]] as Vec2;
+                            });
+                            for (const m of moves) {
+                                propagateSimpleConstraints(updatedPartnerPoints, partnerPolyId, m.vertexIdx, constraints);
+                            }
+                            const pid = partnerEntityId;
+                            setSpaceEntities(eid as ElementId, (entities) =>
+                                entities.map((e) => {
+                                    if (e.id !== pid) return e;
+                                    if (e.kind !== "polyline") return e;
+                                    return { ...e, points: updatedPartnerPoints };
+                                }),
+                            );
+                            break;
+                        }
+                    }
+                }
+                // ── linkedPolys (Collinear/Parallel/Perp/Length) 同期 ────────────
+                // propagateSimpleConstraints の cascade で「ある polygon edge の
+                // 両端点が drag 開始時から **累計** で同じ delta で動いた」場合、
+                // その edge は剛体平行移動したことになる。連結 polygon も同じ
+                // 累計 delta で rigid 平行移動して collinear 関係を保つ。
+                // 単純な単一頂点ドラッグ (= cascade なし) では「両端点同 delta」の
+                // edge が見つからないので何もしない (= 連結 polygon は静止)。
+                const linkedPolysV = dragState.linkedPolys ?? [];
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[vtx-drag] linkedPolys=${linkedPolysV.length} `
+                    + `details=${linkedPolysV.map((l) => `${l.polyId.slice(0,6)}(ents=${l.origEntities.length})`).join(",")}`,
                 );
-                const newPolys = room.polygons.map(p => {
-                    if (p.id !== dragState.polyId) return p;
-                    return {
-                        ...p,
-                        outer: newOuter,
-                        holes: currentPoly?.holes ?? dragState.origHoles,
-                    };
-                });
-                updatePolysAndSync(newPolys);
+                if (linkedPolysV.length > 0) {
+                    const dragPolyForEdge = useAppState.getState()
+                        .elements[activeRoomId as string] as SpaceElement | undefined;
+                    const dragPolyObj = dragPolyForEdge?.polygons?.find((p) => p.id === dragState.polyId);
+                    if (dragPolyObj) {
+                        const polyEdgeListV = polygonEdges(dragPolyObj);
+                        // 累計 delta = newPoints[k] - dragState.origOuter[k]
+                        // Collinear / Parallel は **edge に垂直な方向の translate** が
+                        // 一致していれば「edge 全体が平行移動した」とみなせる
+                        // (= edge に沿う方向の delta は collinear を破らないので無視)。
+                        // この perp-only 判定にすると、矩形の頂点ドラッグで一方の
+                        // 端点が edge 沿いに動いた場合 (= もう片方は H/V cascade で
+                        // perp 方向だけ動く) でも edge の perp 平行移動を検出できる。
+                        let bestEdgeDelta: [number, number] | null = null;
+                        const edgeDeltas: string[] = [];
+                        for (let ei = 0; ei < polyEdgeListV.length; ei++) {
+                            const [ai, bi] = polyEdgeListV[ei];
+                            if (ai >= newPoints.length || bi >= newPoints.length) continue;
+                            if (ai >= dragState.origOuter.length || bi >= dragState.origOuter.length) continue;
+                            const oA = dragState.origOuter[ai];
+                            const oB = dragState.origOuter[bi];
+                            const nA = newPoints[ai];
+                            const nB = newPoints[bi];
+                            const adx = nA[0] - oA[0], ady = nA[1] - oA[1];
+                            const bdx = nB[0] - oB[0], bdy = nB[1] - oB[1];
+                            // edge 方向 (orig 基準) と perp 方向。
+                            const edx = oB[0] - oA[0], edy = oB[1] - oA[1];
+                            const elen = Math.hypot(edx, edy);
+                            if (elen < 1e-9) continue;
+                            const ux = edx / elen, uy = edy / elen;
+                            const nx = -uy, ny = ux; // 90° CCW perp
+                            // 各端点の perp 成分
+                            const aPerp = adx * nx + ady * ny;
+                            const bPerp = bdx * nx + bdy * ny;
+                            edgeDeltas.push(
+                                `e${ei}(${ai},${bi}):a=(${adx.toFixed(3)},${ady.toFixed(3)})/perp=${aPerp.toFixed(3)} `
+                                + `b=(${bdx.toFixed(3)},${bdy.toFixed(3)})/perp=${bPerp.toFixed(3)}`,
+                            );
+                            if (Math.abs(aPerp - bPerp) > 1e-6) continue;
+                            if (Math.abs(aPerp) < 1e-9) continue;
+                            // この edge に cross-poly 拘束があるかチェック。
+                            let hasCross = false;
+                            for (const cid in constraints) {
+                                const c = constraints[cid];
+                                if (c.type !== "Collinear" && c.type !== "Parallel"
+                                    && c.type !== "Perpendicular" && c.type !== "Length") continue;
+                                if (!Array.isArray(c.targets)) continue;
+                                const onEdge = c.targets.some((t: any) =>
+                                    t.kind === "SketchEdge"
+                                    && t.polyId === dragState.polyId
+                                    && t.edgeIdx === ei,
+                                );
+                                if (!onEdge) continue;
+                                const otherSide = c.targets.some((t: any) =>
+                                    (t.kind === "SketchEdge" || t.kind === "SketchPoint")
+                                    && t.polyId !== dragState.polyId,
+                                );
+                                if (otherSide) { hasCross = true; break; }
+                            }
+                            if (hasCross) {
+                                // perp 方向のみで translate (edge に沿う方向の delta は無視)。
+                                bestEdgeDelta = [aPerp * nx, aPerp * ny];
+                                break;
+                            }
+                        }
+                        // eslint-disable-next-line no-console
+                        console.log(
+                            `[vtx-drag] edges=[${edgeDeltas.join(" | ")}] `
+                            + `bestEdgeDelta=${bestEdgeDelta ? `(${bestEdgeDelta[0].toFixed(3)},${bestEdgeDelta[1].toFixed(3)})` : "null"}`,
+                        );
+                        if (bestEdgeDelta) {
+                            const [tdx, tdy] = bestEdgeDelta;
+                            const linkedBySpaceV = new Map<string, typeof linkedPolysV>();
+                            for (const lp of linkedPolysV) {
+                                let arr = linkedBySpaceV.get(lp.spaceId);
+                                if (!arr) { arr = []; linkedBySpaceV.set(lp.spaceId, arr); }
+                                arr.push(lp);
+                            }
+                            for (const [spaceId, lps] of linkedBySpaceV) {
+                                const lpsWithEntity = lps.filter((lp) => lp.origEntities.length > 0);
+                                const lpsLegacy = lps.filter((lp) => lp.origEntities.length === 0);
+                                if (lpsWithEntity.length > 0) {
+                                    setSpaceEntities(spaceId as ElementId, (entities) =>
+                                        entities.map((e) => {
+                                            for (const lp of lpsWithEntity) {
+                                                const orig = lp.origEntities.find((o) => o.entityId === e.id);
+                                                if (orig) return translateEntity(orig.snapshot, tdx, tdy);
+                                            }
+                                            return e;
+                                        }),
+                                    );
+                                }
+                                if (lpsLegacy.length > 0) {
+                                    const sp = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+                                    if (sp) {
+                                        const newPolys = sp.polygons.map((p) => {
+                                            const lp = lpsLegacy.find((x) => x.polyId === p.id);
+                                            if (!lp) return p;
+                                            return {
+                                                ...p,
+                                                outer: lp.origOuter.map((pt) => [pt[0] + tdx, pt[1] + tdy] as Vec2),
+                                                holes: lp.origHoles.map((h) => h.map((pt) => [pt[0] + tdx, pt[1] + tdy] as Vec2)),
+                                            };
+                                        });
+                                        updateElement(spaceId as ElementId, {
+                                            polygons: newPolys,
+                                            dirtyFlags: new Set([...(sp.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                                        } as any);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
             } else if (dragState.kind === "poly") {
                 const dpoly = dragState;
+                if (!dpoly.moved && ROOM_SHAPE_DEBUG) {
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `[room-debug] drag move kind=poly room=${dpoly.spaceId.slice(0, 6)} `
+                        + `poly=${dpoly.polyId.slice(0, 6)} `
+                        + `start=(${dpoly.startWorld[0].toFixed(3)},${dpoly.startWorld[1].toFixed(3)}) `
+                        + `cursor=(${wp[0].toFixed(3)},${wp[1].toFixed(3)})`,
+                    );
+                }
+                // 拘束優先ロック (Coincident のみ): 別 polygon と頂点が一致して
+                // いる場合、全体移動は相手 polygon の一辺を引っ張って形状を歪める
+                // ので抑制。Coincident 解放には先に拘束を削除する必要がある。
+                // ※ Collinear / Parallel / Perpendicular / Length などの「向き・
+                // 距離の拘束」は、自 polygon と **連結 polygon** を **同じ delta で
+                // 一緒に平行移動** すれば拘束が保たれるので、ブロックせず後段で
+                // linkedPolys として一緒に動かす。
+                for (const cid in constraints) {
+                    const c = constraints[cid];
+                    if (c.type !== "Coincident" || c.targets.length < 2) continue;
+                    const t1 = c.targets[0], t2 = c.targets[1];
+                    if (t1.kind !== "SketchPoint" || t2.kind !== "SketchPoint") continue;
+                    if ((t1.polyId === dpoly.polyId && t2.polyId !== dpoly.polyId)
+                        || (t2.polyId === dpoly.polyId && t1.polyId !== dpoly.polyId)) {
+                        setGridSnapInfo(null);
+                        return;
+                    }
+                }
                 let dx = wp[0] - dpoly.startWorld[0], dz = wp[1] - dpoly.startWorld[1];
                 // BVH snap: for each translated vertex, query origin + grid
                 // intersection snap targets. Adopt the closest hit across all
@@ -5887,29 +7315,82 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 const bvh = snapBVHRef.current;
                 const useResStep = designModeRef.current === "jpResidentialGrid";
                 const resStep = RESIDENTIAL_GRID_SECONDARY_M;
-                let bestCorr: { dx: number; dz: number; target: [number, number]; dist: number } | null = null;
+                const snapTol = DEFAULT_GRID_SNAP_TOLERANCE;
+                // 全体移動の頂点スナップ。各 origOuter 頂点 + delta 位置について
+                // (a) grid 交点 / 原点 (b) 他形状の頂点 (c) 他形状の辺 投影 (d) 住居系
+                // grid step を試し、最も近い吸着先を採用する。snap 種別 (kind) も
+                // 保持して、polyVertex / polyEdge ドラッグと同じシンボルを表示する。
+                let bestCorr: {
+                    dx: number; dz: number;
+                    target: [number, number];
+                    dist: number;
+                    kind: SnapKind;
+                } | null = null;
                 for (const pt of dpoly.origOuter) {
                     const tx = pt[0] + dx, tz = pt[1] + dz;
-                    const hit = bvh.nearestWithin(tx, tz, DEFAULT_GRID_SNAP_TOLERANCE);
+                    // (a) Grid intersections / origin
+                    const hit = bvh.nearestWithin(tx, tz, snapTol);
                     if (hit) {
                         const d = Math.hypot(tx - hit.x, tz - hit.z);
                         if (!bestCorr || d < bestCorr.dist) {
-                            bestCorr = { dx: hit.x - pt[0], dz: hit.z - pt[1], target: [hit.x, hit.z], dist: d };
+                            bestCorr = { dx: hit.x - pt[0], dz: hit.z - pt[1], target: [hit.x, hit.z], dist: d, kind: "obj" };
                         }
                     }
+                    // (b) Other room polygon vertices
+                    for (const elId in elementsRef.current) {
+                        const el = elementsRef.current[elId];
+                        if (!el || el.type !== "Space") continue;
+                        for (const p of (el as SpaceElement).polygons ?? []) {
+                            if (p.id === dpoly.polyId) continue;
+                            if (p.wallOutlineOf) continue;
+                            for (const vp of p.outer) {
+                                const d = Math.hypot(tx - vp[0], tz - vp[1]);
+                                if (d <= snapTol && (!bestCorr || d < bestCorr.dist)) {
+                                    bestCorr = { dx: vp[0] - pt[0], dz: vp[1] - pt[1], target: [vp[0], vp[1]], dist: d, kind: "vertex" };
+                                }
+                            }
+                        }
+                    }
+                    // (c) Other room polygon edges (perpendicular projection)。
+                    // 頂点が他形状の辺の上に乗ったらその辺へ吸着する。
+                    for (const elId in elementsRef.current) {
+                        const el = elementsRef.current[elId];
+                        if (!el || el.type !== "Space") continue;
+                        for (const p of (el as SpaceElement).polygons ?? []) {
+                            if (p.id === dpoly.polyId) continue;
+                            if (p.wallOutlineOf) continue;
+                            const edges = polygonEdges(p);
+                            for (const [ai, bi] of edges) {
+                                const a = p.outer[ai];
+                                const b = p.outer[bi];
+                                const edx = b[0] - a[0], edy = b[1] - a[1];
+                                const lenSq = edx * edx + edy * edy;
+                                if (lenSq < 1e-12) continue;
+                                let t = ((tx - a[0]) * edx + (tz - a[1]) * edy) / lenSq;
+                                t = Math.max(0, Math.min(1, t));
+                                const px = a[0] + edx * t;
+                                const py = a[1] + edy * t;
+                                const d = Math.hypot(tx - px, tz - py);
+                                if (d <= snapTol && (!bestCorr || d < bestCorr.dist)) {
+                                    bestCorr = { dx: px - pt[0], dz: py - pt[1], target: [px, py], dist: d, kind: "edge" };
+                                }
+                            }
+                        }
+                    }
+                    // (d) Residential grid step
                     if (useResStep) {
                         const sx = Math.round(tx / resStep) * resStep;
                         const sz = Math.round(tz / resStep) * resStep;
                         const d = Math.hypot(tx - sx, tz - sz);
-                        if (d <= DEFAULT_GRID_SNAP_TOLERANCE && (!bestCorr || d < bestCorr.dist)) {
-                            bestCorr = { dx: sx - pt[0], dz: sz - pt[1], target: [sx, sz], dist: d };
+                        if (d <= snapTol && (!bestCorr || d < bestCorr.dist)) {
+                            bestCorr = { dx: sx - pt[0], dz: sz - pt[1], target: [sx, sz], dist: d, kind: "obj" };
                         }
                     }
                 }
                 if (bestCorr) {
                     dx = bestCorr.dx;
                     dz = bestCorr.dz;
-                    setGridSnapInfo({ point: bestCorr.target, kind: "obj" });
+                    setGridSnapInfo({ point: bestCorr.target, kind: bestCorr.kind });
                 } else {
                     setGridSnapInfo(null);
                 }
@@ -5958,7 +7439,20 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 //    更新に落とす。
                 const dragSpaceId = dpoly.spaceId as ElementId;
                 const useEntityPath = dpoly.origEntities.length > 0;
+                // **設計原則 (= ユーザ指示)**: entity は真値、polygon は entity からの
+                // 一方通行 derive。drag handler は entity の points を直接動かすのみ。
+                // polygon は setSpaceEntities → derivePolygonsFromEntities で自動更新。
+                // 以前は polygon を直接書き戻していたが、それは entity と polygon の
+                // 不整合を生み、再 derive で polygon が縮む等の現象を起こしていた。
+                // ここでは polygon 直書きをやめ、entity だけ更新する。
                 if (useEntityPath) {
+                    // pins は **dragSpace の entity を更新後の状態** で立てる。
+                    // 更新後の polygon は entity-derived なので、entity 各点の
+                    // (orig + delta) 位置が polygon の vertex 位置と一致する。
+                    // pins の vertexIdx は entity-derived polygon の頂点インデックスを
+                    // そのまま使う (= 通常 0..entityPoints.length-1)。
+                    const pins: import("../../application/AppState").SolverDragPin[] = [];
+                    // entity を translate して setSpaceEntities で書く。
                     setSpaceEntities(dragSpaceId, (entities) =>
                         entities.map((e) => {
                             const orig = dpoly.origEntities.find((o) => o.entityId === e.id);
@@ -5966,45 +7460,98 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                             return translateEntity(orig.snapshot, dx, dz);
                         }),
                     );
-                }
-                // FreeCAD `MoveParameters` 風の **多点ピン** を solver に渡す。
-                // poly drag は全頂点を delta 平行移動した位置にピン留め。
-                // solver は他の自由頂点を H/V/Distance などで reflow する。
-                // entity 経路で polygon は既に translated 状態だが、solver が
-                // 拘束違反を検出したらピンを唯一の真実として再解決する。
-                const pins: import("../../application/AppState").SolverDragPin[] =
-                    dpoly.origOuter.map((pt, i) => ({
-                        spaceId: dragSpaceId,
-                        polyId: dpoly.polyId,
-                        vertexIdx: i,
-                        x: pt[0] + dx,
-                        y: pt[1] + dz,
-                    }));
-                setSolverDragHint(pins);
-                // 派生でない部分 (= 同心円 partner / outline / 別 polygon 由来の
-                // Coincident link / 別 polygon が entity を持たないケース) は
-                // 従来通り polygon 直接更新で処理する。entity を持つ polygon は
-                // 上で更新済みなので skip する。
-                const newPolys = room.polygons.map(p => {
-                    if (p.id === dpoly.polyId) {
-                        if (useEntityPath) return p; // 上で entity 経由更新済み
-                        const next: RoomPolygon = {
-                            ...p,
-                            outer: dpoly.origOuter.map(pt => [pt[0] + dx, pt[1] + dz] as Vec2),
-                            holes: dpoly.origHoles.map(h => h.map(pt => [pt[0] + dx, pt[1] + dz] as Vec2)),
-                        };
-                        if (p.shape?.type === "circle" && dpoly.origShapeCenter && dpoly.origShapeRadius !== undefined) {
-                            next.shape = {
-                                type: "circle",
-                                center: [dpoly.origShapeCenter[0] + dx, dpoly.origShapeCenter[1] + dz],
-                                radius: dpoly.origShapeRadius,
-                            };
-                        }
-                        return next;
+                    // cross-poly 拘束で連結された別 polygon も同じ delta で translate。
+                    // Space ごとにまとめて setSpaceEntities を呼ぶ。
+                    const linkedBySpace = new Map<string, typeof dpoly.linkedPolys>();
+                    for (const lp of dpoly.linkedPolys ?? []) {
+                        let arr = linkedBySpace.get(lp.spaceId);
+                        if (!arr) { arr = []; linkedBySpace.set(lp.spaceId, arr); }
+                        arr.push(lp);
                     }
-                    const partner = partnerById.get(p.id);
-                    if (partner) {
-                        return {
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `[poly-drag] linkedPolys=${dpoly.linkedPolys?.length ?? 0} `
+                        + `spaces=${linkedBySpace.size} dx=${dx.toFixed(3)} dz=${dz.toFixed(3)} `
+                        + `details=${(dpoly.linkedPolys ?? []).map((l) => `${l.polyId.slice(0,6)}(ents=${l.origEntities.length})`).join(",")}`,
+                    );
+                    for (const [spaceId, lps] of linkedBySpace) {
+                        // entity を持つ linked polygon は entity を translate (= polygon
+                        // は entity から再 derive されて自動追従)。entity 不在 (= legacy
+                        // polygon) の場合は polygon.outer / holes を直接 translate して
+                        // 同じ画面同期を実現する。
+                        const lpsWithEntity = lps.filter((lp) => lp.origEntities.length > 0);
+                        const lpsLegacy = lps.filter((lp) => lp.origEntities.length === 0);
+                        if (lpsWithEntity.length > 0) {
+                            setSpaceEntities(spaceId as ElementId, (entities) =>
+                                entities.map((e) => {
+                                    for (const lp of lpsWithEntity) {
+                                        const orig = lp.origEntities.find((o) => o.entityId === e.id);
+                                        if (orig) return translateEntity(orig.snapshot, dx, dz);
+                                    }
+                                    return e;
+                                }),
+                            );
+                        }
+                        if (lpsLegacy.length > 0) {
+                            const sp = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+                            if (sp) {
+                                const newPolys = sp.polygons.map((p) => {
+                                    const lp = lpsLegacy.find((x) => x.polyId === p.id);
+                                    if (!lp) return p;
+                                    return {
+                                        ...p,
+                                        outer: lp.origOuter.map((pt) => [pt[0] + dx, pt[1] + dz] as Vec2),
+                                        holes: lp.origHoles.map((h) => h.map((pt) => [pt[0] + dx, pt[1] + dz] as Vec2)),
+                                    };
+                                });
+                                updateElement(spaceId as ElementId, {
+                                    polygons: newPolys,
+                                    dirtyFlags: new Set([...(sp.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                                } as any);
+                            }
+                        }
+                    }
+                    // 連結 polygon の頂点も pin に積む (= solver が再度動かさない
+                    // ように固定)。
+                    for (const lp of dpoly.linkedPolys ?? []) {
+                        const liveSp = useAppState.getState().elements[lp.spaceId] as SpaceElement | undefined;
+                        const lvPoly = liveSp?.polygons?.find((p) => p.id === lp.polyId);
+                        if (!lvPoly) continue;
+                        for (let i = 0; i < lvPoly.outer.length; i++) {
+                            const pt = lvPoly.outer[i];
+                            pins.push({
+                                spaceId: lp.spaceId as ElementId,
+                                polyId: lp.polyId,
+                                vertexIdx: i,
+                                x: pt[0],
+                                y: pt[1],
+                            });
+                        }
+                    }
+                    // entity 更新後の polygon を読み、各頂点を pin。
+                    const liveSpaceAfter = useAppState.getState().elements[dragSpaceId] as SpaceElement | undefined;
+                    const livePoly = liveSpaceAfter?.polygons?.find((p) => p.id === dpoly.polyId);
+                    if (livePoly) {
+                        for (let i = 0; i < livePoly.outer.length; i++) {
+                            const pt = livePoly.outer[i];
+                            pins.push({
+                                spaceId: dragSpaceId,
+                                polyId: dpoly.polyId,
+                                vertexIdx: i,
+                                x: pt[0],
+                                y: pt[1],
+                            });
+                        }
+                    }
+                    setSolverDragHint(pins);
+                    // 同心円 partner / outline / coincident-link 先の polygon は
+                    // **別 polygon** で entity 経路で動かない。これらは個別に直書き
+                    // で追従させる (= 既存挙動を維持)。entity 駆動への置換は別途。
+                    const partnerUpdates: RoomPolygon[] = [];
+                    for (const partner of dpoly.origConcentric) {
+                        const p = room.polygons.find((q) => q.id === partner.polyId);
+                        if (!p) continue;
+                        partnerUpdates.push({
                             ...p,
                             outer: partner.outer.map((pt) => [pt[0] + dx, pt[1] + dz] as Vec2),
                             holes: partner.holes.map((h) => h.map((pt) => [pt[0] + dx, pt[1] + dz] as Vec2)),
@@ -6013,94 +7560,94 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                                 center: [partner.shapeCenter[0] + dx, partner.shapeCenter[1] + dz] as Vec2,
                                 radius: partner.shapeRadius,
                             },
-                        };
+                        });
                     }
-                    const outlineSnap = dpoly.origOutlines.find((o) => o.polyId === p.id);
-                    if (outlineSnap) {
-                        return {
+                    for (const outlineSnap of dpoly.origOutlines) {
+                        const p = room.polygons.find((q) => q.id === outlineSnap.polyId);
+                        if (!p) continue;
+                        partnerUpdates.push({
                             ...p,
                             outer: outlineSnap.outer.map((pt) => [pt[0] + dx, pt[1] + dz] as Vec2),
                             holes: outlineSnap.holes.map((h) => h.map((pt) => [pt[0] + dx, pt[1] + dz] as Vec2)),
-                        };
-                    }
-                    return p;
-                });
-                // Cross-polygon Coincident propagation: move each partner
-                // polygon's coincident vertex to the dragged polygon's new
-                // position, then propagate through that polygon's H/V/etc.
-                let reshapedPolys = newPolys;
-                if (coincidentLinks.length > 0) {
-                    const draggedOuter = reshapedPolys.find((p) => p.id === dpoly.polyId)?.outer;
-                    if (draggedOuter) {
-                        reshapedPolys = reshapedPolys.map((p) => {
-                            const linksHere = coincidentLinks.filter((l) => l.otherPolyId === p.id);
-                            if (linksHere.length === 0) return p;
-                            const newOuter: Vec2[] = p.outer.map((pt) => [pt[0], pt[1]] as Vec2);
-                            for (const link of linksHere) {
-                                const srcPt = draggedOuter[link.dragVertexIdx];
-                                if (!srcPt) continue;
-                                if (link.otherVertexIdx < 0 || link.otherVertexIdx >= newOuter.length) continue;
-                                newOuter[link.otherVertexIdx] = [srcPt[0], srcPt[1]];
-                            }
-                            for (const link of linksHere) {
-                                propagateSimpleConstraints(
-                                    newOuter,
-                                    p.id,
-                                    link.otherVertexIdx,
-                                    constraints,
-                                );
-                            }
-                            return { ...p, outer: newOuter };
                         });
                     }
-                }
-                // entity 経路を使った場合: dragSpace の polygon は setSpaceEntities
-                // が re-derive 済みなので updatePolysAndSync を呼ぶ必要なし。
-                // ただし outline / concentric partner / coincident 先などは
-                // polygon 直接更新したので、それらだけを別途反映する。
-                // entity 経路を使わない (フォールバック) 場合は従来通り全部
-                // updatePolysAndSync に流す。
-                if (!useEntityPath) {
-                    updatePolysAndSync(reshapedPolys);
-                } else {
-                    // 直接更新が必要だった polygon (= entity 由来でない) のみ書き戻す
-                    const directPolys: RoomPolygon[] = [];
-                    for (const p of reshapedPolys) {
-                        // 自身 (entity 経路で更新済み) は skip
-                        if (p.id === dpoly.polyId) continue;
-                        // 元の polygon と outer 参照が同じなら変更なし
-                        const old = room.polygons.find((q) => q.id === p.id);
-                        if (old && p === old) continue;
-                        directPolys.push(p);
+                    // Cross-poly Coincident link 先も同じく直書き。
+                    if (coincidentLinks.length > 0) {
+                        const liveAfter = useAppState.getState().elements[dragSpaceId] as SpaceElement | undefined;
+                        const draggedOuter = liveAfter?.polygons?.find((p) => p.id === dpoly.polyId)?.outer;
+                        if (draggedOuter) {
+                            const linkedPolyIds = new Set(coincidentLinks.map((l) => l.otherPolyId));
+                            for (const pid of linkedPolyIds) {
+                                const p = room.polygons.find((q) => q.id === pid);
+                                if (!p) continue;
+                                const newOuter: Vec2[] = p.outer.map((pt) => [pt[0], pt[1]] as Vec2);
+                                const linksHere = coincidentLinks.filter((l) => l.otherPolyId === pid);
+                                for (const link of linksHere) {
+                                    const srcPt = draggedOuter[link.dragVertexIdx];
+                                    if (!srcPt) continue;
+                                    if (link.otherVertexIdx < 0 || link.otherVertexIdx >= newOuter.length) continue;
+                                    newOuter[link.otherVertexIdx] = [srcPt[0], srcPt[1]];
+                                }
+                                for (const link of linksHere) {
+                                    propagateSimpleConstraints(newOuter, p.id, link.otherVertexIdx, constraints);
+                                }
+                                partnerUpdates.push({ ...p, outer: newOuter });
+                            }
+                        }
                     }
-                    if (directPolys.length > 0) {
-                        const idSet = new Set(directPolys.map((p) => p.id));
-                        const merged = room.polygons.map((p) =>
-                            idSet.has(p.id) ? directPolys.find((q) => q.id === p.id)! : p,
+                    if (partnerUpdates.length > 0) {
+                        const idSet = new Set(partnerUpdates.map((p) => p.id));
+                        const liveSpacePost = useAppState.getState().elements[dragSpaceId] as SpaceElement | undefined;
+                        const basePolys = liveSpacePost?.polygons ?? [];
+                        const merged = basePolys.map((p) =>
+                            idSet.has(p.id) ? partnerUpdates.find((q) => q.id === p.id)! : p,
                         );
                         updateElement(dragSpaceId, {
                             polygons: merged,
                             dirtyFlags: new Set([...(room.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
                         } as any);
                     }
+                } else {
+                    // ── Legacy フォールバック (entity 無しの polygon) ─────────
+                    // 旧データなど entity 不在の polygon を direct write で動かす。
+                    const pins: import("../../application/AppState").SolverDragPin[] =
+                        dpoly.origOuter.map((pt, i) => ({
+                            spaceId: dragSpaceId,
+                            polyId: dpoly.polyId,
+                            vertexIdx: i,
+                            x: pt[0] + dx,
+                            y: pt[1] + dz,
+                        }));
+                    setSolverDragHint(pins);
+                    const newPolys = room.polygons.map(p => {
+                        if (p.id === dpoly.polyId) {
+                            const next: RoomPolygon = {
+                                ...p,
+                                outer: dpoly.origOuter.map(pt => [pt[0] + dx, pt[1] + dz] as Vec2),
+                                holes: dpoly.origHoles.map(h => h.map(pt => [pt[0] + dx, pt[1] + dz] as Vec2)),
+                            };
+                            if (p.shape?.type === "circle" && dpoly.origShapeCenter && dpoly.origShapeRadius !== undefined) {
+                                next.shape = {
+                                    type: "circle",
+                                    center: [dpoly.origShapeCenter[0] + dx, dpoly.origShapeCenter[1] + dz],
+                                    radius: dpoly.origShapeRadius,
+                                };
+                            }
+                            return next;
+                        }
+                        return p;
+                    });
+                    updatePolysAndSync(newPolys);
                 }
-                // Walls are also re-synced inside updatePolysAndSync via
-                // computeMiteredWallAxes; but we still translate the recorded
-                // origWallAxes directly to keep the per-frame axis identical
-                // to the user's drag (avoids miter-recompute drift).
-                for (const w of dpoly.origWallAxes) {
-                    const newAxis: [Vec3, Vec3] = [
-                        [w.a[0] + dx, w.a[1], w.a[2] + dz],
-                        [w.b[0] + dx, w.b[1], w.b[2] + dz],
-                    ];
-                    updateElement(w.id, {
-                        axis: newAxis,
-                        dirtyFlags: new Set(["Geometry", "Mesh", "Render"]),
-                    } as any);
-                }
+                // drag 中は wall slab を描画していないので、毎フレームの
+                // wall axis 更新は完全に skip する (state 更新コスト削減)。
+                // mouseup の `maybeRealtimeRegenWalls` → wallRegenerate が wall を
+                // 新位置に正しく再生成するので最終結果は変わらない。
             } else if (dragState.kind === "polyEdge") {
                 const d = dragState; // polyEdge
-                const s = applyGridSnap(wp);
+                // エッジドラッグでも他の部屋の頂点・辺・通芯交点・軸整列に
+                // スナップする。自 polygon は自分の辺と被るので除外。
+                const s = applyWallPathSnap(wp, { excludePolyId: d.polyId });
                 setGridSnapInfo(s.info);
                 const sp = s.p;
                 const dx = sp[0] - d.startWorld[0], dz = sp[1] - d.startWorld[1];
@@ -6127,13 +7674,81 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 // updatePolysAndSync 側で propagateSimpleConstraints も走る
                 // ので、軽量な拘束 (= H/V/Coincident) は同フレームで解決し、
                 // それ以外 (= 距離拘束など) を solver が後追いで解く。
+                const edgePins: import("../../application/AppState").SolverDragPin[] = [];
                 if (activeRoomId) {
-                    setSolverDragHint([
+                    edgePins.push(
                         { spaceId: activeRoomId, polyId: d.polyId, vertexIdx: i,
                           x: targetI[0], y: targetI[1] },
                         { spaceId: activeRoomId, polyId: d.polyId, vertexIdx: j,
                           x: targetJ[0], y: targetJ[1] },
-                    ]);
+                    );
+                }
+                // cross-poly 拘束 (Collinear / Parallel / Perpendicular / Length) で
+                // 連結された別 polygon を同じ (normal * perp) で rigid 平行移動。
+                // これでドラッグ中も collinear 関係を維持し、相手矩形の底辺が
+                // 同期して動く (= FreeCAD と同じ振る舞い)。
+                const linkPolysE = d.linkedPolys ?? [];
+                if (linkPolysE.length > 0) {
+                    const tdx = d.normal[0] * perp;
+                    const tdy = d.normal[1] * perp;
+                    const linkedBySpaceE = new Map<string, typeof linkPolysE>();
+                    for (const lp of linkPolysE) {
+                        let arr = linkedBySpaceE.get(lp.spaceId);
+                        if (!arr) { arr = []; linkedBySpaceE.set(lp.spaceId, arr); }
+                        arr.push(lp);
+                    }
+                    for (const [spaceId, lps] of linkedBySpaceE) {
+                        const lpsWithEntity = lps.filter((lp) => lp.origEntities.length > 0);
+                        const lpsLegacy = lps.filter((lp) => lp.origEntities.length === 0);
+                        if (lpsWithEntity.length > 0) {
+                            setSpaceEntities(spaceId as ElementId, (entities) =>
+                                entities.map((e) => {
+                                    for (const lp of lpsWithEntity) {
+                                        const orig = lp.origEntities.find((o) => o.entityId === e.id);
+                                        if (orig) return translateEntity(orig.snapshot, tdx, tdy);
+                                    }
+                                    return e;
+                                }),
+                            );
+                        }
+                        if (lpsLegacy.length > 0) {
+                            const sp = useAppState.getState().elements[spaceId] as SpaceElement | undefined;
+                            if (sp) {
+                                const newPolys = sp.polygons.map((p) => {
+                                    const lp = lpsLegacy.find((x) => x.polyId === p.id);
+                                    if (!lp) return p;
+                                    return {
+                                        ...p,
+                                        outer: lp.origOuter.map((pt) => [pt[0] + tdx, pt[1] + tdy] as Vec2),
+                                        holes: lp.origHoles.map((h) => h.map((pt) => [pt[0] + tdx, pt[1] + tdy] as Vec2)),
+                                    };
+                                });
+                                updateElement(spaceId as ElementId, {
+                                    polygons: newPolys,
+                                    dirtyFlags: new Set([...(sp.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
+                                } as any);
+                            }
+                        }
+                        // 連結 polygon の頂点も pin に積む。
+                        for (const lp of lps) {
+                            const liveSp = useAppState.getState().elements[lp.spaceId] as SpaceElement | undefined;
+                            const lvPoly = liveSp?.polygons?.find((p) => p.id === lp.polyId);
+                            if (!lvPoly) continue;
+                            for (let k = 0; k < lvPoly.outer.length; k++) {
+                                const pt = lvPoly.outer[k];
+                                edgePins.push({
+                                    spaceId: lp.spaceId as ElementId,
+                                    polyId: lp.polyId,
+                                    vertexIdx: k,
+                                    x: pt[0],
+                                    y: pt[1],
+                                });
+                            }
+                        }
+                    }
+                }
+                if (edgePins.length > 0) {
+                    setSolverDragHint(edgePins);
                 }
                 // Outer-edge drag: reverse-map through negative mitering to
                 // the inner, same pattern as the outer-vertex case.
@@ -6156,6 +7771,30 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     const newInnerOuter = computeMiteredCorners(
                         newOutline, [cx, cy], -innerPoly.wallThickness,
                     );
+                    // entity-driven outline edge drag (= inner の entity を更新)。
+                    const polyIdByEntityOE = room.polyIdByEntity ?? {};
+                    let innerEntityIdE: string | null = null;
+                    for (const eid in polyIdByEntityOE) {
+                        if (polyIdByEntityOE[eid] === innerPoly.id) { innerEntityIdE = eid; break; }
+                    }
+                    const innerEntE = innerEntityIdE
+                        ? (room.entities ?? []).find((e) => e.id === innerEntityIdE)
+                        : undefined;
+                    if (innerEntE && innerEntE.kind === "polyline"
+                        && innerEntE.points.length === newInnerOuter.length && activeRoomId) {
+                        setSpaceEntities(activeRoomId, (entities) =>
+                            entities.map((e) => {
+                                if (e.id !== innerEntityIdE) return e;
+                                if (e.kind !== "polyline") return e;
+                                return {
+                                    ...e,
+                                    points: newInnerOuter.map((p) => [p[0], p[1]] as Vec2),
+                                };
+                            }),
+                        );
+                        return;
+                    }
+                    // フォールバック: entity 不在 / 頂点数不一致なら polygon 直書き。
                     const newPolys = room.polygons.map(p => {
                         if (p.id !== innerPoly.id) return p;
                         return { ...p, outer: newInnerOuter };
@@ -6185,20 +7824,44 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                     );
                     return;
                 }
-                // Use current state for the other vertices so solver adjustments
-                // from previous frames aren't overwritten (avoids shaking).
-                const currentPoly = room.polygons.find((p) => p.id === d.polyId);
-                const baseOuter = currentPoly?.outer ?? d.origOuter;
-                const newOuter: Vec2[] = baseOuter.map((pt, idx) => {
-                    if (idx === i) return targetI;
-                    if (idx === j) return targetJ;
-                    return [pt[0], pt[1]] as Vec2;
+                // ── polyEdge entity-driven path ─────────────────────────────
+                // 辺の両端点を perp 方向に動かす。entity 駆動なので、対応する
+                // entity polyline の points を直接更新し polygon は derive で更新。
+                // entityId / entityPointIdxA/B は drag 開始時点で確定済 (dragState 内)。
+                const edgeEntityId = d.entityId;
+                const epIdxI = d.entityPointIdxA ?? -1;
+                const epIdxJ = d.entityPointIdxB ?? -1;
+                const edgeEnt = edgeEntityId
+                    ? (room.entities ?? []).find((e) => e.id === edgeEntityId)
+                    : undefined;
+                if (!edgeEnt || edgeEnt.kind !== "polyline" || epIdxI < 0 || epIdxJ < 0) {
+                    // legacy フォールバック (entity 不在 or split 端点)
+                    const currentPolyL = room.polygons.find((p) => p.id === d.polyId);
+                    const baseOuterL = currentPolyL?.outer ?? d.origOuter;
+                    const newOuterL: Vec2[] = baseOuterL.map((pt, idx) => {
+                        if (idx === i) return targetI;
+                        if (idx === j) return targetJ;
+                        return [pt[0], pt[1]] as Vec2;
+                    });
+                    const newPolysL = room.polygons.map(p => {
+                        if (p.id !== d.polyId) return p;
+                        return { ...p, outer: newOuterL, holes: currentPolyL?.holes ?? d.origHoles };
+                    });
+                    updatePolysAndSync(newPolysL);
+                    return;
+                }
+                const newPointsEdge: Vec2[] = edgeEnt.points.map((p, k) => {
+                    if (k === epIdxI) return [targetI[0], targetI[1]] as Vec2;
+                    if (k === epIdxJ) return [targetJ[0], targetJ[1]] as Vec2;
+                    return [p[0], p[1]] as Vec2;
                 });
-                const newPolys = room.polygons.map(p => {
-                    if (p.id !== d.polyId) return p;
-                    return { ...p, outer: newOuter, holes: currentPoly?.holes ?? d.origHoles };
-                });
-                updatePolysAndSync(newPolys);
+                setSpaceEntities(activeRoomId, (entities) =>
+                    entities.map((e) => {
+                        if (e.id !== edgeEntityId) return e;
+                        if (e.kind !== "polyline") return e;
+                        return { ...e, points: newPointsEdge };
+                    }),
+                );
             }
             return;
         }
@@ -6209,9 +7872,18 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             if (gridSnapInfo) setGridSnapInfo(null);
             const r = getCanvasRect();
             const sx = e.clientX - (r?.left ?? 0), sy = e.clientY - (r?.top ?? 0);
-            const pvtx = hitTestPolyVertex(sx, sy);
+            // cross-space ヒット: アクティブ Room 以外の頂点・辺でもホバー反応。
+            // pointerdown と同じ走査を使うことで「ホバー → クリック」の対象を
+            // 一致させる (= ホバーで光った辺を確実に掴める)。
+            const pvtxX = hitTestPolyVertexAcrossSpaces(sx, sy);
+            const pvtx: HoveredPolyVertex | null = pvtxX
+                ? { polyId: pvtxX.polyId, vertexIdx: pvtxX.vertexIdx, wx: pvtxX.wx, wz: pvtxX.wz }
+                : null;
             setHoveredPolyVertex(pvtx);
-            const edge = pvtx ? null : hitTestEdge(sx, sy);
+            const edgeX = pvtx ? null : hitTestEdgeAcrossSpaces(sx, sy);
+            const edge: HoveredEdge | null = edgeX
+                ? { polyId: edgeX.polyId, edgeIdx: edgeX.edgeIdx, midWx: edgeX.midWx, midWz: edgeX.midWz }
+                : null;
             setHoveredEdge(edge);
             // 通芯ホバー — vertex / edge より低優先 (= polygon を優先) でカーソル
             // フィードバック (pointer) を出すために拾う。
@@ -6219,24 +7891,50 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             setHoveredGrid(gh);
             // Suppress polygon-interior hover in wall mode — the interior
             // is a pass-through target for wall drawing, not a drag handle.
-            setHoveredPolyId(pvtx || edge || gh || activeTool === "wall"
+            // 別 Room (重なりで上に乗っている) もホバー検出対象に含めるため
+            // `hitTestPolyAcrossSpaces` を使う。これにより、別 Room の polygon を
+            // 指してもハイライトが正しく追従する (= クリックで切替できる対象が
+            // 視覚的にわかる)。
+            const polyHover = (pvtx || edge || gh || activeTool === "wall")
                 ? null
-                : hitTestPoly(wp[0], wp[1]));
+                : hitTestPolyAcrossSpaces(wp[0], wp[1]);
+            setHoveredPolyId(polyHover?.polyId ?? null);
+            setHoveredPolySpaceId(polyHover?.spaceId ?? null);
         }
     };
 
-    const handlePointerUp = (e?: React.PointerEvent) => {
-        // Wall-mode pass-through: forward the up event so Viewport can
-        // commit a wall (CreateWallCommand runs on the 2nd click there).
-        if (activeTool === "wall" && activeRoomId && wallPassthroughRef.current) {
-            if (e) dispatchToViewport(e, "pointerup");
-            wallPassthroughRef.current = false;
-            (window as any).__viewportInteracting = false;
-            return;
-        }
+	    const handlePointerUp = (e?: React.PointerEvent) => {
+	        // Wall-mode pass-through: forward the up event so Viewport can
+	        // commit a wall (CreateWallCommand runs on the 2nd click there).
+	        if (activeTool === "wall" && activeRoomId && wallPassthroughRef.current) {
+	            if (e) dispatchToViewport(e, "pointerup");
+	            wallPassthroughRef.current = false;
+	            (window as any).__viewportInteracting = false;
+	            return;
+	        }
+	        if (suppressSelectDragUntilPointerUpRef.current) {
+	            suppressSelectDragUntilPointerUpRef.current = false;
+	            dragStateRef.current = null;
+	            setDragState(null);
+	            useAppState.setState({ solverDragHint: [] });
+	            setGridSnapInfo(null);
+	            if (e) {
+	                try {
+	                    e.currentTarget.releasePointerCapture(e.pointerId);
+	                } catch {
+	                    // ignore browsers/cases where capture was not held
+	                }
+	            }
+	            (window as any).__viewportInteracting = false;
+	            if (ROOM_SHAPE_DEBUG) {
+	                // eslint-disable-next-line no-console
+	                console.log("[room-debug] pointerup suppressed after rectangle commit");
+	            }
+	            return;
+	        }
 
-        // Clear any drag hint so subsequent solves don't keep pinning the vertex
-        setSolverDragHint(null);
+	        // Clear any drag hint so subsequent solves don't keep pinning the vertex
+	        setSolverDragHint(null);
         if (dragState?.moved) {
             setSelection([]);
             const polyDragKinds = [
@@ -6249,84 +7947,108 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
                 // 矩形 A と矩形 B が今のドラッグで接続されたケースを既存ロジック
                 // (regenerateAllWalls = 全壁生成) で吸収する。共線重なりが発生
                 // していなければ何もリビルドしないので、ただの単独移動でも安全。
-                // seed = ドラッグした polygon。影響範囲外の部屋の壁は触らない。
+                // seed = ドラッグした polygon。全体移動 (poly drag) で連結 polygon
+                // も同じ delta で動かした場合、それらの壁も新位置で再生成する
+                // 必要があるので linkedPolys も seed に含める。
+                const seeds: string[] = [ds.polyId];
+                if (dragState.kind === "poly") {
+                    const dpolyState = dragState as DragPolyState;
+                    for (const lp of dpolyState.linkedPolys ?? []) {
+                        if (!seeds.includes(lp.polyId)) seeds.push(lp.polyId);
+                    }
+                } else if (dragState.kind === "polyEdge") {
+                    const dedgeState = dragState as DragPolyEdgeState;
+                    for (const lp of dedgeState.linkedPolys ?? []) {
+                        if (!seeds.includes(lp.polyId)) seeds.push(lp.polyId);
+                    }
+                } else if (dragState.kind === "polyVertex") {
+                    const dvtxState = dragState as DragPolyVertexState;
+                    for (const lp of dvtxState.linkedPolys ?? []) {
+                        if (!seeds.includes(lp.polyId)) seeds.push(lp.polyId);
+                    }
+                }
                 maybeRealtimeRegenWalls(
                     `drag ${dragState.kind} → mouseup`,
-                    [ds.polyId],
+                    seeds,
                 );
             }
-        } else if (dragState && activeRoomId) {
+        } else if (dragState && (activeRoomId || activeRoomIdRef.current)) {
             // Click without drag → toggle sketch selection (vertex / edge)
             const additive = !!(e && (e.shiftKey || e.ctrlKey || e.metaKey));
-            // 外壁 outline polygon を直接ピックしても、拘束の対象は **常に
-            // 中央線スケッチ (= primary polygon)** に向ける。ユーザーから見て
-            // inner / outline は派生扱いであり、構成上も outline は wallSync で
-            // 派生再生成されるたびに、outline を target にした拘束は
-            // wallRegenerate.ts の drop 規則で消されてしまう。primary に
-            // リダイレクトしておけばこの drop が起きず、距離拘束がドラッグ後も
-            // 維持される。
-            const redirectToPrimary = (
-                polyId: string,
-            ): string => {
-                const p = room.polygons?.find((q) => q.id === polyId);
-                if (p?.wallOutlineOf) return p.wallOutlineOf;
-                return polyId;
-            };
-            if (dragState.kind === "polyVertex") {
-                toggleSketchSelection({
-                    kind: "point",
-                    spaceId: activeRoomId,
-                    polyId: redirectToPrimary(dragState.polyId),
-                    vertexIdx: dragState.vertexIdx,
-                }, additive);
-            } else if (dragState.kind === "polyEdge") {
-                // Arc 由来 edge は弧全体 (= entity 単位) を選択する。同じ弧の
-                // テッセレーション辺はすべて 1 つの ArcEntity に紐付くので、
-                // ユーザーが任意の辺をクリックしただけで「弧 1 本」を選択
-                // できるようにする。
-                const pp = room.polygons?.find((p) => p.id === dragState.polyId);
-                const ownerId = pp?.edgeOwners?.[dragState.edgeIdx];
-                const ownerEnt = ownerId
-                    ? (room.entities ?? []).find((en) => en.id === ownerId)
-                    : undefined;
-                if (ownerEnt && ownerEnt.kind === "arc") {
+            // pointerdown でアクティブ Room を切り替えた直後 (= cross-space で
+            // 非アクティブ Room のエッジを掴んだ) は React closure の activeRoomId
+            // がまだ古い値のまま。`activeRoomIdRef` は同期的に更新済みなので
+            // そちら経由で「実際にアクティブな Room の id」を取る。これがないと
+            // toggleSketchSelection の spaceId が古い Room を指して、選択が無効
+            // (= ConstraintPanel に出ない・拘束対象として認識されない) になる。
+            const effectiveRoomId = activeRoomIdRef.current ?? activeRoomId;
+            if (effectiveRoomId) {
+                const liveElements = useAppState.getState().elements;
+                const liveRoom = liveElements[effectiveRoomId] as SpaceElement | undefined;
+                const redirectToPrimary = (polyId: string): string => {
+                    const p = liveRoom?.polygons?.find((q) => q.id === polyId);
+                    if (p?.wallOutlineOf) return p.wallOutlineOf;
+                    return polyId;
+                };
+                if (dragState.kind === "polyVertex") {
+                    toggleSketchSelection({
+                        kind: "point",
+                        spaceId: effectiveRoomId,
+                        polyId: redirectToPrimary(dragState.polyId),
+                        vertexIdx: dragState.vertexIdx,
+                    }, additive);
+                } else if (dragState.kind === "polyEdge") {
+                    const pp = liveRoom?.polygons?.find((p) => p.id === dragState.polyId);
+                    const ownerId = pp?.edgeOwners?.[dragState.edgeIdx];
+                    const ownerEnt = ownerId
+                        ? (liveRoom?.entities ?? []).find((en) => en.id === ownerId)
+                        : undefined;
+                    if (ownerEnt && ownerEnt.kind === "arc") {
+                        toggleSketchSelection({
+                            kind: "entity",
+                            spaceId: effectiveRoomId,
+                            entityId: ownerEnt.id,
+                        }, additive);
+                    } else {
+                        toggleSketchSelection({
+                            kind: "edge",
+                            spaceId: effectiveRoomId,
+                            polyId: redirectToPrimary(dragState.polyId),
+                            edgeIdx: dragState.edgeIdx,
+                        }, additive);
+                    }
+                } else if (dragState.kind === "entityArc") {
+                    // entityArc ドラッグ開始したが移動せずに離した = 弧全体を選択トグル。
                     toggleSketchSelection({
                         kind: "entity",
-                        spaceId: activeRoomId,
-                        entityId: ownerEnt.id,
+                        spaceId: effectiveRoomId,
+                        entityId: dragState.entityId,
                     }, additive);
-                } else {
-                    toggleSketchSelection({
-                        kind: "edge",
-                        spaceId: activeRoomId,
-                        polyId: redirectToPrimary(dragState.polyId),
-                        edgeIdx: dragState.edgeIdx,
-                    }, additive);
-                }
-            } else if (dragState.kind === "entityArc") {
-                // entityArc ドラッグ開始したが移動せずに離した = 弧全体を
-                // 選択トグル。
-                toggleSketchSelection({
-                    kind: "entity",
-                    spaceId: activeRoomId,
-                    entityId: dragState.entityId,
-                }, additive);
-            } else if (dragState.kind === "poly") {
-                const pp = room.polygons?.find((p) => p.id === dragState.polyId);
-                if (pp?.shape?.type === "circle") {
-                    // Click inside a parametric circle → toggle circle sketch-selection.
-                    toggleSketchSelection({
-                        kind: "circle",
-                        spaceId: activeRoomId,
-                        polyId: dragState.polyId,
-                    }, additive);
-                } else if (!additive) {
-                    clearSketchSelection();
+                } else if (dragState.kind === "poly") {
+                    const pp = liveRoom?.polygons?.find((p) => p.id === dragState.polyId);
+                    if (pp?.shape?.type === "circle") {
+                        toggleSketchSelection({
+                            kind: "circle",
+                            spaceId: effectiveRoomId,
+                            polyId: dragState.polyId,
+                        }, additive);
+                    } else if (!additive) {
+                        clearSketchSelection();
+                    }
                 }
             }
         }
+        dragStateRef.current = null;
         setDragState(null);
+        suppressSelectDragUntilPointerUpRef.current = false;
         setGridSnapInfo(null);
+        if (e) {
+            try {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+            } catch {
+                // ignore browsers/cases where capture was not held
+            }
+        }
         (window as any).__viewportInteracting = false;
     };
 
@@ -6347,47 +8069,14 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         : roomEditMode === "rectangle" || roomEditMode === "polyline" || roomEditMode === "circle" || roomEditMode === "wallPath" || roomEditMode === "line" || roomEditMode === "arc" || roomEditMode === "arcEdge" || roomEditMode === "trim" || roomEditMode === "wallSkip" ? "crosshair"
         : hoveredPolyId ? "move" : "default";
 
-    /**
-     * WallPath ドラフトが閉じた図形を成しているか判定。
-     *  - "loopback": 最後の点が最初の点付近 (= 自分で閉じた)。
-     *  - "shared-edge": 最初と最後の点が **同じ polygon** の頂点 / 辺に
-     *      スナップ済み。両者の間を polygon 外周に沿って結ぶことで閉じる。
-     *  - "cross-polygon": 最初と最後の点が **別の polygon** にスナップ済み。
-     *      隣接する複数部屋の壁を共有して 1 つの閉図形を成すケース。複数
-     *      部屋の **union 外周** に沿って結ぶ。
-     *  - null: 閉じていない (= 開いたまま単独壁として確定すべき)。
-     */
-    const detectWallPathClosure = (
-        points: [number, number][],
-    ): "loopback" | "shared-edge" | "cross-polygon" | null => {
-        if (points.length < 3) return null;
-        const f = points[0];
-        const l = points[points.length - 1];
-        if (Math.hypot(l[0] - f[0], l[1] - f[1]) < 0.3) return "loopback";
-        const snaps = wallPathDraftSnapsRef.current;
-        if (snaps.length === points.length) {
-            const fst = snaps[0];
-            const lst = snaps[points.length - 1];
-            if (fst && lst) {
-                if (fst.polyId === lst.polyId) return "shared-edge";
-                return "cross-polygon";
-            }
-        }
-        return null;
-    };
-
     const handleDoubleClick = (e: React.MouseEvent) => {
         if (roomEditMode === "polyline" && polyDraftPoints.length >= 3) {
             e.preventDefault();
             commitPolyDraft(polyDraftPoints);
         } else if (roomEditMode === "wallPath" && polyDraftPoints.length >= 2) {
             e.preventDefault();
-            // 閉じた形なら Room として確定、それ以外は単独壁として確定。
-            if (detectWallPathClosure(polyDraftPoints) !== null) {
-                commitWallPathAsClosedRoom(polyDraftPoints);
-            } else {
-                commitWallPathDraft(polyDraftPoints);
-            }
+            // WallPath は常に開いたポリラインで確定 (= ユーザ仕様)。
+            commitWallPathDraft(polyDraftPoints);
         }
     };
 
@@ -6411,19 +8100,17 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
         }
         if (roomEditMode === "polyline") {
             e.preventDefault();
+            // incremental 3D 壁 (open polyline live) も破棄。
+            discardLiveWallPathDraft();
             setPolyDraftPoints([]);
             setMouseWorld(null);
             setGridSnapInfo(null);
         } else if (roomEditMode === "wallPath") {
-            // 右クリック: 1 点以下ならキャンセル、2 点以上なら確定。
-            // 閉ループ (= 最後の点が最初の点付近) なら Room として確定。
+            // 右クリック: 1 点以下ならキャンセル、2 点以上なら開いたポリライン
+            // として確定 (= ユーザ仕様で WallPath は閉じない)。
             e.preventDefault();
             if (polyDraftPoints.length >= 2) {
-                if (detectWallPathClosure(polyDraftPoints) !== null) {
-                    commitWallPathAsClosedRoom(polyDraftPoints);
-                } else {
-                    commitWallPathDraft(polyDraftPoints, true);
-                }
+                commitWallPathDraft(polyDraftPoints, true);
             } else {
                 // 1 点ドラフト時は live polygon は未生成 (≥2 点目で初めて作る)
                 // ので念のため discard して draft state クリア。
@@ -6434,6 +8121,8 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
             }
         } else if (roomEditMode === "circle") {
             e.preventDefault();
+            // 右クリックキャンセル: live 円 + 3D 壁を破棄する。
+            discardLiveCircleDraft();
             setCircleCenter(null);
             setMouseWorld(null);
             setGridSnapInfo(null);
@@ -6496,6 +8185,8 @@ export default function RoomSketchOverlay({ viewportRef }: Props) {
     // early return) can call the latest commit closure.
     commitPolyDraftRef.current = commitPolyDraft;
     commitWallPathDraftRef.current = commitWallPathDraft;
+    discardLiveWallPathDraftRef.current = discardLiveWallPathDraft;
+    discardLiveCircleDraftRef.current = discardLiveCircleDraft;
 
     return (<>
         <canvas ref={canvasRef} data-sketch-overlay

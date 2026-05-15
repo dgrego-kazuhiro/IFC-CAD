@@ -12,6 +12,7 @@ import {
     polygonEdges,
     isPolygonClosed,
     WallReferenceLine,
+    WallSkip,
 } from "../../model/elements/SpaceElement";
 import { ensureCCW, computeWallHexagon } from "../../geometry/wall/EdgeGeometry";
 import { generateId } from "../../utils/ids";
@@ -76,11 +77,7 @@ export interface RegenerateAllWallsOptions {
 export function triggerWallRegenIfEnabled(reason: string, seedPolyIds?: string[]): void {
     const s = useAppState.getState();
     if (!s.realtimeWallGen) return;
-    // eslint-disable-next-line no-console
-    console.log(`[wallRegen-trigger] ${reason}` +
-        (seedPolyIds && seedPolyIds.length
-            ? ` seeds=[${seedPolyIds.map((p) => p.slice(0, 6)).join(",")}]`
-            : ""));
+    void reason;
     regenerateAllWalls({
         wallThicknessMm: s.wallThicknessMm,
         circleWallAngleDeg: s.circleWallAngleDeg,
@@ -125,6 +122,11 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         workingEdges: [number, number][];
         isOpen: boolean;
         aabb: AABB;
+        /** poly.wallSkips を **workingEdges 空間** の edgeIdx に再マップした
+         *  もの。ensureCCW / collapseCollinear で polygon と working の edge
+         *  対応が崩れることがあるので、ここで世界座標マッチで正規化する。
+         *  逆向きエッジ (= ensureCCW で反転) のときは t0/t1 も `1 - t` で反転。 */
+        wallSkipsWorking: WallSkip[];
     }
 
     /**
@@ -135,11 +137,21 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
      *
      * 閉図形のみ対象。開いたポリラインは形状情報を厳格に保ちたいので素通し。
      */
-    const collapseCollinear = (outer: Vec2[]): Vec2[] => {
+    const collapseCollinear = (outer: Vec2[], protectedPositions?: Vec2[]): Vec2[] => {
         const n = outer.length;
         if (n < 4) return outer;
         const SIN_TOL = Math.sin((1 * Math.PI) / 180); // 1° 以内なら共線扱い
         const PERP_TOL = 0.001; // 1 mm 以内なら共線扱い
+        // 「保護位置」(= wallSkip の境界点など、ユーザ意図で挿入した頂点) は
+        // 共線でも畳まない。これがないと、壁トリムで作った切断点が直前で
+        // 壊されて wallSkip.edgeIdx が別エッジを指してしまう。
+        const isProtected = (p: Vec2): boolean => {
+            if (!protectedPositions) return false;
+            for (const q of protectedPositions) {
+                if (Math.abs(p[0] - q[0]) < 1e-6 && Math.abs(p[1] - q[1]) < 1e-6) return true;
+            }
+            return false;
+        };
         const out: Vec2[] = [];
         for (let i = 0; i < n; i++) {
             const prev = outer[(i - 1 + n) % n];
@@ -150,7 +162,11 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
             const len1 = Math.hypot(dx1, dy1);
             const len2 = Math.hypot(dx2, dy2);
             if (len1 < 1e-9 || len2 < 1e-9) {
-                // 縮退頂点はドロップ。
+                // 縮退頂点はドロップ (保護対象でも縮退ならドロップして良い)。
+                continue;
+            }
+            if (isProtected(cur)) {
+                out.push(cur);
                 continue;
             }
             const cross = dx1 * dy2 - dy1 * dx2;
@@ -171,12 +187,52 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         // 全頂点が共線で潰れた異常ケースだけ元を返す。
         return out.length >= 3 ? out : outer;
     };
+    // ── レベルフィルタ (= スコープ階) ───────────────────────────────
+    //
+    // 階 (= levelId) が違う部屋同士は壁生成計算で **絶対に交わらない** よう
+    // ここで一段絞る。これをしないと AABB 交差判定や JunctionGraph の
+    // pairwise 比較で、平面位置が近い他階部屋を「同じ壁を共有する候補」と
+    // 誤検出して、関係ない階の壁が消えたり結合されたりする。
+    //
+    // スコープ階の決定:
+    //   - seedSet 指定時: seed polygon の所属階 (複数階に跨る seed は両方含む)
+    //   - 未指定時:        state.activeLevelId (= ユーザがツリーで選んだ階)
+    //
+    // どちらの場合も、scope に該当しない部屋は allWorks 収集時点で除外する。
+    // levelId 未設定の旧データ部屋は安全側で「scope に明示的に含まれる場合のみ」
+    // (= seed に含まれる、または activeLevelId が無い) のみ通す。
+    const scopeLevels = new Set<string>();
+    const SCOPE_NO_LEVEL = "__no_level__";  // levelId 未設定の部屋識別キー
+    if (seedSet) {
+        for (const eid2 in elements) {
+            const el2 = elements[eid2];
+            if (!el2 || el2.type !== "Space") continue;
+            const sp2 = el2 as SpaceElement;
+            for (const p2 of sp2.polygons ?? []) {
+                if (seedSet.has(p2.id)) {
+                    scopeLevels.add(sp2.levelId ? (sp2.levelId as string) : SCOPE_NO_LEVEL);
+                }
+            }
+        }
+    }
+    if (scopeLevels.size === 0) {
+        // seed 未指定 / seed が見つからなかった → activeLevelId にフォールバック。
+        if (state.activeLevelId) {
+            scopeLevels.add(state.activeLevelId as string);
+        } else {
+            scopeLevels.add(SCOPE_NO_LEVEL);
+        }
+    }
+
     // まず候補となる全 polygon を集める (まだ scope 絞り込みはしない)。
     const allWorks: PolyWork[] = [];
     for (const eid in elements) {
         const el = elements[eid];
         if (!el || el.type !== "Space") continue;
         const space = el as SpaceElement;
+        // 階フィルタ: scopeLevels に含まれない部屋は壁生成計算から除外。
+        const spaceLevelKey = space.levelId ? (space.levelId as string) : SCOPE_NO_LEVEL;
+        if (!scopeLevels.has(spaceLevelKey)) continue;
         if (!space.polygons || space.polygons.length === 0) continue;
         for (const poly of space.polygons) {
             if (poly.wallOutlineOf) continue;
@@ -185,21 +241,49 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
             let workingEdges: [number, number][];
             let isOpen = false;
             if (poly.shape?.type === "circle") {
-                const n = Math.max(3, Math.round((Math.PI * 2) / circleAngleRad));
-                const c = poly.shape.center, r = poly.shape.radius;
-                const pts: Vec2[] = [];
-                for (let i = 0; i < n; i++) {
-                    const a = (i / n) * Math.PI * 2;
-                    pts.push([c[0] + Math.cos(a) * r, c[1] + Math.sin(a) * r]);
-                }
-                workingOuter = pts;
-                workingEdges = pts.map((_, i) => [i, (i + 1) % pts.length] as [number, number]);
+                // 設計原則: polygon.outer は entity からの 1:1 派生で固定。
+                // wallRegen が circleAngleDeg で別テッセレートして wallIds 長を
+                // ずらすと、polygon.outer.length と wallIds.length が一致せず
+                // wall slab 描画チェックを通らない (= 円の 3D 壁が描画されない)。
+                // polygon.outer をそのまま使い、各頂点辺に 1 wall を割り当てる。
+                workingOuter = poly.outer;
+                const n = workingOuter.length;
+                workingEdges = Array.from({ length: n }, (_, i) =>
+                    [i, (i + 1) % n] as [number, number]);
+                void circleAngleRad; // 互換性のため定義は残しておく
             } else if (isPolygonClosed(poly)) {
                 workingOuter = ensureCCW(workingOuter);
+                // 壁トリムで挿入した切断点 (= wallSkip 境界の polygon 頂点) は
+                // 元エッジと共線だが「ユーザ意図で出した実頂点」なので保護
+                // する。これがないと collapseCollinear で潰されて wallSkip
+                // が別エッジを指してしまい、関係ないエッジから壁が消える。
+                const protectedPos: Vec2[] = [];
+                if (poly.wallSkips && poly.wallSkips.length > 0) {
+                    const polyEdgeList = polygonEdges(poly);
+                    for (const skip of poly.wallSkips) {
+                        if (skip.edgeIdx < 0 || skip.edgeIdx >= polyEdgeList.length) continue;
+                        const [pa, pb] = polyEdgeList[skip.edgeIdx];
+                        // wallSkip 境界 (= t0, t1 に対応する世界座標)。t=0/1 なら
+                        // polygon 頂点そのもの、それ以外なら chord 上の補間点。
+                        const A = poly.outer[pa];
+                        const B = poly.outer[pb];
+                        const ts = [skip.t0, skip.t1];
+                        for (const t of ts) {
+                            const tc = Math.max(0, Math.min(1, t));
+                            protectedPos.push([
+                                A[0] + (B[0] - A[0]) * tc,
+                                A[1] + (B[1] - A[1]) * tc,
+                            ]);
+                        }
+                    }
+                }
                 // 前回 regen で挿入されたブレークポイント残骸を畳み込む。
                 // これをしないと毎ドラッグで「t = 0.001 ずつズレた」微小端切れが
                 // 累積し、splits dump で観察されたフィボナッチ的増殖が起きる。
-                workingOuter = collapseCollinear(workingOuter);
+                workingOuter = collapseCollinear(
+                    workingOuter,
+                    protectedPos.length > 0 ? protectedPos : undefined,
+                );
                 const n = workingOuter.length;
                 workingEdges = Array.from({ length: n }, (_, i) =>
                     [i, (i + 1) % n] as [number, number]);
@@ -218,9 +302,51 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
                 if (v[0] > maxX) maxX = v[0];
                 if (v[1] > maxY) maxY = v[1];
             }
+            // wallSkips を polygon space → working space に再マップ。
+            // ensureCCW で polygon の周回が反転していると edgeIdx の向きが
+            // 逆になるので、世界座標で edge を引き、必要なら t0/t1 を 1-t で
+            // 反転する。
+            const wallSkipsWorking: WallSkip[] = [];
+            if (poly.wallSkips && poly.wallSkips.length > 0) {
+                const polyEdgeList = polygonEdges(poly);
+                const closeEnough = (a: Vec2, b: Vec2) =>
+                    Math.abs(a[0] - b[0]) < 1e-5 && Math.abs(a[1] - b[1]) < 1e-5;
+                for (const skip of poly.wallSkips) {
+                    if (skip.edgeIdx < 0 || skip.edgeIdx >= polyEdgeList.length) continue;
+                    const [pa, pb] = polyEdgeList[skip.edgeIdx];
+                    const A = poly.outer[pa];
+                    const B = poly.outer[pb];
+                    let mapped = false;
+                    for (let wi = 0; wi < workingEdges.length; wi++) {
+                        const [wa, wb] = workingEdges[wi];
+                        const Wa = workingOuter[wa];
+                        const Wb = workingOuter[wb];
+                        if (closeEnough(Wa, A) && closeEnough(Wb, B)) {
+                            wallSkipsWorking.push({ ...skip, edgeIdx: wi });
+                            mapped = true; break;
+                        }
+                        if (closeEnough(Wa, B) && closeEnough(Wb, A)) {
+                            wallSkipsWorking.push({
+                                edgeIdx: wi,
+                                t0: 1 - skip.t1,
+                                t1: 1 - skip.t0,
+                            });
+                            mapped = true; break;
+                        }
+                    }
+                    if (!mapped) {
+                        // eslint-disable-next-line no-console
+                        console.warn(
+                            `[wallRegen] wallSkip on poly ${poly.id.slice(0,6)} edgeIdx=${skip.edgeIdx} ` +
+                            `could not be remapped to working space (edge endpoints not found)`,
+                        );
+                    }
+                }
+            }
             allWorks.push({
                 roomId: eid as ElementId, room: space, poly, workingOuter, workingEdges, isOpen,
                 aabb: { minX, minY, maxX, maxY },
+                wallSkipsWorking,
             });
         }
     }
@@ -365,7 +491,7 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         }
 
         works = allWorks.filter((w) => inScope.has(w.poly.id));
-        if (debug || works.length !== allWorks.length) {
+        if (debug) {
             // eslint-disable-next-line no-console
             console.log(
                 `[regenerateAllWalls] scope ${works.length}/${allWorks.length} polys ` +
@@ -396,12 +522,14 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         const col = el as ColumnElement;
         if (col.baseLevelId && earlyRoomLevelIds.size > 0
             && !earlyRoomLevelIds.has(col.baseLevelId)) {
-            // eslint-disable-next-line no-console
-            console.log(
-                `[wallRegen/§0] col ${(col.id as string).slice(0,6)} ` +
-                `SKIPPED by level: col.baseLevelId=${col.baseLevelId} ` +
-                `roomLevelIds=[${[...earlyRoomLevelIds].join(",")}]`,
-            );
+            if (debug) {
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[wallRegen/§0] col ${(col.id as string).slice(0,6)} ` +
+                    `SKIPPED by level: col.baseLevelId=${col.baseLevelId} ` +
+                    `roomLevelIds=[${[...earlyRoomLevelIds].join(",")}]`,
+                );
+            }
             filteredOutByLevel++;
             continue;
         }
@@ -409,26 +537,30 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         if (fp.length >= 3) {
             columnFootprints.push({ id: col.id as string, points: ensureCCW(fp) });
         } else {
-            // eslint-disable-next-line no-console
-            console.log(
-                `[wallRegen/§0] col ${(col.id as string).slice(0,6)} ` +
-                `SKIPPED by fp: fp.length=${fp.length} ` +
-                `basePoint=${col.basePoint ? `(${col.basePoint[0].toFixed(2)},${col.basePoint[2].toFixed(2)})` : "null"}`,
-            );
+            if (debug) {
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[wallRegen/§0] col ${(col.id as string).slice(0,6)} ` +
+                    `SKIPPED by fp: fp.length=${fp.length} ` +
+                    `basePoint=${col.basePoint ? `(${col.basePoint[0].toFixed(2)},${col.basePoint[2].toFixed(2)})` : "null"}`,
+                );
+            }
             filteredOutByFp++;
         }
     }
-    // eslint-disable-next-line no-console
-    console.log(
-        `[wallRegen/§0] columns total=${allColumnsCount} ` +
-        `passed=${columnFootprints.length} ` +
-        `filteredByLevel=${filteredOutByLevel} ` +
-        `filteredByFp=${filteredOutByFp} ` +
-        `roomLevelIds=[${[...earlyRoomLevelIds].join(",")}]`,
-    );
+    if (debug) {
+        // eslint-disable-next-line no-console
+        console.log(
+            `[wallRegen/§0] columns total=${allColumnsCount} ` +
+            `passed=${columnFootprints.length} ` +
+            `filteredByLevel=${filteredOutByLevel} ` +
+            `filteredByFp=${filteredOutByFp} ` +
+            `roomLevelIds=[${[...earlyRoomLevelIds].join(",")}]`,
+        );
+    }
 
     // 柱フットプリントを 1 度だけ console に出して位置を確認できるようにする。
-    if (columnFootprints.length > 0) {
+    if (debug && columnFootprints.length > 0) {
         // eslint-disable-next-line no-console
         console.log(
             `[wallRegen/§0] columnFootprints (${columnFootprints.length}):` +
@@ -846,16 +978,33 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         if (r.modified) modifiedPolyIds.add(works[r.workIdx].poly.id);
     }
 
+    // 旧→新の polygon rebuild 索引。modified な polygon に対する拘束ターゲットの
+    // edgeIdx / vertexIdx を新しい polygon 上の index に再マップするために使う。
+    const rebuildByPolyIdForRemap = new Map<string, PolyRebuild>();
+    for (const r of polyRebuilds) {
+        rebuildByPolyIdForRemap.set(works[r.workIdx].poly.id, r);
+    }
     for (const cid in constraints) {
         const c = constraints[cid];
-        const drop = c.targets.some((t) => {
+        // outline polygon が消えるケースは引き続き drop。outline 自体が
+        // 派生物なので参照を生かしておく意味は無い。
+        const droppedByOutline = c.targets.some((t) => {
             const tt = t as any;
             if (t.kind !== "SketchEdge" && t.kind !== "SketchPoint" && t.kind !== "SketchCircle") {
                 return false;
             }
-            return staleOutlineIds.has(tt.polyId) || modifiedPolyIds.has(tt.polyId);
+            return staleOutlineIds.has(tt.polyId);
         });
-        if (drop) executeCommand(new RemoveConstraintCommand(cid));
+        if (droppedByOutline) {
+            executeCommand(new RemoveConstraintCommand(cid));
+            continue;
+        }
+        // 拘束 index の remap は **行わない**。
+        // ポリゴン outer は entity と 1:1 を保つため (= setSpaceEntities で
+        // JunctionSplit を撤去 + wallRegen も outer を書き換えない)、constraint
+        // が参照する edgeIdx / vertexIdx は entity 由来の安定したインデックスの
+        // ままで良い。wallRegen は internal split layout で壁を作り、polygon
+        // には wallIds[origEdgeIdx] = canonical wall のマッピングだけを書き戻す。
     }
 
     // ── 6.5. Build JunctionGraph from rebuilt polygons ────────────────
@@ -941,10 +1090,27 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
     // 壁を消す挙動 (= 開口を作るのに十分)。部分削除 (t0/t1 が中間) は
     // wallRegenerate ではまだ扱わず、後段の applyPartialWallSkips で処理する想定。
     const isContributorFullySkipped = (c: { workIdx: number; oldEdgeIdx: number }) => {
-        const poly = works[c.workIdx].poly;
-        const skips = poly.wallSkips ?? [];
+        // workingEdges 空間に変換済みの wallSkips を使う。polygon 由来の
+        // raw wallSkips は ensureCCW で edgeIdx が反転している可能性がある
+        // ので使ってはいけない。
+        const skips = works[c.workIdx].wallSkipsWorking ?? [];
         return skips.some((s) => s.edgeIdx === c.oldEdgeIdx && s.t0 <= 0 && s.t1 >= 1);
     };
+    // 診断ログ: wallSkips を持つ polygon について、raw / working / 各 subgroup
+    // の skip 判定を一括ダンプ。「消えるべき壁が消えない」/「関係ない壁が消える」
+    // 系の不具合を切り分けるのに使う。
+    for (const w of works) {
+        const raw = w.poly.wallSkips ?? [];
+        if (raw.length === 0) continue;
+        if (debug) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[wallRegen/skip] poly ${w.poly.id.slice(0,6)} ` +
+                `outer.len=${w.poly.outer.length} workingOuter.len=${w.workingOuter.length} ` +
+                `raw=${JSON.stringify(raw)} working=${JSON.stringify(w.wallSkipsWorking)}`,
+            );
+        }
+    }
     for (const [key, group] of subGroups) {
         const isShared = group.polysContributing.size > 1;
         if (isShared) {
@@ -960,8 +1126,10 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         // wallSkips: full skip があれば壁を生成しない。canonical / 全 contributor
         // のいずれかにマークがあれば skip 対象。
         if (group.contributors.some(isContributorFullySkipped)) {
-            // eslint-disable-next-line no-console
-            console.log(`[wallRegen/§7] subGroup ${key.slice(0,12)} fully skipped via wallSkips — no wall created`);
+            if (debug) {
+                // eslint-disable-next-line no-console
+                console.log(`[wallRegen/§7] subGroup ${key.slice(0,12)} fully skipped via wallSkips — no wall created`);
+            }
             continue;
         }
         const canonicalWork = works[canonical.workIdx];
@@ -1031,13 +1199,15 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
                 }
             }
         }
-        // eslint-disable-next-line no-console
-        console.log(
-            `[wallRegen/§7] subgroup=${key.slice(0,12)} ` +
-            `mitered=${mitered ? `[${mitered.length}pt]` : "null"} ` +
-            `wallRing=[${wallRing.map((p) => `(${p[0].toFixed(2)},${p[1].toFixed(2)})`).join(" ")}] ` +
-            `intersectCols=[${intersectingColIds.map((id) => id.slice(0,6)).join(",")}]`,
-        );
+        if (debug) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[wallRegen/§7] subgroup=${key.slice(0,12)} ` +
+                `mitered=${mitered ? `[${mitered.length}pt]` : "null"} ` +
+                `wallRing=[${wallRing.map((p) => `(${p[0].toFixed(2)},${p[1].toFixed(2)})`).join(" ")}] ` +
+                `intersectCols=[${intersectingColIds.map((id) => id.slice(0,6)).join(",")}]`,
+            );
+        }
 
         // ─ ピース計算: 柱が無ければ wall fp = mitered のまま 1 ピース。
         //              柱があれば wall fp - union(columns) で 0+ ピース。
@@ -1055,19 +1225,23 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
                 diffError = e;
                 result = null;
             }
-            // eslint-disable-next-line no-console
-            console.log(
-                `[wallRegen/§7] subgroup=${key.slice(0,12)} difference ` +
-                `result.length=${result?.length ?? "null"} ` +
-                (diffError ? `error=${String(diffError)}` : ""),
-            );
+            if (debug) {
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[wallRegen/§7] subgroup=${key.slice(0,12)} difference ` +
+                    `result.length=${result?.length ?? "null"} ` +
+                    (diffError ? `error=${String(diffError)}` : ""),
+                );
+            }
             if (result && result.length > 0) {
                 for (let pi = 0; pi < result.length; pi++) {
                     const piece = result[pi];
                     const ring = piece[0];
                     if (!ring || ring.length < 4) {
-                        // eslint-disable-next-line no-console
-                        console.log(`  piece[${pi}]: ring too small (len=${ring?.length})`);
+                        if (debug) {
+                            // eslint-disable-next-line no-console
+                            console.log(`  piece[${pi}]: ring too small (len=${ring?.length})`);
+                        }
                         continue;
                     }
                     const open = ring.slice(0, -1);
@@ -1078,22 +1252,28 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
                         if (t < tMin) tMin = t;
                         if (t > tMax) tMax = t;
                     }
-                    // eslint-disable-next-line no-console
-                    console.log(
-                        `  piece[${pi}]: ${open.length}pt ` +
-                        `tMin=${tMin.toFixed(3)} tMax=${tMax.toFixed(3)} ` +
-                        `verts=[${open.map((p) => `(${p[0].toFixed(2)},${p[1].toFixed(2)})`).join(" ")}]`,
-                    );
-                    if (tMax - tMin < 1e-6) {
+                    if (debug) {
                         // eslint-disable-next-line no-console
-                        console.log(`  piece[${pi}]: skipped (degenerate t-range)`);
+                        console.log(
+                            `  piece[${pi}]: ${open.length}pt ` +
+                            `tMin=${tMin.toFixed(3)} tMax=${tMax.toFixed(3)} ` +
+                            `verts=[${open.map((p) => `(${p[0].toFixed(2)},${p[1].toFixed(2)})`).join(" ")}]`,
+                        );
+                    }
+                    if (tMax - tMin < 1e-6) {
+                        if (debug) {
+                            // eslint-disable-next-line no-console
+                            console.log(`  piece[${pi}]: skipped (degenerate t-range)`);
+                        }
                         continue;
                     }
                     pieces.push({ ring: ringV2, tMin, tMax });
                 }
             } else if (mitered) {
-                // eslint-disable-next-line no-console
-                console.log(`[wallRegen/§7] subgroup=${key.slice(0,12)} difference produced 0 pieces — fallback to original`);
+                if (debug) {
+                    // eslint-disable-next-line no-console
+                    console.log(`[wallRegen/§7] subgroup=${key.slice(0,12)} difference produced 0 pieces — fallback to original`);
+                }
                 pieces.push({ ring: mitered, tMin: 0, tMax: axLen });
             }
         }
@@ -1167,19 +1347,23 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
             createdWallCount++;
         }
         groupWallIds.set(key, widsForGroup);
+        if (debug) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[regenerateAllWalls] subgroup key=${key.slice(0, 12)} ${isShared ? "SHARED" : "exterior"} ` +
+                `axis=(${ax0[0].toFixed(2)},${ax0[2].toFixed(2)})→(${ax1[0].toFixed(2)},${ax1[2].toFixed(2)}) ` +
+                `len=${axLen.toFixed(3)} pieces=${pieces.length}` +
+                (intersectingCols.length > 0 ? ` (cols=${intersectingCols.length})` : ""),
+            );
+        }
+    }
+    if (debug) {
         // eslint-disable-next-line no-console
         console.log(
-            `[regenerateAllWalls] subgroup key=${key.slice(0, 12)} ${isShared ? "SHARED" : "exterior"} ` +
-            `axis=(${ax0[0].toFixed(2)},${ax0[2].toFixed(2)})→(${ax1[0].toFixed(2)},${ax1[2].toFixed(2)}) ` +
-            `len=${axLen.toFixed(3)} pieces=${pieces.length}` +
-            (intersectingCols.length > 0 ? ` (cols=${intersectingCols.length})` : ""),
+            `[regenerateAllWalls] created ${createdWallCount} walls (${sharedGroups} shared) ` +
+            `from ${works.length} polys`,
         );
     }
-    // eslint-disable-next-line no-console
-    console.log(
-        `[regenerateAllWalls] created ${createdWallCount} walls (${sharedGroups} shared) ` +
-        `from ${works.length} polys`,
-    );
 
     // ── 8. Wire wallIds + sharedEdgeIds into each polygon's new outer ─
     for (const rebuild of polyRebuilds) {
@@ -1545,8 +1729,13 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
             if (staleOutlineIds.has(poly.id)) continue;
             const rebuild = rebuildByPolyId.get(poly.id);
             if (!rebuild) { updatedPolys.push(poly); continue; }
-            const { edges: _legacyEdges, ...rest } = poly;
-            void _legacyEdges;
+            // **edges を保持する** (= rest 経由で継承)。
+            // 旧実装は wallRegen が outer を分割していたので edges を破棄して
+            // 次回 derive に作り直させていたが、現在 outer は変更しないので
+            // edges (open chain の場合の明示的辺リスト) もそのまま維持する。
+            // edges を捨てると `isPolygonClosed` が「edges 未設定 → 閉じ図形」と
+            // 判定して、open polyline (= wallPath) が閉じ図形として描画される。
+            const rest = poly;
             const polyVCons = vcByPoly.get(poly.id);
             const newVertexConnections: (Array<{ polyId: string; edgeIdx: number }> | null)[] =
                 new Array(rebuild.newOuter.length).fill(null);
@@ -1596,20 +1785,101 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
                     }
                 }
             }
+
+            // wallSkips を新 outer / 新 edges 空間にマップし直す。
+            // ensureCCW で polygon が CW→CCW に反転すると、旧 edgeIdx が指す
+            // ラインが別の new edge にずれるため、ここで世界座標マッチで
+            // 正しい new edge を引き直さないと、次回 regen で「関係ない壁
+            // が消える」現象が再発する。
+            let remappedWallSkips: WallSkip[] | undefined;
+            if (poly.wallSkips && poly.wallSkips.length > 0) {
+                const closeEnough = (x: Vec2, y: Vec2) =>
+                    Math.abs(x[0] - y[0]) < 1e-5 && Math.abs(x[1] - y[1]) < 1e-5;
+                const oldPolyEdges = polygonEdges(poly);
+                remappedWallSkips = [];
+                for (const skip of poly.wallSkips) {
+                    if (skip.edgeIdx < 0 || skip.edgeIdx >= oldPolyEdges.length) continue;
+                    const [oa, ob] = oldPolyEdges[skip.edgeIdx];
+                    const A = poly.outer[oa];
+                    const B = poly.outer[ob];
+                    let mapped = false;
+                    for (let ni = 0; ni < rebuild.newEdges.length; ni++) {
+                        const [na, nb] = rebuild.newEdges[ni];
+                        const Wa = rebuild.newOuter[na];
+                        const Wb = rebuild.newOuter[nb];
+                        if (closeEnough(Wa, A) && closeEnough(Wb, B)) {
+                            remappedWallSkips.push({ ...skip, edgeIdx: ni });
+                            mapped = true; break;
+                        }
+                        if (closeEnough(Wa, B) && closeEnough(Wb, A)) {
+                            remappedWallSkips.push({
+                                edgeIdx: ni,
+                                t0: 1 - skip.t1,
+                                t1: 1 - skip.t0,
+                            });
+                            mapped = true; break;
+                        }
+                    }
+                    if (!mapped) {
+                        // eslint-disable-next-line no-console
+                        console.warn(
+                            `[wallRegen/§9] wallSkip on poly ${poly.id.slice(0,6)} ` +
+                            `edgeIdx=${skip.edgeIdx} could not be remapped — dropping`,
+                        );
+                    }
+                }
+            }
+            // ── ポリゴン outer は **変更しない** (= entity と 1:1 を保つ) ───
+            // 設計原則 (ユーザ指示): entity が真値、polygon は描画のための変数。
+            // 拘束 (H/V/Parallel/Perp/Coincident) は polygon edge index を参照
+            // しており、ここで outer に split 頂点を挿入すると index がずれて
+            // ドラッグ/再 derive 時に拘束が違うエッジを指して形状が崩れる。
+            // 壁生成は分割された internal layout (rebuild.newOuter) で行うが、
+            // ストアに戻す polygon は元の outer を維持。wallIds / wallsPerEdge
+            // / edgeIds は元エッジ単位にマップし直す。
+            const N_orig = rebuild.oldEdgeToNewEdges.length;
+            const wallIdsOrig: string[] = new Array(N_orig).fill("");
+            const wallsPerEdgeOrig: string[][] = new Array(N_orig);
+            const edgeIdsOrig: string[] = new Array(N_orig).fill("");
+            const sharedEdgeIdsOrig: (string | undefined)[] = new Array(N_orig).fill(undefined);
+            for (let oi = 0; oi < N_orig; oi++) {
+                const newEis = rebuild.oldEdgeToNewEdges[oi];
+                if (!newEis || newEis.length === 0) {
+                    wallsPerEdgeOrig[oi] = [];
+                    continue;
+                }
+                // canonical wall = 最初の sub-edge の wall。
+                wallIdsOrig[oi] = rebuild.newWallIds[newEis[0]] ?? "";
+                edgeIdsOrig[oi] = rebuild.newEdgeIds[newEis[0]] ?? "";
+                sharedEdgeIdsOrig[oi] = rebuild.newSharedEdgeIds[newEis[0]];
+                // 全 sub-edge の wall を統合 (= 柱分断・shared-edge 分割を含む)。
+                const allWalls: string[] = [];
+                for (const newEi of newEis) {
+                    const list = rebuild.newWallsPerEdge?.[newEi];
+                    if (list && list.length > 0) {
+                        for (const id of list) if (id && !allWalls.includes(id)) allWalls.push(id);
+                    } else {
+                        const id = rebuild.newWallIds[newEi];
+                        if (id && !allWalls.includes(id)) allWalls.push(id);
+                    }
+                }
+                wallsPerEdgeOrig[oi] = allWalls;
+            }
             updatedPolys.push({
                 ...rest,
-                outer: rebuild.newOuter,
-                edges: explicitEdges,
-                wallIds: rebuild.newWallIds,
-                wallsPerEdge,
+                // outer / edges / edgeOwners は触らない (= rest からそのまま継承)。
+                wallIds: wallIdsOrig,
+                wallsPerEdge: wallsPerEdgeOrig,
                 wallThickness,
                 innerThickness: innerT,
                 outerThickness: outerT,
                 wallReference,
-                edgeIds: rebuild.newEdgeIds,
-                sharedEdgeIds: rebuild.newSharedEdgeIds,
-                vertexConnections: newVertexConnections,
-                edgeOwners: newEdgeOwners,
+                edgeIds: edgeIdsOrig,
+                sharedEdgeIds: sharedEdgeIdsOrig,
+                // vertexConnections は新 outer 基準なので、polygon を split しない
+                // 今は無意味。クリアして次回 wallRegen で新規生成させる。
+                vertexConnections: undefined,
+                ...(remappedWallSkips !== undefined ? { wallSkips: remappedWallSkips } : {}),
             });
         }
         updateElement(rid, {
@@ -1619,44 +1889,80 @@ export function regenerateAllWalls(opts: RegenerateAllWallsOptions): void {
         // 診断: 各部屋の polygon 最終状態をダンプ。Room 1 が崩れた症状の
         // 切り分け用。post-collapse 後の outer / wallIds の長さが一致して
         // いるか、wallIds に空文字が残っていないかを確認する。
-        for (const p of updatedPolys) {
-            if (p.wallOutlineOf) continue;
-            const wallIdsLen = (p.wallIds ?? []).length;
-            const wpeLen = (p.wallsPerEdge ?? []).length;
-            const filled = (p.wallIds ?? []).filter(Boolean).length;
-            // eslint-disable-next-line no-console
-            console.log(
-                `[wallRegen/§9] poly=${p.id.slice(0, 6)} room=${(rid as string).slice(0, 6)} ` +
-                `outer=${p.outer.length} wallIds=${wallIdsLen}(filled=${filled}) ` +
-                `wallsPerEdge=${wpeLen} thickness=${p.wallThickness}`,
-            );
+        if (debug) {
+            for (const p of updatedPolys) {
+                if (p.wallOutlineOf) continue;
+                const wallIdsLen = (p.wallIds ?? []).length;
+                const wpeLen = (p.wallsPerEdge ?? []).length;
+                const filled = (p.wallIds ?? []).filter(Boolean).length;
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[wallRegen/§9] poly=${p.id.slice(0, 6)} room=${(rid as string).slice(0, 6)} ` +
+                    `outer=${p.outer.length} wallIds=${wallIdsLen}(filled=${filled}) ` +
+                    `wallsPerEdge=${wpeLen} thickness=${p.wallThickness}`,
+                );
+            }
         }
     }
 
-    // ── 10. Re-add Horizontal / Vertical on modified polys ───────────
-    const AXIS_DOT_TOL = Math.cos((2 * Math.PI) / 180);
-    for (const rebuild of polyRebuilds) {
-        if (!rebuild.modified) continue;
-        const polyId = works[rebuild.workIdx].poly.id;
-        const spaceId = works[rebuild.workIdx].roomId;
-        const newOuter = rebuild.newOuter;
-        for (let ei = 0; ei < rebuild.newEdges.length; ei++) {
-            const [aIdx, bIdx] = rebuild.newEdges[ei];
-            const a = newOuter[aIdx];
-            const b = newOuter[bIdx];
-            const dx = b[0] - a[0], dy = b[1] - a[1];
+    // ── 10. H/V 拘束のクリーンアップ ────────────────────────────────
+    // 過去 (split が polygon outer を書き換えていた時代) に追加された H/V
+    // 拘束は、現在 polygon = entity 1:1 で固定された layout のもとでは
+    // 「水平拘束が垂直エッジに付いている」など方向と矛盾するケースがある。
+    // 拘束対象エッジの実際の方向と矛盾している H/V 拘束、および (type, polyId,
+    // edgeIdx) が重複する H/V 拘束を削除する。
+    // **新規に H/V を追加することはしない**: autoRectConstraints が矩形作成時
+    // に必要な H/V を 1 本だけ付け、残りは Parallel / Perpendicular の派生で
+    // propagateSimpleConstraints が解釈する。再追加すると edge index が壊れる。
+    {
+        const AXIS_DOT_TOL_CLEAN = Math.cos((2 * Math.PI) / 180);
+        const seenHV = new Set<string>();
+        const toRemove: string[] = [];
+        const currentConstraints = useAppState.getState().constraints;
+        const liveElements = useAppState.getState().elements;
+        for (const cid in currentConstraints) {
+            const c = currentConstraints[cid];
+            if (c.type !== "Horizontal" && c.type !== "Vertical") continue;
+            if (c.targets.length !== 1) continue;
+            const t = c.targets[0] as any;
+            if (t.kind !== "SketchEdge") continue;
+            const key = `${c.type}:${t.polyId}:${t.edgeIdx}`;
+            if (seenHV.has(key)) {
+                toRemove.push(cid);
+                continue;
+            }
+            seenHV.add(key);
+            // 対象エッジが実際にその方向か検査。違っていれば破棄。
+            const sp = liveElements[t.spaceId as string] as SpaceElement | undefined;
+            if (!sp || sp.type !== "Space") continue;
+            const targetPoly = (sp.polygons ?? []).find((p) => p.id === t.polyId);
+            if (!targetPoly) {
+                toRemove.push(cid);
+                continue;
+            }
+            const polyEdges2 = polygonEdges(targetPoly);
+            if (t.edgeIdx < 0 || t.edgeIdx >= polyEdges2.length) {
+                toRemove.push(cid);
+                continue;
+            }
+            const [ea, eb] = polyEdges2[t.edgeIdx];
+            const p1 = targetPoly.outer[ea];
+            const p2 = targetPoly.outer[eb];
+            const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
             const len = Math.hypot(dx, dy);
             if (len < 1e-9) continue;
             const ax = Math.abs(dx / len), ay = Math.abs(dy / len);
-            let type: "Horizontal" | "Vertical" | null = null;
-            if (ax >= AXIS_DOT_TOL) type = "Horizontal";
-            else if (ay >= AXIS_DOT_TOL) type = "Vertical";
-            if (!type) continue;
-            executeCommand(new AddConstraintCommand({
-                id: generateConstraintId(),
-                type,
-                targets: [{ kind: "SketchEdge", spaceId, polyId, edgeIdx: ei }],
-            }));
+            const isH = ax >= AXIS_DOT_TOL_CLEAN;
+            const isV = ay >= AXIS_DOT_TOL_CLEAN;
+            if (c.type === "Horizontal" && !isH) toRemove.push(cid);
+            else if (c.type === "Vertical" && !isV) toRemove.push(cid);
+        }
+        for (const cid of toRemove) {
+            executeCommand(new RemoveConstraintCommand(cid));
+        }
+        if (debug && toRemove.length > 0) {
+            // eslint-disable-next-line no-console
+            console.log(`[wallRegen/§10] cleaned up ${toRemove.length} mismatched/duplicate H/V constraints`);
         }
     }
 

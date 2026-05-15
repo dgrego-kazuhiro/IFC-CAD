@@ -17,6 +17,14 @@ import {
 import { Constraint } from '../model/constraint/Constraint';
 import type { SketchEntity, SketchEntityId } from '../model/sketch/SketchEntity';
 import type { SpaceElement } from '../model/elements/SpaceElement';
+import type {
+    BaseStairParams,
+    StairExtras,
+    StairKind,
+    TurnDirection,
+    StairAlignment,
+    RiserCalculationMode,
+} from '../model/elements/StairElement';
 import { derivePolygonsFromEntities } from '../model/sketch/PolygonDerive';
 import {
     ElementTypeDef,
@@ -45,6 +53,8 @@ export type SketchSelectionItem =
     // 部屋外の "ポイント候補": Length などの拘束で 2 点間の距離をかける時、
     // 部屋頂点だけでなく柱中心 / 通芯端点 / 原点なども選べるようにする。
     | { kind: "column"; columnId: ElementId }
+    | { kind: "columnVertex"; columnId: ElementId; vertexIdx: number }
+    | { kind: "columnEdge"; columnId: ElementId; edgeIdx: number }
     | { kind: "gridPoint"; gridId: string; vertexIdx: number }
     | { kind: "origin" }
     // 通芯線そのもの (= 柱-通芯の垂直距離拘束に使う edge ライク選択)。
@@ -64,6 +74,8 @@ export function sketchSelectionKey(s: SketchSelectionItem): string {
     if (s.kind === "wallAxis") return `w:${s.wallId}`;
     if (s.kind === "wallPoint") return `wp:${s.wallId}:${s.endIdx}`;
     if (s.kind === "column") return `col:${s.columnId}`;
+    if (s.kind === "columnVertex") return `colv:${s.columnId}:${s.vertexIdx}`;
+    if (s.kind === "columnEdge") return `cole:${s.columnId}:${s.edgeIdx}`;
     if (s.kind === "gridPoint") return `gp:${s.gridId}:${s.vertexIdx}`;
     if (s.kind === "gridLine") return `gl:${s.gridId}`;
     return `o`;
@@ -94,6 +106,17 @@ export interface SolverDragPin {
 /** 後方互換のため alias を残す (= 単点ピンは Pin[] の長さ 1 と等価)。 */
 export type SolverDragHint = SolverDragPin;
 
+const ROOM_SHAPE_DEBUG = true;
+const fmtDebugPt = (p: [number, number]) => `(${p[0].toFixed(3)},${p[1].toFixed(3)})`;
+const fmtDebugRing = (pts: Array<[number, number]>) =>
+    `[${pts.map(fmtDebugPt).join(" ")}]`;
+const fmtDebugPolys = (polys: SpaceElement["polygons"] | undefined) =>
+    (polys ?? [])
+        .filter((p) => !p.wallOutlineOf)
+        .map((p) => `${p.id.slice(0, 6)}:${p.outer.length}v${fmtDebugRing(p.outer as Array<[number, number]>)}`
+            + (p.edges ? ` edges=${p.edges.length}` : ""))
+        .join(" | ");
+
 export interface LevelData {
     id: ElementId;
     name: string;
@@ -122,6 +145,62 @@ export type DesignMode = "freeZoning" | "jpResidentialGrid";
 
 /** ビュー切替: 2D = ortho top-down (作図中心)、3D = perspective (Door/Window 配置・確認)。 */
 export type ViewMode = "2D" | "3D";
+
+/**
+ * 階段作成 / 編集パネル用 draft (= 入力中パラメータの一時保管)。
+ * StairElement と同じ構造を持つが、draft は Element に乗っていない時点でも
+ * 編集できる + UI で文字列化される段階を分離する目的で AppState に保持する。
+ *
+ * 共通 + 両 Kind のフィールドをすべて持っておき、kind の切替時もユーザの
+ * 入力値が消えないようにする (= UX 改善)。
+ */
+export interface StairCreateDraft extends BaseStairParams {
+    // ── BaseStairParams 由来 ─────────────────────────────────
+    // (kind, baseElevation, topElevation, stairWidth, treadDepth,
+    //  riserHeight, riserCount, nosingLength, calculationMode,
+    //  targetRiserHeight, startPoint, startDirection, referenceLine,
+    //  waistSlabThickness, landingSlabThickness, baseLevelId, topLevelId)
+
+    // ── U 字階段固有フィールド (常に保持しておき、kind 切替で値消失を防ぐ) ──
+    flight1RiserCount: number;
+    landingDepth: number;
+    gapBetweenFlights: number;
+    turnDirection: TurnDirection;
+}
+
+/**
+ * 階段の原点 (startPoint) ピックモード。
+ *  - "off":         ピック OFF (= UI で x/y/z を直接入力)。
+ *  - "freeFloor":   3D ビュー中で床面 (Y = 0) をクリックした位置を取得。
+ *  - "vertexSnap":  既存幾何 (壁端点・柱中心・通芯交点) にスナップする
+ *                   ピックモード。クリックでスナップ点が startPoint に。
+ */
+export type StairOriginPickMode = "off" | "freeFloor" | "vertexSnap";
+
+/** 階段 draft の既定値生成 (= ビギナーフレンドリーな建築 PoC 既定)。 */
+export function defaultStairDraft(): StairCreateDraft {
+    return {
+        kind: "straight" as StairKind,
+        baseElevation: 0,
+        topElevation: 3.0,                 // 階高 3000mm 既定
+        stairWidth: 0.9,                   // 900mm 幅
+        treadDepth: 0.25,                  // 250mm 踏面
+        riserHeight: 0.176,                // 176mm 蹴上 (3000/17 ≈ 176)
+        riserCount: 17,                    // 17 段 (auto で 3000/180 = ceil 17)
+        nosingLength: 0,                   // 段鼻 0
+        calculationMode: "auto" as RiserCalculationMode,
+        targetRiserHeight: 0.18,           // 希望蹴上 180mm
+        startPoint: [0, 0, 0],
+        startDirection: [1, 0, 0],         // +X 方向
+        referenceLine: "left" as StairAlignment,
+        waistSlabThickness: 0.15,          // 階段スラブ厚 150mm
+        landingSlabThickness: 0.15,        // 踊り場スラブ厚 150mm
+        flight1RiserCount: 9,              // U 字階段の第 1 フライト段数
+        landingDepth: 0.9,                 // 踊り場奥行 = 階段幅と同じ既定
+        gapBetweenFlights: 0,              // 隙間 0 (= ぴったり接続)
+        turnDirection: "right" as TurnDirection,
+    };
+}
 
 /** Primary / secondary residential grid spacing, in metres. */
 export const RESIDENTIAL_GRID_PRIMARY_M = 0.910;
@@ -200,6 +279,18 @@ export interface AppState {
      *  - false: 「全壁生成」ボタンを押した時のみ生成する従来挙動。
      */
     realtimeWallGen: boolean;
+    showConstraintIcons: boolean;
+
+    // ── 階段 (Stair) 編集状態 ────────────────────────────────
+    //
+    // 「現在編集中の階段 ID」と、新規作成用 draft、原点ピックモードを
+    // 保持する。draft は activeTool === "stair" の時に UI へ束縛される。
+    /** 選択中 / 編集対象の階段。null なら新規作成モード (= draft 編集)。 */
+    activeStairId: ElementId | null;
+    /** 新規作成 draft (= パラメータの一時保管)。Tool 起動 / Kind 切替で初期化。 */
+    stairCreateDraft: StairCreateDraft;
+    /** 原点 (startPoint) のピックモード。 */
+    stairOriginPickMode: StairOriginPickMode;
 
     // ── Type / Family / Category システム ───────────────────────
     //
@@ -222,6 +313,8 @@ export interface AppState {
      * 空配列 (= []) は「ドラッグ中ではない」を表す。
      */
     solverDragHint: SolverDragPin[];
+    /** ドラッグ中の柱 ID。SketchSolver がその柱 GCS 点を fixed: true で扱う。 */
+    draggingColumnId: string | null;
 
     // Actions
     addElement: (element: BaseElement) => void;
@@ -251,11 +344,20 @@ export interface AppState {
     setWallReferenceMode: (mode: "Center" | "Interior" | "Exterior") => void;
     setCircleWallAngleDeg: (deg: string) => void;
     setRealtimeWallGen: (on: boolean) => void;
+    setShowConstraintIcons: (on: boolean) => void;
 
     // Wall tool sub-mode action
     setWallSubMode: (mode: WallSubMode) => void;
     setBeamSubMode: (mode: BeamSubMode) => void;
     setColumnSubMode: (mode: ColumnSubMode) => void;
+
+    // ── 階段 (Stair) アクション ───────────────────────────────
+    setActiveStair: (id: ElementId | null) => void;
+    /** draft を partial 更新。kind 切替や任意フィールドの編集に使う。 */
+    updateStairDraft: (partial: Partial<StairCreateDraft>) => void;
+    /** draft をリセット (= 既定値へ戻す)。Tool 終了時等に呼ぶ。 */
+    resetStairDraft: () => void;
+    setStairOriginPickMode: (mode: StairOriginPickMode) => void;
 
     // Design mode action
     setDesignMode: (mode: DesignMode) => void;
@@ -290,6 +392,7 @@ export interface AppState {
     /** Drag ピンを設定 (= FreeCAD `initMove` + `moveGeometries` 相当)。
      *  null / 空配列 → drag 終了 (= ピン解除)。null クリアで再ソルブが走る。 */
     setSolverDragHint: (hint: SolverDragPin[] | SolverDragPin | null) => void;
+    setDraggingColumnId: (id: string | null) => void;
     setSelectedGridIds: (ids: string[]) => void;
     // §6.2 連続作成: clone the most recent grid offset perpendicular to its direction
     offsetLastGrid: (distance: number, kind?: "Primary" | "Auxiliary") => void;
@@ -347,6 +450,7 @@ export const useAppState = create<AppState>((set, get) => ({
     wallReferenceMode: "Center",
     circleWallAngleDeg: "15",
     realtimeWallGen: true,
+    showConstraintIcons: true,
     wallSubMode: "add",
     beamSubMode: "add",
     columnSubMode: "add",
@@ -361,8 +465,14 @@ export const useAppState = create<AppState>((set, get) => ({
     sketchSelection: [],
     selectedConstraintId: null,
     solverDragHint: [],
+    draggingColumnId: null,
     types: seedStandardTypes(),
     activeTypeIdByCategory: { ...DEFAULT_TYPE_BY_CATEGORY },
+
+    // 階段 (Stair) 初期状態
+    activeStairId: null,
+    stairCreateDraft: defaultStairDraft(),
+    stairOriginPickMode: "off",
 
     addElement: (element) => set((state) => ({
         elements: { ...state.elements, [element.id]: element }
@@ -400,7 +510,7 @@ export const useAppState = create<AppState>((set, get) => ({
         // column / beam / slab / door / window) を選んだ場合は、部屋モードを
         // 抜ける。"select" と "wall" は部屋モード中でも使える (= 共存)。
         const incompatibleWithRoom = new Set([
-            "gridline", "column", "beam", "slab", "door", "window",
+            "gridline", "column", "beam", "slab", "door", "window", "stair",
         ]);
         if (incompatibleWithRoom.has(tool)
             && (state.activeRoomId !== null || state.pendingRoomLevelId !== null)) {
@@ -420,6 +530,29 @@ export const useAppState = create<AppState>((set, get) => ({
             if (!el || el.type !== "Space") return state;
             const cur = el.entities ?? [];
             const next = typeof updater === "function" ? updater(cur) : updater;
+            if (ROOM_SHAPE_DEBUG) {
+                const prevPolys = fmtDebugPolys(el.polygons);
+                const nextEnts = next.map((e: SketchEntity) => {
+                    if (e.kind === "polyline") {
+                        return `${e.closed ? "closed" : "open"}:${e.points.length}p${fmtDebugRing(e.points as Array<[number, number]>)}`
+                            + ` id=${e.id.slice(0, 6)}`;
+                    }
+                    if (e.kind === "line") return `line id=${e.id.slice(0, 6)} ${fmtDebugPt(e.p0)}→${fmtDebugPt(e.p1)}`;
+                    if (e.kind === "circle") return `circle id=${e.id.slice(0, 6)} c=${fmtDebugPt(e.center)} r=${e.radius.toFixed(3)}`;
+                    if (e.kind === "arc") return `arc id=${e.id.slice(0, 6)} c=${fmtDebugPt(e.center)} r=${e.radius.toFixed(3)}`;
+                    return "unknown";
+                }).join(" | ");
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[room-debug] setSpaceEntities start space=${(spaceId as string).slice(0, 6)} `
+                    + `dragPins=${state.solverDragHint.length} prevPolys=${prevPolys || "<none>"} nextEnts=${nextEnts || "<none>"}`,
+                );
+            }
+            // 設計原則: entity は真値、polygon は entity からの一方通行 derive。
+            // 以前は drag 中に polygon の再 derive を skip するガードを置いていたが、
+            // それは drag handler 側が polygon を直接書き込んでいた時代の workaround
+            // で、entity 駆動 drag に切り替えた今は derive を常に走らせて polygon を
+            // 自動更新する方が一貫性がある。
 
             // チェイン検出を含む派生は PolygonDerive 側に集約。返り値の
             // polyIdByEntity は「自己閉 entity 1:1」+「同じチェイン内全 entity
@@ -431,6 +564,42 @@ export const useAppState = create<AppState>((set, get) => ({
                     nextPolyId: () => generateId(),
                 });
 
+            // ── 形状崩壊ガード ─────────────────────────────────────
+            // 以前は正常サイズだった polygon が今回の derive で 1mm 未満まで
+            // 潰れたら、この更新フレーム自体を棄却して旧 state を返す。drag /
+            // 拘束ソルバ / cross-room 切替直後など、何かのパスで中間 state が
+            // 「全頂点同一直線上」のような degenerate になる瞬間があった場合に、
+            // それが永続化されて Room が線状に崩れる現象を防ぐ最終防衛線。
+            // 棄却された場合は次フレームの正常な入力で更新が反映されるので、
+            // 続行中のドラッグは止まらない。
+            const MIN_DIM = 0.001; // 1mm: これ未満の bbox 一辺は「潰れた」と判定
+            const bbox = (ring: Array<[number, number]>): [number, number] => {
+                let mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity;
+                for (const [x, y] of ring) {
+                    if (x < mnX) mnX = x; if (x > mxX) mxX = x;
+                    if (y < mnY) mnY = y; if (y > mxY) mxY = y;
+                }
+                return [mxX - mnX, mxY - mnY];
+            };
+            for (const np of newPolygons) {
+                if (np.wallOutlineOf) continue;
+                if (!np.outer || np.outer.length < 3) continue;
+                const [nw, nh] = bbox(np.outer as Array<[number, number]>);
+                if (nw >= MIN_DIM && nh >= MIN_DIM) continue;
+                const prev = el.polygons?.find((p) => p.id === np.id);
+                if (!prev || !prev.outer || prev.outer.length < 3) continue;
+                const [pw, ph] = bbox(prev.outer as Array<[number, number]>);
+                if (pw >= MIN_DIM && ph >= MIN_DIM) {
+                    // eslint-disable-next-line no-console
+                    console.warn(
+                        `[setSpaceEntities] rejected degenerate update for polygon ${np.id}: `
+                        + `${pw.toFixed(3)}x${ph.toFixed(3)} → ${nw.toFixed(3)}x${nh.toFixed(3)}`,
+                    );
+                    return state;
+                }
+            }
+            // ─────────────────────────────────────────────────────
+
             const updated: SpaceElement = {
                 ...el,
                 entities: next,
@@ -438,7 +607,23 @@ export const useAppState = create<AppState>((set, get) => ({
                 polyIdByEntity: nextMap,
                 dirtyFlags: new Set([...(el.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
             };
-            return { elements: { ...state.elements, [spaceId]: updated } };
+            const intermediateElements = { ...state.elements, [spaceId]: updated };
+            if (ROOM_SHAPE_DEBUG) {
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[room-debug] derive space=${(spaceId as string).slice(0, 6)} `
+                    + `polys=${fmtDebugPolys(newPolygons) || "<none>"}`,
+                );
+            }
+
+            // ── Junction split は実施しない ───────────────────────────────
+            // 設計原則 (ユーザ指示): entity が真値、polygon は entity から 1:1 で
+            // 派生する純粋な描画用変数。他壁との交点 (= JunctionGraph) は壁生成
+            // 時 (= wallRegenerate) に計算され、ポリゴン外周 (= 拘束が参照する
+            // インデックス) は変更されない。これにより polygon vertex/edge idx
+            // = entity point/edge idx で常に安定し、拘束 (H/V/Parallel/Perp/
+            // Coincident) のターゲット index がドラッグや配置で崩れない。
+            return { elements: intermediateElements };
         });
         // 拘束ソルバはエンティティ変更にも反応する想定 (vertex 移動など)。
         // ただし **drag 中** (= solverDragHint にピンが入っている) は solver
@@ -489,6 +674,7 @@ export const useAppState = create<AppState>((set, get) => ({
     setWallReferenceMode: (mode) => set({ wallReferenceMode: mode }),
     setCircleWallAngleDeg: (deg) => set({ circleWallAngleDeg: deg }),
     setRealtimeWallGen: (on) => set({ realtimeWallGen: on }),
+    setShowConstraintIcons: (on) => set({ showConstraintIcons: on }),
     setWallSubMode: (mode) => set((state) => ({
         wallSubMode: mode,
         // Switching sub-modes clears any in-flight sketch selection so the
@@ -497,6 +683,17 @@ export const useAppState = create<AppState>((set, get) => ({
     })),
     setBeamSubMode: (mode) => set({ beamSubMode: mode }),
     setColumnSubMode: (mode) => set({ columnSubMode: mode }),
+
+    // ── Stair actions ─────────────────────────────────────
+    setActiveStair: (id) => set({ activeStairId: id }),
+    updateStairDraft: (partial) => set((state) => ({
+        stairCreateDraft: { ...state.stairCreateDraft, ...partial },
+    })),
+    resetStairDraft: () => set({
+        stairCreateDraft: defaultStairDraft(),
+        stairOriginPickMode: "off",
+    }),
+    setStairOriginPickMode: (mode) => set({ stairOriginPickMode: mode }),
 
     setDesignMode: (mode) => set({ designMode: mode }),
     setViewMode: (mode) => set((state) => {
@@ -790,6 +987,7 @@ export const useAppState = create<AppState>((set, get) => ({
             mod.runSketchSolver();
         }
     },
+    setDraggingColumnId: (id) => set({ draggingColumnId: id }),
     offsetLastGrid: (distance, kind = "Primary") => {
         const state = get();
         // Find the most recently added grid (last in array)
@@ -836,7 +1034,49 @@ export const useAppState = create<AppState>((set, get) => ({
             activeLevelId: state.activeLevelId === id ? null : state.activeLevelId,
         };
     }),
-    setActiveLevel: (id) => set({ activeLevelId: id }),
+    setActiveLevel: (id) => set((state) => {
+        // 部屋モード中にレベル切替された場合、そのレベルに追随する。
+        //   - 編集中の部屋 (activeRoomId) は別階の所属なら解除し、
+        //     新レベルの pending 状態 (= 部屋未指定で待機) に切替える。
+        //   - pending 中ならレベル ID だけ差し替え。
+        // これにより RoomSketchOverlay の "editingLevelId" が新レベルに
+        // なり、背景となる他階の部屋が薄グレーの参照線、新レベル上の部屋
+        // が操作対象として描画 / クリックされる。
+        const inRoomMode = state.activeRoomId !== null || state.pendingRoomLevelId !== null;
+        if (!inRoomMode) return { activeLevelId: id };
+
+        if (id === null) {
+            // 全レベル解除 → 部屋モードも抜ける。
+            return {
+                activeLevelId: null,
+                activeRoomId: null,
+                pendingRoomLevelId: null,
+                roomEditMode: "select" as const,
+            };
+        }
+
+        // 編集中の部屋がある場合: その部屋が新レベル所属ならそのまま編集続行、
+        // 異なる階ならクリアして新レベルの pending 状態へ。
+        if (state.activeRoomId !== null) {
+            const room = state.elements[state.activeRoomId] as SpaceElement | undefined;
+            const roomLvl = room?.type === "Space" ? room.levelId : undefined;
+            if (roomLvl === id) {
+                // 同じ階 — 何も変えない (= ID だけ更新)
+                return { activeLevelId: id };
+            }
+            return {
+                activeLevelId: id,
+                activeRoomId: null,
+                pendingRoomLevelId: id,
+                roomEditMode: "select" as const,
+            };
+        }
+        // pending 中 → レベル ID 同期
+        return {
+            activeLevelId: id,
+            pendingRoomLevelId: id,
+        };
+    }),
 
     // ── Type system actions ─────────────────────────────────────
     addType: (t) => set((state) => ({

@@ -5,6 +5,11 @@ import { mat4, vec4 } from "gl-matrix";
 import { Camera } from "../../renderer/camera/Camera";
 import { Vec3 } from "../../geometry/math/Vec3";
 import { AxisAlignSnapResult } from "../../model/grid/GridSnap";
+import {
+    SNAP_GUIDE_COLOR, SNAP_GUIDE_WIDTH, SNAP_GUIDE_DASH,
+    SNAP_GUIDE_TEXT_HALO, SNAP_LABEL_FONT_SIZE, SNAP_LABEL_FONT_WEIGHT,
+    SNAP_LABEL_FONT_FAMILY, SNAP_LABEL_HALO_WIDTH,
+} from "../snapStyle";
 
 interface Props {
     getCamera: () => Camera | null;
@@ -132,8 +137,6 @@ export default function GridAxisGuideOverlay({ getCamera, getCanvas, axisSnap }:
 
     if (!axisSnap) return null;
 
-    // やや濃い水色で視認性を確保。Tailwind の sky-600 (rgb(2,132,199)) を採用。
-    const stroke = "rgb(2, 132, 199)";
     return (
         <svg
             ref={svgRef}
@@ -142,40 +145,40 @@ export default function GridAxisGuideOverlay({ getCamera, getCanvas, axisSnap }:
         >
             <line
                 ref={guideHRef}
-                stroke={stroke}
-                strokeWidth={1}
-                strokeDasharray="4 3"
+                stroke={SNAP_GUIDE_COLOR}
+                strokeWidth={SNAP_GUIDE_WIDTH}
+                strokeDasharray={SNAP_GUIDE_DASH}
             />
             <line
                 ref={guideVRef}
-                stroke={stroke}
-                strokeWidth={1}
-                strokeDasharray="4 3"
+                stroke={SNAP_GUIDE_COLOR}
+                strokeWidth={SNAP_GUIDE_WIDTH}
+                strokeDasharray={SNAP_GUIDE_DASH}
             />
             <g ref={labelHRef}>
                 <text
                     textAnchor="middle"
                     dominantBaseline="alphabetic"
-                    fontSize={11}
-                    fontWeight={600}
-                    fill={stroke}
-                    stroke="rgba(255,255,255,0.85)"
-                    strokeWidth={3}
+                    fontSize={SNAP_LABEL_FONT_SIZE}
+                    fontWeight={SNAP_LABEL_FONT_WEIGHT}
+                    fill={SNAP_GUIDE_COLOR}
+                    stroke={SNAP_GUIDE_TEXT_HALO}
+                    strokeWidth={SNAP_LABEL_HALO_WIDTH}
                     paintOrder="stroke"
-                    fontFamily="ui-sans-serif, system-ui, sans-serif"
+                    fontFamily={SNAP_LABEL_FONT_FAMILY}
                 />
             </g>
             <g ref={labelVRef}>
                 <text
                     textAnchor="start"
                     dominantBaseline="central"
-                    fontSize={11}
-                    fontWeight={600}
-                    fill={stroke}
-                    stroke="rgba(255,255,255,0.85)"
-                    strokeWidth={3}
+                    fontSize={SNAP_LABEL_FONT_SIZE}
+                    fontWeight={SNAP_LABEL_FONT_WEIGHT}
+                    fill={SNAP_GUIDE_COLOR}
+                    stroke={SNAP_GUIDE_TEXT_HALO}
+                    strokeWidth={SNAP_LABEL_HALO_WIDTH}
                     paintOrder="stroke"
-                    fontFamily="ui-sans-serif, system-ui, sans-serif"
+                    fontFamily={SNAP_LABEL_FONT_FAMILY}
                 />
             </g>
         </svg>

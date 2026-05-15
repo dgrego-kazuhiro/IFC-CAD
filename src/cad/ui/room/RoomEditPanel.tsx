@@ -27,6 +27,8 @@ import { regenerateAllWalls, triggerWallRegenIfEnabled } from "./wallRegenerate"
 export default function RoomEditPanel() {
     // OCCT 内/外オフセットの距離 (mm)。負値で内側、正値で外側。
     const [offsetMm, setOffsetMm] = useState("100");
+    // 壁オフセットの距離 (mm)。負値で内側、正値で外側。
+    const [wallOffsetMm, setWallOffsetMm] = useState("100");
 
     // 壁厚 / 円分割角 / リアルタイム壁生成は AppState に持って共有する。
     // RoomSketchOverlay が figure の commit / drag 完了時に同じ値で
@@ -39,6 +41,8 @@ export default function RoomEditPanel() {
     const setCircleWallAngleDeg = useAppState((s: AppState) => s.setCircleWallAngleDeg);
     const realtimeWallGen = useAppState((s: AppState) => s.realtimeWallGen);
     const setRealtimeWallGen = useAppState((s: AppState) => s.setRealtimeWallGen);
+    const showConstraintIcons = useAppState((s: AppState) => s.showConstraintIcons);
+    const setShowConstraintIcons = useAppState((s: AppState) => s.setShowConstraintIcons);
 
     const activeRoomId = useAppState((s: AppState) => s.activeRoomId);
     const pendingRoomLevelId = useAppState((s: AppState) => s.pendingRoomLevelId);
@@ -1072,6 +1076,13 @@ export default function RoomEditPanel() {
                 <Boxes size={14} />
                 {realtimeWallGen ? "Live ON" : "Live OFF"}
             </button>
+            <button
+                className={btnClass(showConstraintIcons)}
+                onClick={() => setShowConstraintIcons(!showConstraintIcons)}
+                title={showConstraintIcons ? "拘束シンボル: 表示中 (クリックで非表示)" : "拘束シンボル: 非表示 (クリックで表示)"}
+            >
+                {showConstraintIcons ? "拘束 ON" : "拘束 OFF"}
+            </button>
             <div className="w-px h-6 bg-zinc-600 mx-1" />
             <div className="flex items-center gap-1" title="OCCT 内外オフセット (符号で内/外、mm)">
                 <input
@@ -1095,6 +1106,30 @@ export default function RoomEditPanel() {
             >
                 <GitCompareArrows size={14} />
                 Offset
+            </button>
+            <div className="w-px h-6 bg-zinc-600 mx-1" />
+            <div className="flex items-center gap-1" title="壁オフセット (符号で内/外、mm)">
+                <input
+                    type="number"
+                    value={wallOffsetMm}
+                    onChange={(e) => setWallOffsetMm(e.target.value)}
+                    className="w-16 bg-zinc-900 border border-zinc-600 rounded px-1.5 py-1 text-xs text-zinc-100 text-center outline-none focus:border-blue-500"
+                    title="Wall offset distance (mm). Positive = outward, negative = inward."
+                />
+                <span className="text-[10px] text-zinc-500">mm</span>
+            </div>
+            <button
+                className={hasSelectedShapes ? btnClass(false) : disabledBtnClass}
+                onClick={handleOffsetSelected}
+                disabled={!hasSelectedShapes}
+                title={
+                    hasSelectedShapes
+                        ? `選択ポリゴンの壁を ${wallOffsetMm}mm オフセット`
+                        : "先にポリゴンを選択してください"
+                }
+            >
+                <GitCompareArrows size={14} />
+                Wall Offset
             </button>
             <button
                 className={canDelete ? btnClass(false) : disabledBtnClass}

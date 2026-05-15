@@ -8,8 +8,21 @@ import { Vec3 } from "../../geometry/math/Vec3";
 import { Constraint } from "../../model/constraint/Constraint";
 import { SpaceElement, RoomPolygon } from "../../model/elements/SpaceElement";
 import { WallElement } from "../../model/elements/WallElement";
+import { ColumnElement } from "../../model/elements/ColumnElement";
+import { columnFootprint2D } from "../../mesh/builders/ColumnMeshBuilder";
 import { Vec2 } from "../../geometry/math/Vec2";
 import { RemoveConstraintCommand } from "../../commands/create/AddConstraintCommand";
+import {
+    CONSTRAINT_GLYPHS,
+    COLOR_ICON_TEXT, COLOR_SELECTED,
+    COLOR_DIM_LINE, COLOR_DIM_LINE_SEL,
+    COLOR_DIM_TEXT, COLOR_DIM_TEXT_SEL, COLOR_LABEL_BG,
+    ICON_RADIUS, ICON_RADIUS_SEL,
+    ICON_FONT_SIZE, ICON_FONT_WEIGHT, ICON_FONT_FAMILY,
+    DIM_LINE_WIDTH, DIM_LINE_WIDTH_SEL,
+    DIM_ARROW_PX, DIM_OFFSET_PX, DIM_EXT_EXTRA_PX,
+    ICON_STACK_GAP_PX, ICON_CELL_SIZE_PX,
+} from "./constraintStyle";
 
 interface Props {
     getCamera: () => Camera | null;
@@ -27,16 +40,6 @@ function project(world: Vec3, camera: Camera, width: number, height: number): { 
     return { x, y, visible: v[3] > 0 };
 }
 
-const GLYPHS: Record<string, { glyph: string; color: string; tip: string }> = {
-    Horizontal:    { glyph: "─", color: "#60a5fa", tip: "水平" },
-    Vertical:      { glyph: "│", color: "#60a5fa", tip: "垂直" },
-    Parallel:      { glyph: "∥", color: "#a78bfa", tip: "平行" },
-    Perpendicular: { glyph: "⊥", color: "#a78bfa", tip: "直交" },
-    Coincident:    { glyph: "●", color: "#f97316", tip: "点一致" },
-    PointOnGrid:   { glyph: "⊕", color: "#ef4444", tip: "通芯上" },
-    PointOnColumn: { glyph: "⊙", color: "#10b981", tip: "柱中心" },
-    Length:        { glyph: "↔", color: "#fbbf24", tip: "長さ寸法" },
-};
 
 function findPoly(elements: Record<string, any>, spaceId: string, polyId: string): RoomPolygon | null {
     const sp = elements[spaceId] as SpaceElement | undefined;
@@ -83,6 +86,25 @@ function placementFor(c: Constraint, elements: Record<string, any>): Vec3 | null
         if (!w || w.type !== "Wall") continue;
         const p = w.axis[t.endIdx];
         return [p[0], 0, p[2]];
+    }
+    // 柱頂点・柱辺の中点。
+    for (const t of c.targets) {
+        if (t.kind === "ColumnVertex") {
+            const col = elements[t.columnId as string] as ColumnElement | undefined;
+            if (!col || !col.basePoint) continue;
+            const fp = columnFootprint2D(col);
+            if (t.vertexIdx < 0 || t.vertexIdx >= fp.length) continue;
+            return [fp[t.vertexIdx][0], 0, fp[t.vertexIdx][1]];
+        }
+        if (t.kind === "ColumnEdge") {
+            const col = elements[t.columnId as string] as ColumnElement | undefined;
+            if (!col || !col.basePoint) continue;
+            const fp = columnFootprint2D(col);
+            const n = fp.length;
+            if (t.edgeIdx < 0 || t.edgeIdx >= n) continue;
+            const a = fp[t.edgeIdx], b = fp[(t.edgeIdx + 1) % n];
+            return [(a[0] + b[0]) / 2, 0, (a[1] + b[1]) / 2];
+        }
     }
     return null;
 }
@@ -165,14 +187,10 @@ interface DimPlacement {
 
 type Placement = IconPlacement | DimPlacement;
 
-// CAD-style dimension visual constants (screen-space, pixels)
-const DIM_OFFSET_PX = 38;     // dim line distance from the edge
-const EXT_GAP_RATIO = 0.06;   // small gap so ext lines don't touch the edge
-const EXT_OVERSHOOT = 1.18;   // ext lines extend slightly past the dim line
-const ARROW_LEN = 9;
+// Derived geometry constants (local, computed from constraintStyle)
+const EXT_GAP_RATIO = 0.06;
+const EXT_OVERSHOOT = (DIM_OFFSET_PX + DIM_EXT_EXTRA_PX) / DIM_OFFSET_PX;
 const ARROW_WIDTH = 6;
-const DIM_COLOR = "#334155";  // slate-700, dark enough to read on light bg
-const DIM_COLOR_SELECTED = "#fbbf24";
 
 /**
  * True when the constraint touches the active room — either via a
@@ -200,12 +218,32 @@ export default function ConstraintIconOverlay({ getCamera, getCanvas }: Props) {
     const executeCommand = useAppState((s: AppState) => s.executeCommand);
     const selectedConstraintId = useAppState((s: AppState) => s.selectedConstraintId);
     const setSelectedConstraintId = useAppState((s: AppState) => s.setSelectedConstraintId);
+    const showConstraintIcons = useAppState((s: AppState) => s.showConstraintIcons);
     const svgRef = useRef<SVGSVGElement>(null);
     const iconRefs = useRef<Map<string, SVGGElement>>(new Map());
     const dimRefs = useRef<Map<string, SVGGElement>>(new Map());
 
     const placements: Placement[] = React.useMemo(() => {
         const out: Placement[] = [];
+
+        // Column-only constraints (HorizDistance / VertDistance) — shown
+        // regardless of activeRoomId since they don't belong to a room.
+        for (const id in constraints) {
+            const c = constraints[id];
+            if (c.type !== "HorizDistance" && c.type !== "VertDistance") continue;
+            const colTargets = c.targets.filter((t) => t.kind === "Column");
+            if (colTargets.length < 2) continue;
+            const col0 = elements[(colTargets[0] as any).columnId as string] as ColumnElement | undefined;
+            const col1 = elements[(colTargets[1] as any).columnId as string] as ColumnElement | undefined;
+            if (!col0?.basePoint || !col1?.basePoint) continue;
+            const world: Vec3 = [
+                (col0.basePoint[0] + col1.basePoint[0]) / 2,
+                0,
+                (col0.basePoint[2] + col1.basePoint[2]) / 2,
+            ];
+            out.push({ kind: "icon", c, world });
+        }
+
         if (!activeRoomId) return out;
         for (const id in constraints) {
             const c = constraints[id];
@@ -253,10 +291,10 @@ export default function ConstraintIconOverlay({ getCamera, getCanvas }: Props) {
                             continue;
                         }
                         el.removeAttribute("display");
-                        const key = `${Math.round(proj.x / 8)},${Math.round(proj.y / 8)}`;
+                        const key = `${Math.round(proj.x / ICON_CELL_SIZE_PX)},${Math.round(proj.y / ICON_CELL_SIZE_PX)}`;
                         const n = groups.get(key) ?? 0;
                         groups.set(key, n + 1);
-                        const ox = n * 18;
+                        const ox = n * ICON_STACK_GAP_PX;
                         el.setAttribute("transform", `translate(${(proj.x + ox).toFixed(1)},${proj.y.toFixed(1)})`);
                         continue;
                     }
@@ -297,14 +335,14 @@ export default function ConstraintIconOverlay({ getCamera, getCanvas }: Props) {
                     const ebSy = pb.y + ny * (off * EXT_GAP_RATIO);
                     const ebEx = pb.x + nx * (off * EXT_OVERSHOOT);
                     const ebEy = pb.y + ny * (off * EXT_OVERSHOOT);
-                    // Arrow A: tip at dim-line endpoint a, base ARROW_LEN along +u.
-                    const baseAx = dax + ux * ARROW_LEN, baseAy = day + uy * ARROW_LEN;
+                    // Arrow A: tip at dim-line endpoint a, base DIM_ARROW_PX along +u.
+                    const baseAx = dax + ux * DIM_ARROW_PX, baseAy = day + uy * DIM_ARROW_PX;
                     const a1x = baseAx + nx * (ARROW_WIDTH / 2);
                     const a1y = baseAy + ny * (ARROW_WIDTH / 2);
                     const a2x = baseAx - nx * (ARROW_WIDTH / 2);
                     const a2y = baseAy - ny * (ARROW_WIDTH / 2);
-                    // Arrow B: tip at dim-line endpoint b, base ARROW_LEN along -u.
-                    const baseBx = dbx - ux * ARROW_LEN, baseBy = dby - uy * ARROW_LEN;
+                    // Arrow B: tip at dim-line endpoint b, base DIM_ARROW_PX along -u.
+                    const baseBx = dbx - ux * DIM_ARROW_PX, baseBy = dby - uy * DIM_ARROW_PX;
                     const b1x = baseBx + nx * (ARROW_WIDTH / 2);
                     const b1y = baseBy + ny * (ARROW_WIDTH / 2);
                     const b2x = baseBx - nx * (ARROW_WIDTH / 2);
@@ -339,6 +377,8 @@ export default function ConstraintIconOverlay({ getCamera, getCanvas }: Props) {
         else dimRefs.current.delete(id);
     };
 
+    if (!showConstraintIcons) return null;
+
     return (
         <svg
             ref={svgRef}
@@ -348,8 +388,8 @@ export default function ConstraintIconOverlay({ getCamera, getCanvas }: Props) {
             {placements.map((p) => {
                 if (p.kind === "icon") {
                     const c = p.c;
-                    const g = GLYPHS[c.type] ?? { glyph: "?", color: "#ffffff", tip: c.type };
-                    const tip = g.tip + (c.value !== undefined ? ` ${c.value.toFixed(2)}m` : "");
+                    const g = CONSTRAINT_GLYPHS[c.type] ?? { glyph: "?", color: "#ffffff", tip: c.type };
+                    const tip = g.tip + (c.value !== undefined ? ` ${Math.round(c.value * 1000)}mm` : "");
                     const isSelected = selectedConstraintId === c.id;
                     return (
                         <g
@@ -367,79 +407,78 @@ export default function ConstraintIconOverlay({ getCamera, getCanvas }: Props) {
                         >
                             <title>{tip}（クリックで選択 / Delete で削除 / 右クリックで即削除）</title>
                             {isSelected && (
-                                <circle r={13} fill="none" stroke="#fbbf24" strokeWidth={2} />
+                                <circle r={ICON_RADIUS_SEL} fill="none" stroke={COLOR_SELECTED} strokeWidth={2} />
                             )}
                             <circle
-                                r={9}
+                                r={ICON_RADIUS}
                                 fill={g.color}
-                                stroke={isSelected ? "#fbbf24" : "#ffffff"}
-                                strokeWidth={isSelected ? 2 : 1.2}
+                                stroke={isSelected ? COLOR_SELECTED : COLOR_ICON_TEXT}
+                                strokeWidth={isSelected ? 2 : DIM_LINE_WIDTH}
                             />
                             <text
                                 textAnchor="middle"
                                 dominantBaseline="central"
-                                fontSize={11}
-                                fontWeight={700}
-                                fill="#ffffff"
-                                fontFamily="ui-sans-serif, system-ui, sans-serif"
+                                fontSize={ICON_FONT_SIZE}
+                                fontWeight={ICON_FONT_WEIGHT}
+                                fill={COLOR_ICON_TEXT}
+                                fontFamily={ICON_FONT_FAMILY}
                             >{g.glyph}</text>
                         </g>
                     );
                 }
                 const c = p.c;
-                const isSelected = selectedConstraintId === c.id;
-                const stroke = isSelected ? DIM_COLOR_SELECTED : DIM_COLOR;
-                const tip = "長さ寸法" + (c.value !== undefined ? ` ${c.value.toFixed(2)}m` : "");
+                const stroke = COLOR_DIM_LINE;
+                const tip = "長さ寸法" + (c.value !== undefined ? ` ${Math.round(c.value * 1000)}mm` : "")
+                    + "（右クリックで削除）";
                 const labelW = Math.max(22, p.label.length * 8 + 10);
-                const onSelect = (e: React.MouseEvent) => {
-                    e.stopPropagation();
-                    setSelectedConstraintId(isSelected ? null : c.id);
-                };
                 const onDelete = (e: React.MouseEvent) => {
                     e.preventDefault();
+                    e.stopPropagation();
                     executeCommand(new RemoveConstraintCommand(c.id));
                 };
+                // 寸法ラベルは「クリックで選択」を廃止 (= 部屋ドラッグを邪魔
+                // しない)。削除手段は dim-line 右クリックのみ残す。ラベル背景・
+                // テキストは pointerEvents=none で完全に透過させる。
                 return (
                     <g key={c.id} ref={setDimRef(c.id)}>
-                        <title>{tip}（クリックで選択 / Delete で削除 / 右クリックで即削除）</title>
+                        <title>{tip}</title>
                         <line data-role="ext-a" x1={0} y1={0} x2={0} y2={0}
-                            stroke={stroke} strokeWidth={1} strokeLinecap="round" />
+                            stroke={stroke} strokeWidth={1} strokeLinecap="round"
+                            style={{ pointerEvents: "none" }} />
                         <line data-role="ext-b" x1={0} y1={0} x2={0} y2={0}
-                            stroke={stroke} strokeWidth={1} strokeLinecap="round" />
+                            stroke={stroke} strokeWidth={1} strokeLinecap="round"
+                            style={{ pointerEvents: "none" }} />
                         <line data-role="dim-line" x1={0} y1={0} x2={0} y2={0}
                             stroke={stroke}
-                            strokeWidth={isSelected ? 1.6 : 1.2}
+                            strokeWidth={DIM_LINE_WIDTH}
                             strokeLinecap="round"
-                            style={{ pointerEvents: "stroke", cursor: "pointer" }}
-                            onClick={onSelect}
+                            style={{ pointerEvents: "stroke", cursor: "context-menu" }}
                             onContextMenu={onDelete}
                         />
-                        <polygon data-role="arrow-a" points="0,0 0,0 0,0" fill={stroke} stroke="none" />
-                        <polygon data-role="arrow-b" points="0,0 0,0 0,0" fill={stroke} stroke="none" />
-                        <g data-role="label-group">
+                        <polygon data-role="arrow-a" points="0,0 0,0 0,0" fill={stroke} stroke="none"
+                            style={{ pointerEvents: "none" }} />
+                        <polygon data-role="arrow-b" points="0,0 0,0 0,0" fill={stroke} stroke="none"
+                            style={{ pointerEvents: "none" }} />
+                        <g data-role="label-group" style={{ pointerEvents: "none" }}>
                             <rect
                                 x={-labelW / 2}
                                 y={-17}
                                 width={labelW}
                                 height={14}
                                 rx={2}
-                                fill="rgba(255,255,255,0.92)"
+                                fill={COLOR_LABEL_BG}
                                 stroke={stroke}
-                                strokeWidth={isSelected ? 1 : 0.6}
-                                style={{ pointerEvents: "auto", cursor: "pointer" }}
-                                onClick={onSelect}
-                                onContextMenu={onDelete}
+                                strokeWidth={0.6}
                             />
                             <text
                                 x={0}
                                 y={-10}
                                 textAnchor="middle"
                                 dominantBaseline="central"
-                                fontSize={11}
-                                fontWeight={600}
-                                fill={isSelected ? "#92400e" : "#0f172a"}
-                                fontFamily="ui-sans-serif, system-ui, sans-serif"
-                                style={{ pointerEvents: "none", userSelect: "none" }}
+                                fontSize={ICON_FONT_SIZE}
+                                fontWeight={ICON_FONT_WEIGHT}
+                                fill={COLOR_DIM_TEXT}
+                                fontFamily={ICON_FONT_FAMILY}
                             >{p.label}</text>
                         </g>
                     </g>

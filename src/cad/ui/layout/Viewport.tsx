@@ -24,7 +24,7 @@ import { unifiedSnap, SnapSource, SnapInfo } from "../../snapping/UnifiedSnap";
 import { BeamElement } from "../../model/elements/BeamElement";
 import { ColumnElement } from "../../model/elements/ColumnElement";
 import { BeamMeshBuilder } from "../../mesh/builders/BeamMeshBuilder";
-import { ColumnMeshBuilder, columnFootprint2D } from "../../mesh/builders/ColumnMeshBuilder";
+import { ColumnMeshBuilder, columnFootprint2D, profileRing } from "../../mesh/builders/ColumnMeshBuilder";
 import {
     buildJunctionGraph,
     resolveJunctions,
@@ -54,6 +54,8 @@ import { WallMeshBuilder, WallOpeningInfo } from "../../mesh/builders/WallMeshBu
 import { DoorMeshBuilder } from "../../mesh/builders/DoorMeshBuilder";
 import { WindowMeshBuilder } from "../../mesh/builders/WindowMeshBuilder";
 import { SlabMeshBuilder } from "../../mesh/builders/SlabMeshBuilder";
+import { StairMeshBuilder } from "../../mesh/builders/StairMeshBuilder";
+import type { StairElement } from "../../model/elements/StairElement";
 import earcut from "earcut";
 import { MeshData } from "../../mesh/MeshData";
 import { LineMeshBuilder } from "../../mesh/builders/LineMeshBuilder";
@@ -67,8 +69,28 @@ import { snapToGrids, pickGrid, snapAngle, snapAxisAlign, GridSnapResult, AxisAl
 import GridBubbleOverlay from "../grid/GridBubbleOverlay";
 import GridEditOverlay from "../grid/GridEditOverlay";
 import GridAxisGuideOverlay from "../grid/GridAxisGuideOverlay";
+import OriginOverlay from "../grid/OriginOverlay";
+import SnapSymbolOverlay from "./SnapSymbolOverlay";
+import ColumnSketchOverlay from "./ColumnSketchOverlay";
+import DimensionOverlay from "../constraint/DimensionOverlay";
 import { gridVertices } from "../../model/grid/GridLine";
 import { triggerWallRegenIfEnabled } from "../room/wallRegenerate";
+import {
+    SNAP_RGBA_OBJ, SNAP_RGBA_AXIS, SNAP_RGBA_WHITE,
+    GRID_DRAFT_RGBA_SOLID, GRID_DRAFT_RGBA_DASH,
+    GRID_DRAFT_DASH_LEN_M, GRID_DRAFT_GAP_LEN_M,
+} from "../snapStyle";
+import {
+    SEL, WALL_2D, WALL_3D, WALL_DRAFT,
+    SKETCH_INNER_STROKE, SKETCH_INNER_FILL, SKETCH_OUTLINE,
+    SLAB_DEFAULT, SLAB_SPACE, SLAB_SKETCH, SLAB_CLOSING,
+    COLUMN_DEFAULT, COLUMN_PREVIEW,
+    BEAM_DEFAULT, BEAM_PREVIEW, BEAM_GHOST,
+    STAIR_DEFAULT,
+    DOOR_DEFAULT, DOOR_PREVIEW,
+    WINDOW_DEFAULT, WINDOW_PREVIEW,
+    GRID_SKETCH_SEL,
+} from "../viewportStyle";
 
 export interface ViewportHandle {
     getCamera(): Camera | null;
@@ -128,10 +150,18 @@ function pickWallByRay(
     rayDir: Vec3,
     groundPoint: Vec3 | null,
     elements: Record<string, any>,
-    sceneObjects: { id: string; mesh: { bounds: { min: Vec3; max: Vec3 } } }[],
+    sceneObjects: { id: string; mesh: { bounds: { min: Vec3; max: Vec3 } }; transform: mat4 }[],
 ): { wallId: string; position: number } | null {
     const debug = (globalThis as any).__pickDebug === true;
     // 1. Ray vs wall AABB — works in 3D
+    //
+    // **重要**: 壁メッシュの bounds は **ローカル座標** (Y=[0, height]) で
+    // 計算されている。レベル 2F 以降の壁は scene object の transform で
+    // Y 方向に levelElevation だけ平行移動して描画されているため、AABB
+    // 交差判定もその平行移動を反映した **world bounds** で行わないと、
+    // 2F 以降の壁にレイがヒットしない (= ドア / 窓を配置できない)。
+    // ここでは transform から平行移動成分 (m[12], m[13], m[14]) を取り出して
+    // bounds をシフトする。回転 / スケールは現状の使用例では使わない。
     let bestHit: { wallId: string; dist: number } | null = null;
     let wallObjCount = 0;
     for (const obj of sceneObjects) {
@@ -140,7 +170,12 @@ function pickWallByRay(
         const el = elements[sid];
         if (!el || el.type !== "Wall") continue;
         wallObjCount++;
-        const dist = rayIntersectsAABB(rayOrigin, rayDir, obj.mesh.bounds);
+        const tx = obj.transform[12], ty = obj.transform[13], tz = obj.transform[14];
+        const worldBounds = (tx === 0 && ty === 0 && tz === 0) ? obj.mesh.bounds : {
+            min: [obj.mesh.bounds.min[0] + tx, obj.mesh.bounds.min[1] + ty, obj.mesh.bounds.min[2] + tz] as Vec3,
+            max: [obj.mesh.bounds.max[0] + tx, obj.mesh.bounds.max[1] + ty, obj.mesh.bounds.max[2] + tz] as Vec3,
+        };
+        const dist = rayIntersectsAABB(rayOrigin, rayDir, worldBounds);
         if (debug) {
             // eslint-disable-next-line no-console
             console.log(
@@ -265,7 +300,7 @@ function snapForBeam(
     grids: { id: string; visible: boolean; curve: any }[],
     tolerance: number = 0.5,
     residentialStep?: number,
-): { point: Vec3; kind: "Column" | "BeamEndpoint" | "WallEndpoint" | "WallAxis" | "GridIntersection" | "Grid" | "ResidentialGrid" | null } {
+): { point: Vec3; kind: "Column" | "BeamEndpoint" | "WallEndpoint" | "WallVertex" | "WallAxis" | "Origin" | "GridIntersection" | "Grid" | "ResidentialGrid" | null } {
     // 1. Column corner / center (角を中心より優先 — 角がより精密な配置目標)
     let bestCorner: { dist: number; point: Vec3 } | null = null;
     let bestCenter: { dist: number; point: Vec3 } | null = null;
@@ -308,8 +343,29 @@ function snapForBeam(
     }
     if (bestEp) return { point: bestEp.point, kind: "BeamEndpoint" };
 
-    // 3. Wall endpoint (= wall.axis[0] / axis[1])。Column / Beam を壁の取付き
-    //    点に正確に置けるよう、端点を最優先帯で吸着させる。
+    // 3. Wall footprint vertex — 壁の実描画 (3D) における可視コーナー。
+    //    junction-graph パイプラインが書き込んだ `wall.footprint` (CCW Vec2[])
+    //    の各頂点を XZ 平面でスナップ候補にする。axis 端点 (= 部屋ポリゴン
+    //    頂点 = centerline) は壁厚の内側に隠れているので、ユーザの見た目と
+    //    一致するのはこちら。`footprint` を持つ壁ではこの頂点が優先される。
+    let bestWV: { dist: number; point: Vec3 } | null = null;
+    for (const id in elements) {
+        const el = elements[id];
+        if (!el || el.type !== "Wall") continue;
+        const fp = (el as any).footprint as Vec2[] | undefined;
+        if (!fp || fp.length < 3) continue;
+        for (const p of fp) {
+            const d = Math.hypot(raw[0] - p[0], raw[2] - p[1]);
+            if (d <= tolerance && (!bestWV || d < bestWV.dist)) {
+                bestWV = { dist: d, point: [p[0], raw[1], p[1]] };
+            }
+        }
+    }
+    if (bestWV) return { point: bestWV.point, kind: "WallVertex" };
+
+    // 4. Wall endpoint (= wall.axis[0] / axis[1])。`footprint` を持たない
+    //    レガシー壁向けのフォールバック (= 室ポリゴン頂点に吸着)。footprint
+    //    があってもこのパスは走るが、上の WallVertex がほぼ確実に先に当たる。
     let bestWE: { dist: number; point: Vec3 } | null = null;
     for (const id in elements) {
         const el = elements[id];
@@ -349,6 +405,13 @@ function snapForBeam(
         }
     }
     if (bestWA) return { point: bestWA.point, kind: "WallAxis" };
+
+    // 5.5 世界原点 (0, 0) — freeZoning モードでは通芯が無いことが多いので、
+    //     原点を独立した「固定参照点」としてスナップ可能にする。通芯交点と
+    //     同程度の優先度 (= 次パスより先) で評価する。
+    if (Math.hypot(raw[0], raw[2]) <= tolerance) {
+        return { point: [0, raw[1], 0], kind: "Origin" };
+    }
 
     // 5. Grid intersection + 6. Grid line — reuse snapToGrids
     const gsnap = snapToGrids(raw, grids as any, tolerance);
@@ -394,22 +457,30 @@ function pointInPolygon(p: [number, number], ring: [number, number][]): boolean 
 }
 
 // Find the Space whose unioned profile contains a given 2D point (XZ).
+// 複数 Space が重なっている場合は `createdAt` (= 後から追加した Room ほど大きい)
+// が最大のものを返し、ユーザの「上に乗せた矩形を優先」というレイヤ感覚に合わせる。
 function pickSpaceAt(point: [number, number], elements: Record<string, any>): string | null {
+    let bestId: string | null = null;
+    let bestCreatedAt = -Infinity;
     for (const id in elements) {
         const el = elements[id];
         if (!el || el.type !== "Space") continue;
         const profiles = collectSpaceProfiles(el as SpaceElement);
+        let hit = false;
         for (const p of profiles) {
             if (pointInPolygon(point, p.outer as unknown as [number, number][])) {
                 let inHole = false;
                 for (const h of p.holes) {
                     if (pointInPolygon(point, h as unknown as [number, number][])) { inHole = true; break; }
                 }
-                if (!inHole) return id;
+                if (!inHole) { hit = true; break; }
             }
         }
+        if (!hit) continue;
+        const c = (el as SpaceElement).createdAt ?? -Infinity;
+        if (c >= bestCreatedAt) { bestCreatedAt = c; bestId = id; }
     }
-    return null;
+    return bestId;
 }
 
 function getGroundIntersection(
@@ -462,12 +533,17 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
     const addGrid = useAppState((state: AppState) => state.addGrid);
     const addGridPolyline = useAppState((state: AppState) => state.addGridPolyline);
     const offsetLastGrid = useAppState((state: AppState) => state.offsetLastGrid);
-    const createGridArray = useAppState((state: AppState) => state.createGridArray);
     const selectedGridIds = useAppState((state: AppState) => state.selectedGridIds);
     const constraints = useAppState((state: AppState) => state.constraints);
     const setSelectedGridIds = useAppState((state: AppState) => state.setSelectedGridIds);
     const removeGrids = useAppState((state: AppState) => state.removeGrids);
     const setActiveTool = useAppState((state: AppState) => state.setActiveTool);
+    // ── Stair (階段) 関連 state ─────────────────────────────────
+    const stairOriginPickMode = useAppState((state: AppState) => state.stairOriginPickMode);
+    const setStairOriginPickMode = useAppState((state: AppState) => state.setStairOriginPickMode);
+    const stairCreateDraft = useAppState((state: AppState) => state.stairCreateDraft);
+    const updateStairDraft = useAppState((state: AppState) => state.updateStairDraft);
+    const activeStairId = useAppState((state: AppState) => state.activeStairId);
     const sketchSelection = useAppState((state: AppState) => state.sketchSelection);
     const toggleSketchSelection = useAppState((state: AppState) => state.toggleSketchSelection);
     const clearSketchSelection = useAppState((state: AppState) => state.clearSketchSelection);
@@ -524,6 +600,13 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
     const [showArrayPanel, setShowArrayPanel] = useState(false);
     const [arrayPitch, setArrayPitch] = useState("3");
     const [arrayCount, setArrayCount] = useState("3");
+    // 配列作成: 通芯の方向 (= 各軸の向き)。
+    //   "horizontal" → 各通芯が水平 (= X 方向)、ピッチは縦方向 (Y) に並ぶ
+    //   "vertical"   → 各通芯が垂直 (= Y 方向)、ピッチは横方向 (X) に並ぶ
+    const [arrayDirection, setArrayDirection] = useState<"horizontal" | "vertical">("horizontal");
+    const [arrayOriginX, setArrayOriginX] = useState("0");
+    const [arrayOriginY, setArrayOriginY] = useState("0");
+    const [arrayLength, setArrayLength] = useState("20");
     const [offsetInput, setOffsetInput] = useState("3");
 
     // Door / window placement preview
@@ -544,7 +627,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
     const [slabSketching, setSlabSketching] = useState(false);
     const [slabSketchPoints, setSlabSketchPoints] = useState<Vec3[]>([]);
     const [slabSketchHover, setSlabSketchHover] = useState<Vec3 | null>(null);
-    const [slabSnap, setSlabSnap] = useState<{ kind: "Column" | "BeamEndpoint" | "WallEndpoint" | "WallAxis" | "GridIntersection" | "Grid" | "ResidentialGrid" | null }>({ kind: null });
+    const [slabSnap, setSlabSnap] = useState<{ kind: "Column" | "BeamEndpoint" | "WallEndpoint" | "WallVertex" | "WallAxis" | "Origin" | "GridIntersection" | "Grid" | "ResidentialGrid" | null }>({ kind: null });
     // Beam tool (spec §5) — 2-point sketch, chain mode
     const [beamStart, setBeamStart] = useState<Vec3 | null>(null);
     const [beamHover, setBeamHover] = useState<Vec3 | null>(null);
@@ -554,10 +637,15 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
     const [beamTopOffsetInput, setBeamTopOffsetInput] = useState("0");
     const [beamLevelId, setBeamLevelId] = useState<string | undefined>(undefined);
     const [beamZJust, setBeamZJust] = useState<"Top" | "Center" | "Bottom">("Top");
-    const [beamSnap, setBeamSnap] = useState<{ kind: "Column" | "Grid" | "GridIntersection" | "BeamEndpoint" | "WallEndpoint" | "WallAxis" | "ResidentialGrid" | null }>({ kind: null });
+    const [beamSnap, setBeamSnap] = useState<{ kind: "Column" | "Grid" | "GridIntersection" | "BeamEndpoint" | "WallEndpoint" | "WallVertex" | "WallAxis" | "Origin" | "ResidentialGrid" | null }>({ kind: null });
     // Column tool (spec §5)
     const [columnHover, setColumnHover] = useState<Vec3 | null>(null);
+    // 「snap marker (緑十字)」を描く位置。`columnHover` は配置中の柱の
+    // basePoint (= ghost の中心) を指すので、コーナー→ターゲットの
+    // スナップが効いている時はマーカー位置とずれる。
+    const [columnSnapPoint, setColumnSnapPoint] = useState<Vec3 | null>(null);
     const [columnSnap, setColumnSnap] = useState<{ kind: string | null }>({ kind: null });
+    const [colPickHoverItem, setColPickHoverItem] = useState<SketchSelectionItem | null>(null);
     const [columnProfileKind, setColumnProfileKind] = useState<"Rectangle" | "Circle">("Rectangle");
     const [columnWidthInput, setColumnWidthInput] = useState("0.4");
     const [columnDepthInput, setColumnDepthInput] = useState("0.4");
@@ -770,6 +858,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         if (activeTool !== "column") {
             setColumnHover(null);
             setColumnSnap({ kind: null });
+            setColumnSnapPoint(null);
         } else {
             // Initialize base/top levels when entering the tool (spec §5)
             if (!columnBaseLevelId && activeLevelId) setColumnBaseLevelId(activeLevelId as string);
@@ -1137,7 +1226,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh: meshData,
                         transform: wallYTransform(el),
                         visible: true,
-                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [140 / 255, 140 / 255, 145 / 255, 0.85],
+                        color: isSelected ? SEL : WALL_2D,
                     });
                 } else {
                     // 3D Geometry: hex footprint when wall has polyRef AND
@@ -1219,7 +1308,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh: meshData,
                         transform: wallYTransform(el),
                         visible: true,
-                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.88, 0.88, 0.9, 1.0],
+                        color: isSelected ? SEL : WALL_3D,
                         //color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.88, 0.88, 0.9, 1.0],
                         //color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.45, 0.45, 0.5, 1.0],
                         cylinderCenter,
@@ -1240,10 +1329,10 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             const pxToWorld = useOrtho ? (2 * orthoZoom / canvasH) : 0.015;
             const refThickness = useOrtho ? REF_LINE_PX * pxToWorld : 0.02;
             // Mirror RoomSketchOverlay's C_RECT / C_RECT_FILL for parity.
-            const innerStroke: [number, number, number, number] = [59 / 255, 130 / 255, 246 / 255, 0.9];
-            const innerFill: [number, number, number, number] = [59 / 255, 130 / 255, 246 / 255, 0.06];
-            const outlineStroke: [number, number, number, number] = [100 / 255, 116 / 255, 139 / 255, 0.9];
-            const selColor: [number, number, number, number] = [249 / 255, 115 / 255, 22 / 255, 1.0];
+            const innerStroke  = SKETCH_INNER_STROKE;
+            const innerFill    = SKETCH_INNER_FILL;
+            const outlineStroke = SKETCH_OUTLINE;
+            const selColor     = SEL;
             const selEdgeIdx = new Set<string>();
             const selVertIdx = new Set<string>();
             const selWallAxis = new Set<string>();
@@ -1415,7 +1504,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         // Slab manual sketch preview (per spec §3.1) — solid polyline for
         // committed points + dashed line from last point to cursor.
         if (activeTool === "slab" && slabSketching && slabSketchPoints.length > 0) {
-            const slabSketchColor: [number, number, number, number] = [0.95, 0.55, 0.1, 1.0];
+            const slabSketchColor = SLAB_SKETCH;
             if (slabSketchPoints.length >= 2) {
                 scene.addObject({
                     id: "slab-sketch-solid",
@@ -1441,15 +1530,13 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 const dz = slabSketchHover[2] - last[2];
                 const len = Math.hypot(dx, dz);
                 if (len > 1e-6) {
-                    const dashLen = 0.3;
-                    const gapLen = 0.2;
-                    const stride = dashLen + gapLen;
+                    const stride = GRID_DRAFT_DASH_LEN_M + GRID_DRAFT_GAP_LEN_M;
                     const ux = dx / len;
                     const uz = dz / len;
                     let t = 0;
                     let dashIdx = 0;
                     while (t < len) {
-                        const tEnd = Math.min(t + dashLen, len);
+                        const tEnd = Math.min(t + GRID_DRAFT_DASH_LEN_M, len);
                         const a: Vec3 = [last[0] + ux * t, 0, last[2] + uz * t];
                         const b: Vec3 = [last[0] + ux * tEnd, 0, last[2] + uz * tEnd];
                         scene.addObject({
@@ -1474,7 +1561,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                             let ct = 0;
                             let cIdx = 0;
                             while (ct < clen) {
-                                const ctEnd = Math.min(ct + dashLen, clen);
+                                const ctEnd = Math.min(ct + GRID_DRAFT_DASH_LEN_M, clen);
                                 const a: Vec3 = [slabSketchHover[0] + cux * ct, 0, slabSketchHover[2] + cuz * ct];
                                 const b: Vec3 = [slabSketchHover[0] + cux * ctEnd, 0, slabSketchHover[2] + cuz * ctEnd];
                                 scene.addObject({
@@ -1482,7 +1569,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                                     mesh: LineMeshBuilder.build([a, b]),
                                     transform: mat4.create(),
                                     visible: true,
-                                    color: [0.95, 0.8, 0.3, 0.7],
+                                    color: SLAB_CLOSING,
                                 });
                                 ct += stride;
                                 cIdx++;
@@ -1515,7 +1602,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh,
                         transform: mat4.create(),
                         visible: true,
-                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.5, 0.8, 1.0, 0.55],
+                        color: isSelected ? SEL : SLAB_SPACE,
                     });
                 });
             }
@@ -1551,11 +1638,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 mesh: ColumnMeshBuilder.buildFromElement(col, baseElev, topElev),
                 transform: mat4.create(),
                 visible: true,
-                color: isSel
-                    ? [249 / 255, 115 / 255, 22 / 255, 1.0]              // selection: orange
-                    : isSketchSel
-                    ? [0.1, 0.85, 0.35, 1.0]            // sketchSelection: emerald
-                    : [0.85, 0.85, 0.88, 1.0],
+                color: (isSel || isSketchSel) ? SEL : COLUMN_DEFAULT,
             });
         }
 
@@ -1584,31 +1667,12 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     }),
                     transform: mat4.create(),
                     visible: true,
-                    color: [0.55, 0.85, 1.0, 0.6],
+                    color: COLUMN_PREVIEW,
                 });
             }
         }
-        // Column snap marker
-        if (activeTool === "column" && columnHover && columnSnap.kind && !inRoomMode) {
-            const sp = columnHover;
-            const s = 0.25;
-            scene.addObject({
-                id: "column-snap-h",
-                mesh: LineMeshBuilder.build([[sp[0] - s, 0, sp[2]], [sp[0] + s, 0, sp[2]]]),
-                transform: mat4.create(),
-                visible: true,
-                color: [0.1, 0.85, 0.35, 1.0],
-                overlay: true,
-            });
-            scene.addObject({
-                id: "column-snap-v",
-                mesh: LineMeshBuilder.build([[sp[0], 0, sp[2] - s], [sp[0], 0, sp[2] + s]]),
-                transform: mat4.create(),
-                visible: true,
-                color: [0.1, 0.85, 0.35, 1.0],
-                overlay: true,
-            });
-        }
+        // Column snap marker は SnapSymbolOverlay (SVG, 16px screen-space)
+        // が描画する。world-space mesh は不要。
 
         // Beams — render as solid extruded boxes.
         // 部屋モード中も既存梁は描画する。プレビューは別 if で gated。
@@ -1656,7 +1720,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 mesh: BeamMeshBuilder.buildFromElement(beam, elevation, beamColFps.length > 0 ? beamColFps : undefined),
                 transform: mat4.create(),
                 visible: true,
-                color: selection.includes(beam.id as string) ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.83, 0.83, 0.86, 1.0],
+                color: selection.includes(beam.id as string) ? SEL : BEAM_DEFAULT,
             });
         }
 
@@ -1668,7 +1732,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 mesh: LineMeshBuilder.build([beamStart, beamHover]),
                 transform: mat4.create(),
                 visible: true,
-                color: [0.1, 0.4, 0.9, 1.0],
+                color: BEAM_PREVIEW,
             });
             // Ghost 3D beam using current profile + level
             const effectiveBeamLevelId = beamLevelId ?? (activeLevelId as string | undefined);
@@ -1691,55 +1755,11 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     }),
                     transform: mat4.create(),
                     visible: true,
-                    color: [0.55, 0.75, 1.0, 0.55],
+                    color: BEAM_GHOST,
                 });
             }
         }
-        // Snap marker at cursor in beam tool (常に最前面)
-        if (activeTool === "beam" && beamHover && beamSnap.kind && !inRoomMode) {
-            const sp = beamHover;
-            const s = 0.25;
-            scene.addObject({
-                id: "beam-snap-h",
-                mesh: LineMeshBuilder.build([[sp[0] - s, 0, sp[2]], [sp[0] + s, 0, sp[2]]]),
-                transform: mat4.create(),
-                visible: true,
-                color: [0.1, 0.85, 0.35, 1.0],
-                overlay: true,
-            });
-            scene.addObject({
-                id: "beam-snap-v",
-                mesh: LineMeshBuilder.build([[sp[0], 0, sp[2] - s], [sp[0], 0, sp[2] + s]]),
-                transform: mat4.create(),
-                visible: true,
-                color: [0.1, 0.85, 0.35, 1.0],
-                overlay: true,
-            });
-        }
-
-        // Snap marker at cursor in slab sketch tool (= 柱・壁端点・壁軸・通芯
-        // にスナップしている時に十字マーカーを表示)。`overlay: true` で他の
-        // ジオメトリ (柱・梁・壁) の手前に確実に出す。
-        if (activeTool === "slab" && slabSketching && slabSketchHover && slabSnap.kind) {
-            const sp = slabSketchHover;
-            const s = 0.25;
-            scene.addObject({
-                id: "slab-snap-h",
-                mesh: LineMeshBuilder.build([[sp[0] - s, 0, sp[2]], [sp[0] + s, 0, sp[2]]]),
-                transform: mat4.create(),
-                visible: true,
-                color: [0.1, 0.85, 0.35, 1.0],
-                overlay: true,
-            });
-            scene.addObject({
-                id: "slab-snap-v",
-                mesh: LineMeshBuilder.build([[sp[0], 0, sp[2] - s], [sp[0], 0, sp[2] + s]]),
-                transform: mat4.create(),
-                visible: true,
-                color: [0.1, 0.85, 0.35, 1.0],
-                overlay: true,
-            });
-        }
+        // Beam / Slab の snap marker も SnapSymbolOverlay (16px SVG) が描く。
 
         // Slabs — render as solid extruded polygons (per spec §7).
         // 2D wall plan view (activeTool === "wall") は壁を Y=0.02 のフラット
@@ -1767,9 +1787,31 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     mesh: SlabMeshBuilder.build(slab),
                     transform: slabXform,
                     visible: true,
-                    color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.9, 0.9, 0.92, 1.0],
+                    color: isSelected ? SEL : SLAB_DEFAULT,
                     // 裏側 (= 床下から見上げ) からも slab が柱・壁を occlude
                     // するように両面描画。
+                    noCull: true,
+                });
+            }
+        }
+
+        // Stairs — 直階段 / U 字階段の 3D メッシュを各要素から都度構築。
+        // パラメータが変わると updateElement → dirtyFlags 経由で次フレームに
+        // 再ビルドされる (= リアルタイム形状変更)。Wall 編集モードでは
+        // 視認性を上げるため非表示。
+        if (activeTool !== "wall") {
+            for (const id in elements) {
+                const el = elements[id];
+                if (!el || el.type !== "Stair") continue;
+                const stair = el as StairElement;
+                if (!stair.visible) continue;
+                const isSelected = selection.includes(stair.id as string);
+                scene.addObject({
+                    id: stair.id,
+                    mesh: StairMeshBuilder.build(stair),
+                    transform: stair.transform,
+                    visible: true,
+                    color: isSelected ? SEL : STAIR_DEFAULT,
                     noCull: true,
                 });
             }
@@ -1820,7 +1862,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh,
                         transform: openingTransform,
                         visible: true,
-                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.55, 0.35, 0.18, 1.0],
+                        color: isSelected ? SEL : DOOR_DEFAULT,
                         noCull: true,
                     });
                 } else {
@@ -1837,7 +1879,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh,
                         transform: openingTransform,
                         visible: true,
-                        color: isSelected ? [249 / 255, 115 / 255, 22 / 255, 1.0] : [0.6, 0.78, 0.92, 0.85],
+                        color: isSelected ? SEL : WINDOW_DEFAULT,
                         noCull: true,
                     });
                 }
@@ -1879,7 +1921,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh,
                         transform: previewTransform,
                         visible: true,
-                        color: activeTool === "door" ? [0.9, 0.55, 0.2, 0.7] : [0.55, 0.85, 1.0, 0.7],
+                        color: activeTool === "door" ? DOOR_PREVIEW : WINDOW_PREVIEW,
                         noCull: true,
                     });
                 }
@@ -1907,7 +1949,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     }),
                     transform: mat4.create(),
                     visible: true,
-                    color: [0.2, 0.2, 0.2, 1.0],
+                    color: WALL_DRAFT,
                 });
             }
             // Small marker at the first (committed) point so the user can
@@ -1951,10 +1993,9 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             const sp = wallSnap.point;
             const isAxis = wallSnap.kind === "Axis";
 
-            // Mirror room mode's C_SNAP_OBJ / C_SNAP_AXIS palette.
-            const objFill: [number, number, number, number] = [25 / 255, 204 / 255, 102 / 255, 1.0];
-            const axisFill: [number, number, number, number] = [51 / 255, 191 / 255, 242 / 255, 1.0];
-            const white: [number, number, number, number] = [1, 1, 1, 1];
+            const objFill  = SNAP_RGBA_OBJ;
+            const axisFill = SNAP_RGBA_AXIS;
+            const white    = SNAP_RGBA_WHITE;
 
             const makeSquareMesh = (cx: number, cz: number, half: number): MeshData => {
                 const Y = 0;
@@ -2078,7 +2119,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     color: isSelected
                         ? selectedColor
                         : isSketchSel
-                        ? [0.1, 0.85, 0.35, 1.0]            // emerald = sketchSelection ハイライト
+                        ? GRID_SKETCH_SEL
                         : g.kind === "Auxiliary" ? auxColor : primaryColor,
                     // 通芯は地面と平行な薄い帯。視点が下方からでも見えるよう
                     // 両面描画する。
@@ -2089,35 +2130,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
 
         // Snap indicator + draft preview — only in 2D drafting mode
         if (useOrtho && !inRoomMode) {
-            if (activeTool === "gridline" && gridlineDrafting && gridSnap) {
-                const sp = gridSnap.point;
-                // クロスマーカーの腕長を **ピクセル一定** にする (= ortho zoom と
-                // canvas 高さから world-per-pixel 比に換算)。世界 0.25m 固定だと
-                // ズームインで巨大に、ズームアウトで小さくなるため。
-                const canvasH = canvasRef.current?.clientHeight ?? 800;
-                const pxToWorld = (2 * orthoZoom) / canvasH;
-                const SNAP_CROSS_HALF_PX = 8; // 腕長 = 8px → 全長 16px
-                const s = SNAP_CROSS_HALF_PX * pxToWorld;
-                const cross: Vec3[] = [
-                    [sp[0] - s, 0, sp[2]], [sp[0] + s, 0, sp[2]],
-                ];
-                scene.addObject({
-                    id: "grid-snap-marker-h",
-                    mesh: LineMeshBuilder.build(cross),
-                    transform: mat4.create(),
-                    visible: true,
-                    color: [0.1, 0.8, 0.4, 1.0],
-                    overlay: true,
-                });
-                scene.addObject({
-                    id: "grid-snap-marker-v",
-                    mesh: LineMeshBuilder.build([[sp[0], 0, sp[2] - s], [sp[0], 0, sp[2] + s]]),
-                    transform: mat4.create(),
-                    visible: true,
-                    color: [0.1, 0.8, 0.4, 1.0],
-                    overlay: true,
-                });
-            }
+            // Gridline snap marker は SnapSymbolOverlay (16px SVG) が描く。
 
             // Axis-alignment guide は GridAxisGuideOverlay (SVG) で描画する。
             // 線幅 1px ・点線パターン・距離ラベルが camera 距離に依存しない
@@ -2135,14 +2148,12 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                     const dz = to[2] - from[2];
                     const len = Math.hypot(dx, dz);
                     if (len < 1e-6) return;
-                    const dashLen = 0.3;
-                    const gapLen = 0.2;
-                    const stride = dashLen + gapLen;
+                    const stride = GRID_DRAFT_DASH_LEN_M + GRID_DRAFT_GAP_LEN_M;
                     const ux = dx / len;
                     const uz = dz / len;
                     let t = 0;
                     while (t < len) {
-                        const tEnd = Math.min(t + dashLen, len);
+                        const tEnd = Math.min(t + GRID_DRAFT_DASH_LEN_M, len);
                         const a: Vec3 = [from[0] + ux * t, 0, from[2] + uz * t];
                         const b: Vec3 = [from[0] + ux * tEnd, 0, from[2] + uz * tEnd];
                         scene.addObject({
@@ -2150,7 +2161,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                             mesh: LineMeshBuilder.build([a, b]),
                             transform: mat4.create(),
                             visible: true,
-                            color: [0.85, 0.2, 0.2, 1.0],
+                            color: GRID_DRAFT_RGBA_DASH,
                         });
                         t += stride;
                         dashIdx++;
@@ -2162,7 +2173,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         mesh: LineMeshBuilder.build([from, to]),
                         transform: mat4.create(),
                         visible: true,
-                        color: [0.85, 0.2, 0.2, 0.9],
+                        color: GRID_DRAFT_RGBA_SOLID,
                     });
                 };
                 if (gridDraftMode === "polyline") {
@@ -2177,11 +2188,47 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 }
             }
         }
-    }, [elements, selection, activeTool, wallStart, wallEnd, wallSnap, activeRoomId, pendingRoomLevelId, grids, gridStart, gridHover, gridlineDrafting, gridDraftMode, gridDraftPoints, useOrtho, orthoZoom, selectedGridIds, gridSnap, gridAxisSnap, openingHover, slabSelectedSpaces, slabSketching, slabSketchPoints, slabSketchHover, slabSnap, beamStart, beamHover, beamSnap, beamWidthInput, beamDepthInput, beamTopOffsetInput, beamZJust, beamLevelId, beamSubMode, beamDragState, levels, columnHover, columnSnap, columnProfileKind, columnWidthInput, columnDepthInput, columnRadiusInput, columnRotationInput, columnBaseLevelId, columnTopLevelId, columnBaseOffsetInput, columnTopOffsetInput, columnSubMode, columnDragState, sketchSelection, wallSubMode]);
+    }, [elements, selection, activeTool, wallStart, wallEnd, wallSnap, activeRoomId, pendingRoomLevelId, grids, gridStart, gridHover, gridlineDrafting, gridDraftMode, gridDraftPoints, useOrtho, orthoZoom, selectedGridIds, gridSnap, gridAxisSnap, openingHover, slabSelectedSpaces, slabSketching, slabSketchPoints, slabSketchHover, slabSnap, beamStart, beamHover, beamSnap, beamWidthInput, beamDepthInput, beamTopOffsetInput, beamZJust, beamLevelId, beamSubMode, beamDragState, levels, columnHover, columnSnap, columnSnapPoint, columnProfileKind, columnWidthInput, columnDepthInput, columnRadiusInput, columnRotationInput, columnBaseLevelId, columnTopLevelId, columnBaseOffsetInput, columnTopOffsetInput, columnSubMode, columnDragState, sketchSelection, wallSubMode]);
 
     // Pick the nearest sketch item (polygon vertex/edge) to a world-space
     // ground point. Shared by select + wall modes. Priority: vertex > edge.
     // Returns null if nothing is within the pixel-based tolerance.
+    // 階段原点用のスナップ。raw (XZ) の近傍にある「ピック可能な点」候補
+    // (= 壁端点・柱中心・通芯端点・原点・部屋ポリゴン頂点) の中で最も近い
+    // ものを Vec3 (Y は raw[1]) で返す。許容内に何もなければ null。
+    const snapStairOrigin = (raw: Vec3): Vec3 | null => {
+        const canvasH = canvasRef.current?.clientHeight ?? 800;
+        const pxToWorld = useOrtho ? (2 * orthoZoom / canvasH) : 0.015;
+        const SNAP_TOL = 14 * pxToWorld;
+        let best: { p: Vec3; d: number } | null = null;
+        const consider = (p: Vec3) => {
+            const d = Math.hypot(raw[0] - p[0], raw[2] - p[2]);
+            if (d < SNAP_TOL && (!best || d < best.d)) best = { p, d };
+        };
+        for (const id in elements) {
+            const el = elements[id];
+            if (!el) continue;
+            if (el.type === "Wall") {
+                const w = el as WallElement;
+                consider(w.axis[0]);
+                consider(w.axis[1]);
+            } else if (el.type === "Column") {
+                const c = el as ColumnElement;
+                if (c.basePoint) consider(c.basePoint);
+            } else if (el.type === "Space") {
+                for (const poly of (el as SpaceElement).polygons ?? []) {
+                    for (const v of poly.outer) consider([v[0], 0, v[1]]);
+                }
+            }
+        }
+        for (const g of grids) {
+            if (!g.visible) continue;
+            for (const v of gridVertices(g.curve)) consider(v);
+        }
+        consider([0, 0, 0]); // 原点
+        return best ? (best as any).p : null;
+    };
+
     const pickSketchItemAt = (raw: Vec3): SketchSelectionItem | null => {
         const canvasH = canvasRef.current?.clientHeight ?? 800;
         const pxToWorld = useOrtho ? (2 * orthoZoom / canvasH) : 0.015;
@@ -2233,15 +2280,19 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 }
             }
         }
-        // Column 中心 — Length / Coincident 等の点拘束で柱の basePoint を
-        // 第一級ターゲットとして選べる。
+        // Column — フットプリント全体をヒット領域とし、中心距離が最小のものを選ぶ。
+        // 中心から VERT_TOL だけの点判定だと外縁クリックで検出失敗するため。
         for (const id in elements) {
             const el = elements[id];
             if (!el || el.type !== "Column") continue;
             const col = el as ColumnElement;
             if (!col.basePoint) continue;
+            const fp = columnFootprint2D(col);
+            const ring2: [number, number][] = fp.map((p) => [p[0], p[1]]);
+            if (fp.length >= 3 && !pointInPolygon([raw[0], raw[2]], ring2)) continue;
             const d = Math.hypot(raw[0] - col.basePoint[0], raw[2] - col.basePoint[2]);
-            if (d < VERT_TOL && d < bestD) {
+            if (fp.length < 3 && d >= VERT_TOL) continue;
+            if (d < bestD) {
                 bestD = d;
                 hit = { kind: "column", columnId: id as any };
             }
@@ -2267,6 +2318,22 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 hit = { kind: "origin" };
             }
         }
+        // 柱フットプリント頂点 — 中心 (column kind) より優先度低め。
+        // Rectangle / Arbitrary のみ対象 (Circle は頂点が多すぎるため除外)。
+        for (const id in elements) {
+            const el = elements[id];
+            if (!el || el.type !== "Column") continue;
+            const col = el as ColumnElement;
+            if (!col.basePoint || col.profile.kind === "Circle") continue;
+            const fp = columnFootprint2D(col);
+            for (let i = 0; i < fp.length; i++) {
+                const d = Math.hypot(raw[0] - fp[i][0], raw[2] - fp[i][1]);
+                if (d < VERT_TOL && d < bestD) {
+                    bestD = d;
+                    hit = { kind: "columnVertex", columnId: id as any, vertexIdx: i };
+                }
+            }
+        }
         if (hit) return hit;
         // 通芯線 (= grid 全体) のエッジヒット。柱-通芯垂直距離拘束に使う。
         for (const g of grids) {
@@ -2284,6 +2351,28 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 if (d < EDGE_TOL && d < bestD) {
                     bestD = d;
                     hit = { kind: "gridLine", gridId: g.id };
+                }
+            }
+        }
+        // 柱フットプリント辺。Rectangle / Arbitrary のみ対象。
+        for (const id in elements) {
+            const el = elements[id];
+            if (!el || el.type !== "Column") continue;
+            const col = el as ColumnElement;
+            if (!col.basePoint || col.profile.kind === "Circle") continue;
+            const fp = columnFootprint2D(col);
+            const n = fp.length;
+            for (let i = 0; i < n; i++) {
+                const a = fp[i], b = fp[(i + 1) % n];
+                const dx = b[0] - a[0], dz = b[1] - a[1];
+                const lenSq = dx * dx + dz * dz;
+                if (lenSq < 1e-12) continue;
+                const t = Math.max(0, Math.min(1, ((raw[0] - a[0]) * dx + (raw[2] - a[1]) * dz) / lenSq));
+                const qx = a[0] + dx * t, qz = a[1] + dz * t;
+                const d = Math.hypot(raw[0] - qx, raw[2] - qz);
+                if (d < EDGE_TOL && d < bestD) {
+                    bestD = d;
+                    hit = { kind: "columnEdge", columnId: id as any, edgeIdx: i };
                 }
             }
         }
@@ -2345,6 +2434,49 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         return hit;
     };
 
+    // 柱配置スナップ: カーソル中心だけでなく **配置予定の柱フットプリント
+    // 各頂点** に対しても snapForBeam を試し、最良 (= dist 最小) を採用する。
+    // 採用された頂点が snap.point にちょうど乗るよう basePoint をシフトする
+    // (= 角→ターゲット スナップ。column-drag と同じロジック)。
+    const snapForColumnPlace = (
+        cursor: Vec3,
+    ): { basePoint: Vec3; snapPoint: Vec3 | null; kind: string | null } => {
+        const profile: Profile = columnProfileKind === "Circle"
+            ? { kind: "Circle", radius: Math.max(0.05, parseFloat(columnRadiusInput) || 0.25) }
+            : { kind: "Rectangle", width: Math.max(0.05, parseFloat(columnWidthInput) || 0.4), depth: Math.max(0.05, parseFloat(columnDepthInput) || 0.4) };
+        const rotation = ((parseFloat(columnRotationInput) || 0) * Math.PI) / 180;
+        const resStep = designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined;
+        type Cand = { kind: string; snapPoint: Vec3; basePoint: Vec3; dist: number };
+        let best: Cand | null = null;
+        const trySnap = (queryWorld: Vec3, offset: [number, number]) => {
+            const sn = snapForBeam(queryWorld, elements, grids as any, 0.5, resStep);
+            if (!sn.kind) return;
+            const d = Math.hypot(sn.point[0] - queryWorld[0], sn.point[2] - queryWorld[2]);
+            if (best && d >= best.dist) return;
+            best = {
+                kind: sn.kind,
+                snapPoint: sn.point,
+                basePoint: [sn.point[0] - offset[0], cursor[1], sn.point[2] - offset[1]],
+                dist: d,
+            };
+        };
+        // 中心 (basePoint = snap.point)
+        trySnap(cursor, [0, 0]);
+        // 各フットプリント頂点 (basePoint = snap.point - offset)。
+        // Circle は 32 セグメントになるので skip (角の概念が薄い)。
+        if (profile.kind !== "Circle") {
+            const ring = profileRing(profile, rotation);
+            for (const r of ring) {
+                trySnap([cursor[0] + r[0], cursor[1], cursor[2] + r[1]], [r[0], r[1]]);
+            }
+        }
+        if (best) {
+            const b = best as Cand;
+            return { basePoint: b.basePoint, snapPoint: b.snapPoint, kind: b.kind };
+        }
+        return { basePoint: cursor, snapPoint: null, kind: null };
+    };
+
     const handlePointerDown = (e: React.PointerEvent) => {
         if (e.button !== 0) return;
 
@@ -2354,6 +2486,50 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         // geometry for constraints. pending (Space 未生成) でも overlay 側で
         // 図形ドラフトを処理させたいので同様に early return。
         if ((activeRoomId || pendingRoomLevelId) && activeTool !== "wall") return;
+
+        // ── Stair 原点 (startPoint) ピックモード ─────────────────
+        // activeTool に依存せず、stairOriginPickMode が ON の間は左クリック
+        // を「原点取得」として消費する (= select 等の通常クリック処理より
+        // 優先)。確定後は pick mode を OFF へ戻す。
+        //
+        //   - freeFloor:   getGroundIntersection で得た床点をそのまま採用。
+        //                  Y は draft の baseElevation を維持。
+        //   - vertexSnap:  pickSketchItemAt の結果から world 座標を逆算。
+        //                  ヒットなしなら床点フォールバック。
+        if (stairOriginPickMode !== "off") {
+            const pt = getGroundIntersection(
+                e.clientX, e.clientY, canvasRef.current!, cameraRef.current,
+            );
+            if (!pt) return;
+            let world: Vec3 = [pt[0], stairCreateDraft.baseElevation, pt[2]];
+            if (stairOriginPickMode === "vertexSnap") {
+                const snap = snapStairOrigin(pt);
+                if (snap) world = [snap[0], stairCreateDraft.baseElevation, snap[2]];
+            }
+            // 編集中 stair が選択されていればその startPoint を更新。
+            // それ以外は draft の startPoint を更新 (= 新規作成モード)。
+            const stairId = (() => {
+                if (selection.length === 1) {
+                    const el = elements[selection[0]];
+                    if (el?.type === "Stair") return el.id;
+                }
+                return activeStairId;
+            })();
+            if (stairId) {
+                const cur = elements[stairId] as any;
+                updateElement(stairId, {
+                    startPoint: world,
+                    dirtyFlags: new Set([
+                        ...(cur?.dirtyFlags ?? []),
+                        "Geometry", "Mesh", "Render",
+                    ]),
+                } as any);
+            } else {
+                updateStairDraft({ startPoint: world });
+            }
+            setStairOriginPickMode("off");
+            return;
+        }
 
         if (activeTool === "select") {
             const pt = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
@@ -2627,14 +2803,21 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             //     対象は柱中心 / 通芯端点 / 原点 / 部屋頂点 / 壁端点 など
             if (columnSubMode === "edit") {
                 const additive = e.shiftKey || e.ctrlKey || e.metaKey;
-                if (additive) {
-                    const hit = pickSketchItemAt(raw);
-                    if (hit) {
-                        toggleSketchSelection(hit, true);
-                        return;
-                    }
+                // 頂点・辺は Shift なしのプレーンクリックでも選択可能。
+                // ドラッグ開始より優先して判定する。
+                const hitVE = pickSketchItemAt(raw);
+                if (hitVE?.kind === "columnVertex" || hitVE?.kind === "columnEdge") {
+                    // エッジ / 頂点選択時は 3D 要素選択を解除 (= 柱全体のオレンジ塗りなし)。
+                    if (!additive) setSelection([]);
+                    toggleSketchSelection(hitVE, additive);
                     return;
                 }
+                if (additive) {
+                    if (hitVE) toggleSketchSelection(hitVE, true);
+                    return;
+                }
+                // 柱ボディドラッグへ。クリックした柱を sketchSelection に設定する
+                // (= 後から Shift+クリックで 2 柱選択 → 水平/垂直距離拘束が可能)。
                 let bestCol: { id: string; dist: number } | null = null;
                 for (const cid in elements) {
                     const ce = elements[cid];
@@ -2651,6 +2834,9 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 if (bestCol) {
                     const col = elements[bestCol.id] as ColumnElement;
                     setSelection([bestCol.id]);
+                    // additive toggle: 2 柱選択→拘束付与のため clearSketchSelection しない。
+                    // 既に選択済みの柱は外れ、未選択の柱は追加される。空白クリックで全クリア。
+                    toggleSketchSelection({ kind: "column", columnId: bestCol.id as any }, true);
                     setColumnDragState({
                         columnId: bestCol.id,
                         startPt: raw,
@@ -2658,12 +2844,24 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                         finalPoint: [col.basePoint[0], col.basePoint[1], col.basePoint[2]],
                         moved: false,
                     });
+                } else {
+                    clearSketchSelection();
                 }
                 return;
             }
 
-            const snap = snapForBeam(raw, elements, grids as any, 0.5, designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined);
-            const pt = snap.point;
+            // Add モードでも Shift/Ctrl クリックは sketchSelection への追加とし、
+            // 新規配置は行わない。壁 add モードと同じ振る舞い。
+            if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                const hit = pickSketchItemAt(raw);
+                if (hit) { toggleSketchSelection(hit, true); }
+                return;
+            }
+
+            // 柱配置: カーソル中心 / フットプリント各頂点 のどれかが既存柱
+            // の角・壁端点/壁頂点・通芯交点などに乗るよう basePoint を補正。
+            const colSnap = snapForColumnPlace(raw);
+            const pt = colSnap.basePoint;
             // Type 体系: アクティブな ColumnType を使用。ユーザがツールバーで
             // 寸法を上書き入力していたら override として渡す。
             const colTypeId = useAppState.getState().activeTypeIdByCategory.Column;
@@ -2994,6 +3192,14 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         }
     };
 
+    const updateColPickHover = (hit: ReturnType<typeof pickSketchItemAt>) => {
+        if (hit?.kind === "columnVertex" || hit?.kind === "columnEdge") {
+            setColPickHoverItem(hit);
+        } else if (colPickHoverItem !== null) {
+            setColPickHoverItem(null);
+        }
+    };
+
     const handlePointerMove = (e: React.PointerEvent) => {
         if (activeTool === "wall" && wallSubMode === "add") {
             const raw = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
@@ -3107,18 +3313,44 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             // 回避 / 自身を含めて毎フレーム吸着して marker が出続ける問題を防ぐ)。
             if (columnDragState) {
                 // skip — already handled by drag block above
+                if (colPickHoverItem !== null) setColPickHoverItem(null);
             } else if (columnSubMode === "edit") {
                 // 編集サブモードでドラッグしていない時はスナップしない
                 // (= マーカーを出さない / 既存柱の上を撫でただけで吸着挙動が
                 //   走ると邪魔)。
                 if (columnSnap.kind) setColumnSnap({ kind: null });
                 if (columnHover) setColumnHover(null);
+                if (columnSnapPoint) setColumnSnapPoint(null);
+                // edit mode でも頂点・辺ホバーは検出する。
+                const rawEdit = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
+                if (rawEdit) {
+                    const hitEdit = pickSketchItemAt(rawEdit);
+                    updateColPickHover(hitEdit);
+                } else if (colPickHoverItem !== null) {
+                    setColPickHoverItem(null);
+                }
             } else {
                 const raw = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
                 if (raw) {
-                    const snap = snapForBeam(raw, elements, grids as any, 0.5, designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined);
-                    setColumnSnap({ kind: snap.kind });
-                    setColumnHover(snap.point);
+                    // 頂点・辺・柱中心ホバーを先に判定。
+                    // 既存柱の上に居る場合はスナップシンボルを抑制し、
+                    // Shift+クリック選択の際に緑□が出ないようにする。
+                    const hitAdd = pickSketchItemAt(raw);
+                    updateColPickHover(hitAdd);
+                    if (hitAdd) {
+                        if (columnSnap.kind) setColumnSnap({ kind: null });
+                        if (columnSnapPoint) setColumnSnapPoint(null);
+                    } else {
+                        // basePoint (= ghost 中心) は corner→target スナップが効く
+                        // ようオフセット補正されたもの。snapPoint は緑□マーカー
+                        // 描画用の「吸着先」位置 (= 既存柱の角・壁頂点 etc)。
+                        const r = snapForColumnPlace(raw);
+                        setColumnSnap({ kind: r.kind });
+                        setColumnHover(r.basePoint);
+                        setColumnSnapPoint(r.snapPoint);
+                    }
+                } else if (colPickHoverItem !== null) {
+                    setColPickHoverItem(null);
                 }
             }
         }
@@ -3200,12 +3432,16 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
         // basePoint を live で更新。pointerup で UpdateColumnBasePointCommand を
         // 1 回だけ発行して undo/redo を 1 ステップに集約する (= dirty な中間
         // 状態を history に積まない)。
+        //
+        // スナップは中心 (basePoint) だけでなく **フットプリントの全頂点**
+        // に対しても検査する。各頂点位置で snapForBeam を呼び、ヒットの中で
+        // 最も近い (= dist 最小) ものを採用する。採用された頂点が snap.point
+        // にちょうど乗るよう basePoint を offset 分シフトする (= 回転は保つ)。
         if (columnDragState) {
             const raw = getGroundIntersection(e.clientX, e.clientY, canvasRef.current!, cameraRef.current);
             if (!raw) return;
             const dx = raw[0] - columnDragState.startPt[0];
             const dz = raw[2] - columnDragState.startPt[2];
-            // ターゲット位置 = orig + delta、その位置を中心に snapForBeam で吸着。
             const target: Vec3 = [
                 columnDragState.origBasePoint[0] + dx,
                 columnDragState.origBasePoint[1],
@@ -3215,24 +3451,50 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
             // 震えるのを防ぐ)。shallow copy で削除。
             const elementsExSelf = { ...elements };
             delete elementsExSelf[columnDragState.columnId];
-            const snap = snapForBeam(target, elementsExSelf, grids as any, 0.5,
-                designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined);
-            const finalPt: Vec3 = snap.kind ? snap.point : target;
-            // スナップマーカー (緑十字) の表示を制御。snap が当たった時だけ
-            // 表示。snap が無ければ marker を消す (= "ずっと出続ける" 防止)。
-            setColumnSnap({ kind: snap.kind });
-            setColumnHover(snap.kind ? snap.point : null);
+            const resStep = designMode === "jpResidentialGrid" ? RESIDENTIAL_GRID_SECONDARY_M : undefined;
+            const col = elements[columnDragState.columnId] as ColumnElement | undefined;
+            // 候補: 中心 (offset 0,0) + 各フットプリント頂点 (offset = local ring)。
+            // 中心スナップで finalCenter = snap.point、頂点スナップでは
+            // finalCenter = snap.point - offset となる (= その頂点が snap.point に乗る)。
+            type Cand = { kind: string; point: Vec3; finalCenter: Vec3; dist: number };
+            let best: Cand | null = null;
+            const trySnap = (queryWorld: Vec3, offset: [number, number]) => {
+                const sn = snapForBeam(queryWorld, elementsExSelf, grids as any, 0.5, resStep);
+                if (!sn.kind) return;
+                const d = Math.hypot(sn.point[0] - queryWorld[0], sn.point[2] - queryWorld[2]);
+                if (best && d >= best.dist) return;
+                best = {
+                    kind: sn.kind,
+                    point: sn.point,
+                    finalCenter: [sn.point[0] - offset[0], target[1], sn.point[2] - offset[1]],
+                    dist: d,
+                };
+            };
+            trySnap(target, [0, 0]);
+            if (col && col.type === "Column") {
+                const ring = profileRing(col.profile, col.rotation);
+                for (const r of ring) {
+                    trySnap([target[0] + r[0], target[1], target[2] + r[1]], [r[0], r[1]]);
+                }
+            }
+            const finalPt: Vec3 = best ? (best as Cand).finalCenter : target;
+            // スナップマーカー (緑十字) は採用された頂点 / 中心が乗っかる
+            // snap target の位置に表示する。snap が無ければ marker を消す。
+            setColumnSnap({ kind: best ? (best as Cand).kind : null });
+            setColumnHover(best ? (best as Cand).point : null);
             const moved = Math.hypot(
                 finalPt[0] - columnDragState.origBasePoint[0],
                 finalPt[2] - columnDragState.origBasePoint[2],
             ) > 1e-6;
             // live 更新: basePoint を直接書き換え (履歴に積まない)。
-            const col = elements[columnDragState.columnId] as ColumnElement | undefined;
             if (col && col.type === "Column") {
                 updateElement(columnDragState.columnId, {
                     basePoint: finalPt,
                     dirtyFlags: new Set([...(col.dirtyFlags ?? []), "Geometry", "Mesh", "Render"]),
                 } as any);
+                // 拘束をリアルタイムで反映: ドラッグ中の柱を fixed として solver に渡す。
+                useAppState.getState().setDraggingColumnId(columnDragState.columnId);
+                runSketchSolver();
             }
             setColumnDragState({ ...columnDragState, finalPoint: finalPt, moved });
         }
@@ -3275,6 +3537,7 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 triggerWallRegenIfEnabled("column-move");
             }
         }
+        useAppState.getState().setDraggingColumnId(null);
         setColumnDragState(null);
         (window as any).__viewportInteracting = false;
     };
@@ -3330,6 +3593,38 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                 getCamera={() => cameraRef.current}
                 getCanvas={() => canvasRef.current}
                 axisSnap={activeTool === "gridline" && gridlineDrafting ? gridAxisSnap : null}
+            />
+            <OriginOverlay
+                getCamera={() => cameraRef.current}
+                getCanvas={() => canvasRef.current}
+            />
+            <SnapSymbolOverlay
+                getCamera={() => cameraRef.current}
+                getCanvas={() => canvasRef.current}
+                // Room モードは RoomSketchOverlay 側の snap シンボルが描画する。
+                // 他ツール (column/beam/slab/gridline) はここで一元描画。
+                point={
+                    (activeRoomId || pendingRoomLevelId)
+                        ? null
+                        : activeTool === "column"
+                            ? (columnSnap.kind ? columnSnapPoint : null)
+                            : activeTool === "beam"
+                                ? (beamSnap.kind ? beamHover : null)
+                                : activeTool === "slab" && slabSketching
+                                    ? (slabSnap.kind ? slabSketchHover : null)
+                                    : activeTool === "gridline" && gridlineDrafting
+                                        ? (gridSnap ? gridSnap.point : null)
+                                        : null
+                }
+            />
+            <ColumnSketchOverlay
+                getCamera={() => cameraRef.current}
+                getCanvas={() => canvasRef.current}
+                hoverItem={colPickHoverItem}
+            />
+            <DimensionOverlay
+                getCamera={() => cameraRef.current}
+                getCanvas={() => canvasRef.current}
             />
             {activeRoomId && (
                 <ConstraintIconOverlay
@@ -3895,15 +4190,27 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                             </button>
                             {showArrayPanel && (
                                 <div className="mt-1 p-1.5 bg-zinc-50 border border-zinc-200 rounded space-y-1">
+                                    {/* 方向: 水平/垂直 (= 各軸の向き) */}
                                     <div className="flex items-center gap-1">
-                                        <span className="text-[10px] text-zinc-500 w-10">ピッチ</span>
-                                        <input
-                                            className="flex-1 min-w-0 text-[10px] px-1 py-0.5 bg-white border border-zinc-300 rounded"
-                                            type="number"
-                                            step="0.1"
-                                            value={arrayPitch}
-                                            onChange={(e) => setArrayPitch(e.target.value)}
-                                        />
+                                        <span className="text-[10px] text-zinc-500 w-10">方向</span>
+                                        <label className="flex items-center gap-0.5 text-[10px] cursor-pointer">
+                                            <input
+                                                type="radio"
+                                                name="grid-array-dir"
+                                                checked={arrayDirection === "horizontal"}
+                                                onChange={() => setArrayDirection("horizontal")}
+                                            />
+                                            水平
+                                        </label>
+                                        <label className="flex items-center gap-0.5 text-[10px] cursor-pointer">
+                                            <input
+                                                type="radio"
+                                                name="grid-array-dir"
+                                                checked={arrayDirection === "vertical"}
+                                                onChange={() => setArrayDirection("vertical")}
+                                            />
+                                            垂直
+                                        </label>
                                     </div>
                                     <div className="flex items-center gap-1">
                                         <span className="text-[10px] text-zinc-500 w-10">本数</span>
@@ -3915,18 +4222,83 @@ const Viewport = forwardRef<ViewportHandle>(function Viewport(_props, ref) {
                                             onChange={(e) => setArrayCount(e.target.value)}
                                         />
                                     </div>
+                                    <div className="flex items-center gap-1">
+                                        <span className="text-[10px] text-zinc-500 w-10">ピッチ</span>
+                                        <input
+                                            className="flex-1 min-w-0 text-[10px] px-1 py-0.5 bg-white border border-zinc-300 rounded"
+                                            type="number"
+                                            step="0.1"
+                                            value={arrayPitch}
+                                            onChange={(e) => setArrayPitch(e.target.value)}
+                                        />
+                                    </div>
+                                    {/* 開始位置 (X, Y) — 1 本目の通芯の始点 */}
+                                    <div className="flex items-center gap-1">
+                                        <span className="text-[10px] text-zinc-500 w-10">開始 X</span>
+                                        <input
+                                            className="flex-1 min-w-0 text-[10px] px-1 py-0.5 bg-white border border-zinc-300 rounded"
+                                            type="number"
+                                            step="0.1"
+                                            value={arrayOriginX}
+                                            onChange={(e) => setArrayOriginX(e.target.value)}
+                                        />
+                                    </div>
+                                    <div className="flex items-center gap-1">
+                                        <span className="text-[10px] text-zinc-500 w-10">開始 Y</span>
+                                        <input
+                                            className="flex-1 min-w-0 text-[10px] px-1 py-0.5 bg-white border border-zinc-300 rounded"
+                                            type="number"
+                                            step="0.1"
+                                            value={arrayOriginY}
+                                            onChange={(e) => setArrayOriginY(e.target.value)}
+                                        />
+                                    </div>
+                                    <div className="flex items-center gap-1">
+                                        <span className="text-[10px] text-zinc-500 w-10">線長</span>
+                                        <input
+                                            className="flex-1 min-w-0 text-[10px] px-1 py-0.5 bg-white border border-zinc-300 rounded"
+                                            type="number"
+                                            step="0.5"
+                                            value={arrayLength}
+                                            onChange={(e) => setArrayLength(e.target.value)}
+                                        />
+                                    </div>
                                     <button
                                         className="w-full text-[10px] py-1 rounded bg-blue-600 text-white hover:bg-blue-500 disabled:opacity-40"
-                                        disabled={grids.length === 0}
                                         onClick={() => {
-                                            const last = grids[grids.length - 1];
-                                            if (!last || last.curve.type !== "Line") return;
                                             const pitch = parseFloat(arrayPitch);
                                             const count = parseInt(arrayCount, 10);
+                                            const ox = parseFloat(arrayOriginX);
+                                            const oy = parseFloat(arrayOriginY);
+                                            const len = parseFloat(arrayLength);
                                             if (!Number.isFinite(pitch) || !Number.isFinite(count) || count < 1) return;
-                                            createGridArray(last.curve.start, last.curve.end, pitch, count, gridKind);
+                                            if (!Number.isFinite(ox) || !Number.isFinite(oy)) return;
+                                            if (!Number.isFinite(len) || len <= 0) return;
+                                            // 世界座標: X = ox (画面横), Z = oy (画面奥/縦)。
+                                            for (let i = 0; i < count; i++) {
+                                                let s: Vec3, e: Vec3;
+                                                if (arrayDirection === "horizontal") {
+                                                    // 水平通芯: ピッチは Y (= Z) 方向に並ぶ。
+                                                    const z = oy + i * pitch;
+                                                    s = [ox, 0, z];
+                                                    e = [ox + len, 0, z];
+                                                } else {
+                                                    // 垂直通芯: ピッチは X 方向に並ぶ。
+                                                    const x = ox + i * pitch;
+                                                    s = [x, 0, oy];
+                                                    e = [x, 0, oy + len];
+                                                }
+                                                const gid = addGrid(s, e, gridKind);
+                                                // 水平/垂直拘束を即時付与 → 後の編集で
+                                                // ドラッグしても軸が傾かない。
+                                                executeCommand(new AddConstraintCommand({
+                                                    id: generateConstraintId(),
+                                                    type: arrayDirection === "horizontal" ? "Horizontal" : "Vertical",
+                                                    targets: [{ kind: "Grid", gridId: gid }],
+                                                }));
+                                            }
                                         }}
-                                        title="直前の通芯を基準に配列生成"
+                                        title="入力した条件で通芯を一括生成 (= 既存通芯不要)"
                                     >生成</button>
                                 </div>
                             )}

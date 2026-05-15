@@ -110,10 +110,7 @@ const COLLINEAR_DOT = Math.cos(2 * Math.PI / 180); // 2° tol
 const COLLINEAR_PERP_TOL = 0.005; // 5mm — 共線判定の perpendicular distance
 const ON_LINE_TOL = 1e-4; // 0.1 mm — Clipper 結果からの 3 点抽出時に line 上判定
 
-// グローバルフラグでログ ON/OFF 切替。デフォルトは true (デバッグ中)。
-// 安定したら false にする。
-const JUNCTION_GRAPH_DEBUG: boolean =
-    (globalThis as unknown as { __jgraphDebug?: boolean }).__jgraphDebug !== false;
+const JUNCTION_GRAPH_DEBUG = false;
 const fmt = (v: Vec2) => `(${v[0].toFixed(3)},${v[1].toFixed(3)})`;
 const fmtA = (deg: number) => `${deg.toFixed(1)}°`;
 

@@ -39,6 +39,9 @@ export class CreateSpaceCommand implements Command {
             area: 0,
             height: this.height,
             levelId: this.baseLevelId,
+            // 重なり領域のピック優先度に使う作成時刻。後から作った Room ほど
+            // 値が大きく、矩形が重なったときに上側として優先的に選ばれる。
+            createdAt: Date.now(),
         };
 
         state.addElement(newSpace);

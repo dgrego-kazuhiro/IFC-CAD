@@ -7,4 +7,5 @@ export type ElementType =
     | "Door"
     | "Window"
     | "Space"
+    | "Stair"
     | "Level";
